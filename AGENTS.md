@@ -1,0 +1,151 @@
+# Project instructions
+
+This project implements a local coding agent from scratch.
+
+## Hard constraints
+
+- Do not use any agent framework or agent SDK, including LangChain,
+  LlamaIndex, OpenAI Agents SDK, Claude Agent SDK, AutoGen, or CrewAI.
+- Model-provider API clients and native tool-calling interfaces are allowed.
+- Do not use server-hosted code execution or file tools.
+- The agent loop, conversation history, context management, tool definitions,
+  local tool execution, model-output parsing, termination conditions, and
+  error handling must be implemented locally.
+- Never store API keys in source code, tests, logs, documentation, commits,
+  screenshots, or videos.
+- Read credentials only from environment variables or ignored local
+  configuration files.
+- Restrict all filesystem operations to the configured workspace.
+- Shell commands must have a timeout and output-size limit.
+
+## Development workflow
+
+- Use Superpowers brainstorming before introducing a new feature or changing
+  existing behavior.
+- Do not implement a design until the user explicitly approves it.
+- Use writing-plans for multi-step implementation tasks.
+- Use test-driven-development for production behavior and bug fixes.
+- Use systematic-debugging for reproducible failures.
+- Use verification-before-completion before claiming that work is complete,
+  fixed, or passing.
+- Use requesting-code-review after completing a core module.
+- Do not dispatch subagents unless explicitly requested by the user.
+- Do not use parallel agents for tightly coupled core modules.
+- Do not create Git worktrees unless explicitly requested.
+- Trivial documentation, formatting, and naming changes do not require a
+  complete feature-development workflow.
+
+## Coding rules
+
+- Make small, reviewable changes.
+- Complete one task or one coherent module at a time.
+- Add or update tests for every behavioral change.
+- Run relevant tests after modifications.
+- Do not modify unrelated files.
+- Prefer clear, explicit implementations over unnecessary abstractions.
+- Prefer standard-library implementations where reasonable.
+- Explain important design decisions before implementing them.
+- Do not silently introduce new dependencies.
+- Do not weaken tests merely to make them pass.
+
+## Safety requirements
+
+- Normalize and validate every filesystem path before use.
+- Reject paths that resolve outside the configured workspace.
+- Treat symbolic-link escapes as workspace violations.
+- Run commands only inside the configured workspace.
+- Reject destructive or prohibited commands.
+- Capture command exit code, stdout, stderr, timeout status, and truncation
+  status.
+- Never rely only on model instructions for security enforcement.
+- Enforce security restrictions in deterministic local code.
+
+## Completion checklist
+
+Before completing a task, verify:
+
+- No prohibited agent framework or SDK was introduced.
+- Core agent behavior remains implemented locally.
+- Filesystem paths remain restricted to the workspace.
+- Shell commands have timeout and output limits.
+- Every loop has an explicit termination condition.
+- Failure paths have appropriate tests.
+- Secrets are not stored or exposed.
+- Relevant tests were actually executed.
+- Test commands and their real results are reported accurately.
+- Verified facts are distinguished from assumptions.
+
+## Design and approval gates
+
+- Read `DESIGN.md` and `TASKS.md` before changing production behavior.
+- `DESIGN.md` is the approved architectural source of truth.
+- `TASKS.md` defines the implementation order and per-task acceptance criteria.
+- Do not create production source code until the user approves `DESIGN.md`,
+  `TASKS.md`, and `AGENTS.md`, then approves the detailed implementation plan.
+- Do not invoke an implementation workflow while a required approval is
+  pending.
+- Work on one `TASKS.md` item at a time and keep its status accurate.
+- If implementation reveals a design conflict, stop and return to
+  brainstorming rather than silently changing the architecture.
+- Do not commit, push, rewrite Git history, or operate on a remote repository
+  unless the user explicitly authorizes that action.
+
+## Project-specific implementation decisions
+
+- Use Python and target Windows for the first version.
+- Keep production code under `src/coding_agent/` and tests under `tests/`.
+- Implement a one-shot CLI; do not add a chat REPL in the first version.
+- Use an explicit synchronous agent loop, not an agent framework, independent
+  planner, or multi-agent orchestration.
+- Depend on the `ModelClient` protocol in core code. The first production
+  adapter uses the official OpenAI Responses API; tests use `FakeModelClient`.
+- Use `store=False` and manage active history and compaction locally. Do not
+  use server-side conversation state as a substitute for local context logic.
+- Use strict function-tool schemas, but validate every argument again locally.
+- Execute tool calls sequentially in the first version.
+- The first version exposes only `list_directory`, `read_file`,
+  `replace_text`, `write_file`, and `run_command`.
+- `write_file` may create a file but may not overwrite one. `replace_text`
+  must require an exact expected match count. Do not add deletion or move
+  tools in the first version.
+- Parse commands into argument arrays and execute with `shell=False`.
+- Do not expose PowerShell, `cmd.exe`, Bash, WSL, network commands, package
+  installation, system administration, or destructive Git commands.
+- Allow only the Python verification commands, workspace-local Python scripts,
+  and read-only Git subcommands documented in `DESIGN.md`.
+- Treat `.git/` and `.coding-agent/` as protected internal paths.
+- Any successful file mutation must invalidate earlier verification evidence.
+- If `--verify` is supplied, the agent may report success only after that exact
+  command runs after the latest mutation and exits with code 0.
+- Without `--verify`, require a safe, credible `purpose="verification"`
+  command after the latest mutation; inspection-only commands are not proof.
+- Keep default limits aligned with `DESIGN.md`: 12 model calls, 40 tool calls,
+  10 minutes total runtime, and a threshold of 3 for no-progress repetition,
+  consecutive failures, or consecutive safety rejections.
+- Write only redacted execution facts to JSONL. Never log hidden reasoning,
+  authentication headers, environment dumps, or provider continuation payloads.
+- Treat code executed from the workspace as trusted for the first version and
+  state clearly that the project is not an operating-system sandbox.
+
+## Dependency policy
+
+- The only planned production dependency is the official `openai` Python
+  package.
+- The planned test dependency is `pytest`.
+- Any additional dependency requires an explicit design discussion and user
+  approval before it is introduced.
+- Never install a dependency merely to avoid implementing required core agent
+  logic locally.
+
+## Test and reporting rules
+
+- Default automated tests must not require network access or a real API key.
+- Use `FakeModelClient` for deterministic agent-loop tests.
+- Test the OpenAI adapter with fake SDK responses; keep live API checks
+  separate and explicitly opt-in.
+- Test success and failure paths for every security rule, termination rule, and
+  verification invariant.
+- A model statement that work is complete is not proof. Report only local
+  execution evidence and actual exit codes.
+- Do not mark a `TASKS.md` item complete until its acceptance criteria and
+  required tests have actually been satisfied.
