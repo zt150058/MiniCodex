@@ -14,7 +14,10 @@ from coding_agent.tools.base import (
 
 _LIST_ARGUMENTS = {"path", "recursive", "max_depth", "max_entries"}
 _READ_ARGUMENTS = {"path", "start_line", "end_line"}
+_REPLACE_ARGUMENTS = {"path", "old_text", "new_text", "expected_count"}
+_WRITE_ARGUMENTS = {"path", "content"}
 _MAX_READ_BYTES = 256 * 1024
+_MAX_WRITE_BYTES = 512 * 1024
 
 
 def _require_exact_arguments(
@@ -98,7 +101,12 @@ def _iter_directory_entries(
             )
 
 
-def _json_execution(payload: JSONObject, *, truncated: bool = False) -> ToolExecution:
+def _json_execution(
+    payload: JSONObject,
+    *,
+    truncated: bool = False,
+    changed_paths: tuple[str, ...] = (),
+) -> ToolExecution:
     return ToolExecution(
         output=json.dumps(
             payload,
@@ -106,7 +114,10 @@ def _json_execution(payload: JSONObject, *, truncated: bool = False) -> ToolExec
             sort_keys=True,
             separators=(",", ":"),
         ),
-        metadata=ToolResultMetadata(truncated=truncated),
+        metadata=ToolResultMetadata(
+            truncated=truncated,
+            changed_paths=changed_paths,
+        ),
     )
 
 
@@ -143,6 +154,31 @@ def _decode_utf8_prefix(path: Path) -> tuple[str, bool]:
             except UnicodeDecodeError:
                 continue
         raise ToolArgumentError("file is not valid UTF-8") from exc
+
+
+def _required_string(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise ToolArgumentError(f"{name} must be a string")
+    return value
+
+
+def _encode_utf8(value: str, name: str) -> bytes:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ToolArgumentError(f"{name} cannot be encoded as UTF-8") from exc
+
+
+def _decode_utf8_file(path: Path) -> tuple[bytes, str]:
+    raw = path.read_bytes()
+    try:
+        return raw, raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ToolArgumentError("file is not valid UTF-8") from exc
+
+
+def _relative_output_path(workspace: Path, target: Path) -> str:
+    return target.relative_to(workspace).as_posix()
 
 
 class ListDirectoryTool:
@@ -274,4 +310,140 @@ class ReadFileTool:
         return _json_execution(
             {"lines": lines},
             truncated=size_truncated or omitted_before or omitted_after,
+        )
+
+
+class ReplaceTextTool:
+    name = "replace_text"
+    schema: JSONObject = {
+        "name": "replace_text",
+        "description": (
+            "Replace an exact number of non-overlapping matches in a UTF-8 file."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "old_text": {"type": "string", "minLength": 1},
+                "new_text": {"type": "string"},
+                "expected_count": {"type": "integer", "minimum": 1},
+            },
+            "required": ["path", "old_text", "new_text", "expected_count"],
+            "additionalProperties": False,
+        },
+    }
+
+    def execute(
+        self,
+        arguments: JSONObject,
+        context: ExecutionContext,
+    ) -> ToolExecution:
+        values = _require_exact_arguments(
+            arguments,
+            _REPLACE_ARGUMENTS,
+            self.name,
+        )
+        old_text = _required_string(values["old_text"], "old_text")
+        if not old_text:
+            raise ToolArgumentError("old_text must not be empty")
+        new_text = _required_string(values["new_text"], "new_text")
+        _encode_utf8(old_text, "old_text")
+        _encode_utf8(new_text, "new_text")
+        expected_count = _positive_integer(
+            values["expected_count"],
+            "expected_count",
+        )
+
+        workspace, target = _functional_workspace_path(
+            values["path"],
+            context,
+        )
+        if not target.exists():
+            raise ToolArgumentError("file does not exist")
+        if not target.is_file():
+            raise ToolArgumentError("path is not a file")
+
+        _, source = _decode_utf8_file(target)
+        actual_count = source.count(old_text)
+        if actual_count != expected_count:
+            raise ToolArgumentError(
+                f"expected {expected_count} matches for old_text, "
+                f"found {actual_count}"
+            )
+
+        rendered = source.replace(old_text, new_text)
+        encoded = _encode_utf8(rendered, "result")
+        if len(encoded) > _MAX_WRITE_BYTES:
+            raise ToolArgumentError("result exceeds 512 KiB UTF-8 limit")
+
+        target.write_bytes(encoded)
+        relative_path = _relative_output_path(workspace, target)
+        return _json_execution(
+            {
+                "path": relative_path,
+                "replacements": actual_count,
+            },
+            changed_paths=(relative_path,),
+        )
+
+
+class WriteFileTool:
+    name = "write_file"
+    schema: JSONObject = {
+        "name": "write_file",
+        "description": "Create a new UTF-8 file without overwriting.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "content": {"type": "string"},
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    }
+
+    def execute(
+        self,
+        arguments: JSONObject,
+        context: ExecutionContext,
+    ) -> ToolExecution:
+        values = _require_exact_arguments(
+            arguments,
+            _WRITE_ARGUMENTS,
+            self.name,
+        )
+        content = _required_string(values["content"], "content")
+        encoded = _encode_utf8(content, "content")
+        if len(encoded) > _MAX_WRITE_BYTES:
+            raise ToolArgumentError("content exceeds 512 KiB UTF-8 limit")
+
+        workspace, target = _functional_workspace_path(
+            values["path"],
+            context,
+        )
+        if target.exists():
+            if target.is_dir():
+                raise ToolArgumentError("path is an existing directory")
+            raise ToolArgumentError("file already exists")
+        if not target.parent.exists():
+            raise ToolArgumentError("parent directory does not exist")
+        if not target.parent.is_dir():
+            raise ToolArgumentError("parent path is not a directory")
+
+        try:
+            with target.open("xb") as stream:
+                stream.write(encoded)
+        except FileExistsError as exc:
+            raise ToolArgumentError("file already exists") from exc
+
+        relative_path = _relative_output_path(workspace, target)
+        return _json_execution(
+            {
+                "bytes_written": len(encoded),
+                "path": relative_path,
+            },
+            changed_paths=(relative_path,),
         )

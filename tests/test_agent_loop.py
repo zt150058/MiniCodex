@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -19,11 +20,16 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import FakeModelClient
-from coding_agent.state import AgentStatus
+from coding_agent.state import AgentStatus, VerificationStatus
 from coding_agent.tools.base import (
     ExecutionContext,
     ToolArgumentError,
     ToolExecution,
+)
+from coding_agent.tools.filesystem import (
+    ReadFileTool,
+    ReplaceTextTool,
+    WriteFileTool,
 )
 from coding_agent.tools.registry import ToolRegistry
 
@@ -118,6 +124,13 @@ def test_direct_text_returns_completion_candidate(tmp_path: Path) -> None:
     assert state.open_issues == ()
     assert state.model_call_count == 1
     assert state.tool_call_count == 0
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN
+    assert json.dumps(state.verification_status) == '"not_run"'
+    assert "mutation_index=0" in repr(state)
+    assert "modified_paths=()" in repr(state)
+    assert "verification_status=" in repr(state)
     assert state.messages == (
         UserMessage("repair the failing test"),
         AssistantMessage(content="implementation is ready for verification"),
@@ -317,6 +330,9 @@ def test_tool_exception_becomes_error_result_without_traceback(
     assert result.status == "error"
     assert result.error == "tool_execution_failed: RuntimeError: boom"
     assert "Traceback" not in result.error
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN
     assert state.status is AgentStatus.COMPLETION_CANDIDATE
 
 
@@ -364,3 +380,253 @@ import coding_agent.tools.registry
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_successful_replace_updates_ledger_and_marks_verification_stale(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sample.txt").write_text("old", encoding="utf-8")
+    call = ToolCall(
+        call_id="replace_1",
+        name="replace_text",
+        arguments={
+            "path": "sample.txt",
+            "old_text": "old",
+            "new_text": "new",
+            "expected_count": 1,
+        },
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(ReplaceTextTool(),),
+    )
+
+    state = runner.run("replace text")
+
+    assert state.mutation_index == 1
+    assert state.modified_paths == ("sample.txt",)
+    assert state.verification_status is VerificationStatus.STALE
+    assert json.dumps(state.verification_status) == '"stale"'
+
+
+def test_successful_write_updates_ledger_and_marks_verification_stale(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall(
+        call_id="write_1",
+        name="write_file",
+        arguments={"path": "created.txt", "content": "content"},
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(WriteFileTool(),),
+    )
+
+    state = runner.run("create file")
+
+    assert state.mutation_index == 1
+    assert state.modified_paths == ("created.txt",)
+    assert state.verification_status is VerificationStatus.STALE
+
+
+def test_successful_calls_increment_per_call_and_deduplicate_in_first_seen_order(
+    tmp_path: Path,
+) -> None:
+    write_b = ToolCall(
+        call_id="write_b",
+        name="write_file",
+        arguments={"path": "b.txt", "content": "old"},
+    )
+    write_a = ToolCall(
+        call_id="write_a",
+        name="write_file",
+        arguments={"path": "a.txt", "content": "a"},
+    )
+    replace_b = ToolCall(
+        call_id="replace_b",
+        name="replace_text",
+        arguments={
+            "path": "b.txt",
+            "old_text": "old",
+            "new_text": "new",
+            "expected_count": 1,
+        },
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(write_b, write_a, replace_b)),
+            ModelResponse(text="done"),
+        ),
+        tools=(WriteFileTool(), ReplaceTextTool()),
+    )
+
+    state = runner.run("modify two paths")
+
+    assert state.mutation_index == 3
+    assert state.modified_paths == ("b.txt", "a.txt")
+    assert state.verification_status is VerificationStatus.STALE
+
+
+@dataclass(slots=True)
+class MultiPathMutationTool:
+    name: str = field(default="multi_path_mutation", init=False)
+    schema: JSONObject = field(
+        default_factory=lambda: {
+            "name": "multi_path_mutation",
+            "description": "Return two changed paths for ledger testing.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+        init=False,
+    )
+
+    def execute(
+        self,
+        arguments: JSONObject,
+        context: ExecutionContext,
+    ) -> ToolExecution:
+        return ToolExecution(
+            output="changed two paths",
+            metadata=ToolResultMetadata(changed_paths=("z.py", "a.py")),
+        )
+
+
+def test_one_successful_call_with_multiple_paths_increments_once(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall(
+        call_id="multi_1",
+        name="multi_path_mutation",
+        arguments={},
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(MultiPathMutationTool(),),
+    )
+
+    state = runner.run("record multiple paths")
+
+    assert state.mutation_index == 1
+    assert state.modified_paths == ("z.py", "a.py")
+    assert state.verification_status is VerificationStatus.STALE
+
+
+def test_read_file_does_not_change_mutation_state(tmp_path: Path) -> None:
+    (tmp_path / "sample.txt").write_text("content", encoding="utf-8")
+    call = ToolCall(
+        call_id="read_1",
+        name="read_file",
+        arguments={"path": "sample.txt", "start_line": 1, "end_line": None},
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(ReadFileTool(),),
+    )
+
+    state = runner.run("read without changing")
+
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN
+
+
+def test_failed_replace_does_not_change_mutation_state(tmp_path: Path) -> None:
+    target = tmp_path / "sample.txt"
+    target.write_text("old", encoding="utf-8")
+    call = ToolCall(
+        call_id="replace_bad",
+        name="replace_text",
+        arguments={
+            "path": "sample.txt",
+            "old_text": "old",
+            "new_text": "new",
+            "expected_count": 2,
+        },
+    )
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(ReplaceTextTool(),),
+    )
+
+    state = runner.run("failed replace")
+
+    result = client.requests[1].messages[2]
+    assert isinstance(result, ToolResult)
+    assert result.status == "rejected"
+    assert target.read_text(encoding="utf-8") == "old"
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN
+
+
+def test_failed_write_does_not_change_mutation_state(tmp_path: Path) -> None:
+    target = tmp_path / "created.txt"
+    target.write_text("original", encoding="utf-8")
+    call = ToolCall(
+        call_id="write_bad",
+        name="write_file",
+        arguments={"path": "created.txt", "content": "replacement"},
+    )
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(WriteFileTool(),),
+    )
+
+    state = runner.run("failed write")
+
+    result = client.requests[1].messages[2]
+    assert isinstance(result, ToolResult)
+    assert result.status == "rejected"
+    assert target.read_text(encoding="utf-8") == "original"
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN
+
+
+def test_rejection_and_exception_after_success_preserve_existing_ledger(
+    tmp_path: Path,
+) -> None:
+    write = ToolCall(
+        call_id="write_ok",
+        name="write_file",
+        arguments={"path": "created.txt", "content": "content"},
+    )
+    rejected_write = ToolCall(
+        call_id="write_bad",
+        name="write_file",
+        arguments={"path": "created.txt", "content": "replacement"},
+    )
+    explosion = ToolCall(call_id="explode_after_write", name="explode", arguments={})
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(write, rejected_write, explosion)),
+            ModelResponse(text="done"),
+        ),
+        tools=(WriteFileTool(), ExplodingTool()),
+    )
+
+    state = runner.run("preserve ledger after failures")
+
+    first_request_with_results = client.requests[1].messages
+    results = [
+        message
+        for message in first_request_with_results
+        if isinstance(message, ToolResult)
+    ]
+    assert [result.status for result in results] == ["ok", "rejected", "error"]
+    assert state.mutation_index == 1
+    assert state.modified_paths == ("created.txt",)
+    assert state.verification_status is VerificationStatus.STALE

@@ -12,6 +12,11 @@ class AgentStatus(StrEnum):
     FAILED = "failed"
 
 
+class VerificationStatus(StrEnum):
+    NOT_RUN = "not_run"
+    STALE = "stale"
+
+
 @dataclass(slots=True)
 class AgentState:
     task: str
@@ -21,6 +26,9 @@ class AgentState:
     status: AgentStatus = AgentStatus.RUNNING
     model_call_count: int = 0
     tool_call_count: int = 0
+    mutation_index: int = 0
+    modified_paths: tuple[str, ...] = ()
+    verification_status: VerificationStatus = VerificationStatus.NOT_RUN
     completion_text: str | None = None
     failure_reason: str | None = None
     continuation_items: tuple[object, ...] = field(default=(), repr=False)

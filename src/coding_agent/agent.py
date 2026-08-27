@@ -1,10 +1,25 @@
 from __future__ import annotations
 
-from coding_agent.messages import AssistantMessage, ModelRequest
+from coding_agent.messages import AssistantMessage, ModelRequest, ToolResult
 from coding_agent.model import ModelClient
-from coding_agent.state import AgentState, AgentStatus
+from coding_agent.state import AgentState, AgentStatus, VerificationStatus
 from coding_agent.tools.base import ExecutionContext
 from coding_agent.tools.registry import ToolRegistry
+
+
+def _record_successful_mutation(
+    state: AgentState,
+    result: ToolResult,
+) -> None:
+    changed_paths = result.metadata.changed_paths
+    if result.status != "ok" or not changed_paths:
+        return
+
+    state.mutation_index += 1
+    known_paths = set(state.modified_paths)
+    new_paths = tuple(path for path in changed_paths if path not in known_paths)
+    state.modified_paths += new_paths
+    state.verification_status = VerificationStatus.STALE
 
 
 class AgentRunner:
@@ -63,6 +78,7 @@ class AgentRunner:
                         self._execution_context,
                     )
                     state.messages += (result,)
+                    _record_successful_mutation(state, result)
                     state.tool_call_count += 1
                 continue
 
