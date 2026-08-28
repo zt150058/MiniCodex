@@ -31,7 +31,15 @@ from coding_agent.messages import (
     ToolResult,
     UserMessage,
 )
-from coding_agent.model import FatalModelError, ModelError, TransientModelError
+from coding_agent.model import (
+    FatalModelError,
+    ModelBudgetExceeded,
+    ModelBudgetReason,
+    ModelCallBudget,
+    ModelError,
+    TransientModelError,
+    invoke_model,
+)
 
 
 class InvalidOpenAIResponseError(ModelError):
@@ -365,12 +373,24 @@ class OpenAIResponsesClient:
         self._sleeper = sleeper
 
     def complete(self, request: ModelRequest) -> ModelResponse:
+        budget = ModelCallBudget(
+            max_logical_calls=1,
+            max_provider_attempts=3,
+        )
+        return invoke_model(self, request, budget)
+
+    def complete_with_budget(
+        self,
+        request: ModelRequest,
+        budget: ModelCallBudget,
+    ) -> ModelResponse:
         mapped_input = _map_messages(request)
         mapped_tools = _map_tools(request.tool_schemas)
 
         response = None
         for attempt in range(3):
             try:
+                budget.claim_provider_attempt()
                 response = self._client.responses.create(
                     model=self._model,
                     input=mapped_input,
@@ -414,6 +434,10 @@ class OpenAIResponsesClient:
                         raise TransientModelError(
                             "OpenAI Responses request failed after 3 attempts: "
                             "transient provider error"
+                        ) from None
+                    if budget.remaining_provider_attempts == 0:
+                        raise ModelBudgetExceeded(
+                            ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT
                         ) from None
                     self._sleeper((0.25, 0.50)[attempt])
                     continue

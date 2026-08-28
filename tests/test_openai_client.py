@@ -33,7 +33,15 @@ from coding_agent.messages import (
     ToolResult,
     UserMessage,
 )
-from coding_agent.model import FatalModelError, ModelClient, TransientModelError
+from coding_agent.model import (
+    FatalModelError,
+    ModelBudgetExceeded,
+    ModelBudgetReason,
+    ModelCallBudget,
+    ModelClient,
+    TransientModelError,
+    invoke_model,
+)
 from coding_agent.openai_client import (
     InvalidOpenAIResponseError,
     OpenAIResponsesClient,
@@ -990,3 +998,57 @@ assert result.text == "offline"
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_openai_retries_claim_each_shared_provider_attempt() -> None:
+    delays: list[float] = []
+    sdk = FakeSDKClient(
+        FakeRateLimitError("hidden"),
+        text_response("recovered"),
+    )
+    client = OpenAIResponsesClient(
+        model="gpt-test",
+        api_key=FAKE_KEY,
+        sdk_client=sdk,
+        sleeper=delays.append,
+    )
+    budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=2)
+
+    response = invoke_model(
+        client,
+        ModelRequest(messages=(UserMessage("retry"),)),
+        budget,
+    )
+
+    assert response.text == "recovered"
+    assert (budget.logical_calls, budget.provider_attempts) == (1, 2)
+    assert len(sdk.responses.calls) == 2
+    assert delays == [0.25]
+
+
+def test_openai_shared_provider_budget_prevents_third_physical_request() -> None:
+    delays: list[float] = []
+    sdk = FakeSDKClient(
+        FakeRateLimitError("hidden"),
+        FakeRateLimitError("hidden"),
+        text_response("must not run"),
+    )
+    client = OpenAIResponsesClient(
+        model="gpt-test",
+        api_key=FAKE_KEY,
+        sdk_client=sdk,
+        sleeper=delays.append,
+    )
+    budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=2)
+
+    with pytest.raises(ModelBudgetExceeded) as caught:
+        invoke_model(
+            client,
+            ModelRequest(messages=(UserMessage("retry"),)),
+            budget,
+        )
+
+    assert caught.value.reason is ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT
+    assert len(sdk.responses.calls) == 2
+    assert budget.provider_attempts == 2
+    assert delays == [0.25]

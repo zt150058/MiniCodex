@@ -18,9 +18,13 @@ from coding_agent.model import (
     FakeModelClient,
     FakeModelExhaustedError,
     FatalModelError,
+    ModelBudgetExceeded,
+    ModelBudgetReason,
+    ModelCallBudget,
     ModelClient,
     ModelError,
     TransientModelError,
+    invoke_model,
 )
 
 
@@ -214,3 +218,64 @@ def test_fake_model_replays_transient_and_fatal_errors_in_order() -> None:
     assert caught.value is fatal
 
     assert client.requests == (request, request, request)
+
+
+def test_invoke_model_counts_one_logical_and_one_physical_attempt() -> None:
+    client = FakeModelClient((ModelResponse(text="done"),))
+    budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=1)
+
+    response = invoke_model(client, _request("count"), budget)
+
+    assert response.text == "done"
+    assert budget.logical_calls == 1
+    assert budget.provider_attempts == 1
+    assert len(client.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("logical_calls", "provider_attempts", "reason"),
+    [
+        (1, 0, ModelBudgetReason.LOGICAL_CALL_LIMIT),
+        (0, 1, ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT),
+    ],
+)
+def test_budget_rejects_before_call_without_exceeding_limit(
+    logical_calls: int,
+    provider_attempts: int,
+    reason: ModelBudgetReason,
+) -> None:
+    client = FakeModelClient((ModelResponse(text="must not run"),))
+    budget = ModelCallBudget(
+        max_logical_calls=1,
+        max_provider_attempts=1,
+        logical_calls=logical_calls,
+        provider_attempts=provider_attempts,
+    )
+
+    with pytest.raises(ModelBudgetExceeded) as caught:
+        invoke_model(client, _request("blocked"), budget)
+
+    assert caught.value.reason is reason
+    assert budget.logical_calls <= budget.max_logical_calls
+    assert budget.provider_attempts <= budget.max_provider_attempts
+    assert client.requests == ()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"max_logical_calls": 0},
+        {"max_provider_attempts": -1},
+        {"max_logical_calls": True},
+        {"max_provider_attempts": 1.5},
+        {"logical_calls": -1},
+        {"provider_attempts": True},
+        {"logical_calls": 2, "max_logical_calls": 1},
+        {"provider_attempts": 2, "max_provider_attempts": 1},
+    ],
+)
+def test_model_budget_rejects_invalid_counts_and_limits(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        ModelCallBudget(**changes)  # type: ignore[arg-type]
