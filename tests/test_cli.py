@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from io import StringIO
 from pathlib import Path
 import subprocess
 import sys
 import tomllib
+from typing import TextIO
 
 import pytest
 
@@ -166,6 +168,17 @@ def test_cli_accepts_valid_arguments(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    received: list[RunConfig] = []
+
+    def application(
+        config: RunConfig,
+        *,
+        stdout: TextIO,
+        stderr: TextIO,
+    ) -> int:
+        received.append(config)
+        return 0
+
     exit_code = main(
         [
             "inspect the project",
@@ -177,14 +190,15 @@ def test_cli_accepts_valid_arguments(
             "cli-model",
         ],
         environ={"OPENAI_API_KEY": SECRET_SENTINEL},
+        application=application,
     )
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert captured.out == (
-        "Configuration valid. Agent execution is not implemented in task 1.\n"
-    )
+    assert len(received) == 1
+    assert received[0].task == "inspect the project"
     assert captured.err == ""
+    assert captured.out == ""
     assert SECRET_SENTINEL not in captured.out
 
 
@@ -290,12 +304,15 @@ def test_gitignore_covers_runtime_and_local_credentials() -> None:
     }.issubset(ignored)
 
 
-def test_standard_console_command_runs(tmp_path: Path) -> None:
+def test_standard_console_command_rejects_missing_key_before_app(
+    tmp_path: Path,
+) -> None:
     launcher = Path(sys.executable).with_name("coding-agent.exe")
     assert launcher.is_file()
 
     environ = os.environ.copy()
-    environ.update(valid_environ())
+    environ.pop("OPENAI_API_KEY", None)
+    environ["OPENAI_MODEL"] = "env-model"
     completed = subprocess.run(
         [str(launcher), "inspect", "--workspace", str(tmp_path)],
         capture_output=True,
@@ -305,11 +322,10 @@ def test_standard_console_command_runs(tmp_path: Path) -> None:
         check=False,
     )
 
-    assert completed.returncode == 0
-    assert completed.stdout == (
-        "Configuration valid. Agent execution is not implemented in task 1.\n"
-    )
-    assert completed.stderr == ""
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert "OPENAI_API_KEY is not configured" in completed.stderr
+    assert "coding_agent.app" not in completed.stderr
     assert SECRET_SENTINEL not in completed.stdout
     assert SECRET_SENTINEL not in completed.stderr
 
@@ -399,13 +415,27 @@ def test_cli_authorizes_safe_verify_before_returning_success(
     capsys: pytest.CaptureFixture[str],
     verify: str,
 ) -> None:
+    received: list[RunConfig] = []
+
+    def application(
+        config: RunConfig,
+        *,
+        stdout: TextIO,
+        stderr: TextIO,
+    ) -> int:
+        received.append(config)
+        return 0
+
     exit_code = main(
         ["inspect", "--workspace", str(tmp_path), "--verify", verify],
         environ=valid_environ(),
+        application=application,
     )
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert len(received) == 1
+    assert received[0].verify_command is not None
     assert verify not in captured.out
     assert verify not in captured.err
     assert SECRET_SENTINEL not in captured.out + captured.err
@@ -476,3 +506,44 @@ def test_config_rejects_noncredible_user_verify_without_echoing_it(
     )
     assert "git status" not in str(caught.value)
     assert "secret-sentinel" not in str(caught.value)
+
+
+def test_cli_delegates_one_validated_config_to_application(tmp_path: Path) -> None:
+    calls: list[RunConfig] = []
+    expected_stdout = StringIO()
+    expected_stderr = StringIO()
+
+    def application(
+        config: RunConfig,
+        *,
+        stdout: TextIO,
+        stderr: TextIO,
+    ) -> int:
+        assert stdout is expected_stdout
+        assert stderr is expected_stderr
+        calls.append(config)
+        return 17
+
+    code = main(
+        [
+            " repair ",
+            "--workspace",
+            str(tmp_path),
+            "--verify",
+            "pytest -q",
+        ],
+        environ={
+            "OPENAI_MODEL": "fake-model",
+            "OPENAI_API_KEY": SECRET_SENTINEL,
+        },
+        stdout=expected_stdout,
+        stderr=expected_stderr,
+        application=application,
+    )
+
+    assert code == 17
+    assert len(calls) == 1
+    assert calls[0].task == "repair"
+    assert calls[0].verify_command is not None
+    assert expected_stdout.getvalue() == ""
+    assert expected_stderr.getvalue() == ""
