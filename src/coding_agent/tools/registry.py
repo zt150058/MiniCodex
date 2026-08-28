@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from coding_agent.messages import JSONObject, ToolCall, ToolResult
+from coding_agent.safety import SafetyViolation
 from coding_agent.tools.base import ExecutionContext, Tool, ToolArgumentError
 
 
@@ -43,6 +44,16 @@ class ToolRegistry:
                 status="ok",
                 output=execution.output,
                 metadata=execution.metadata,
+            )
+        except SafetyViolation as exc:
+            return ToolResult(
+                call_id=call.call_id,
+                tool_name=call.name,
+                status="rejected",
+                error=(
+                    f"security_rejected:{exc.code.value}: "
+                    f"{exc.public_message}"
+                ),
             )
         except ToolArgumentError as exc:
             detail = str(exc).strip() or "invalid arguments"

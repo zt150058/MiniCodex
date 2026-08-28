@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from coding_agent.messages import JSONObject, ToolCall, ToolResultMetadata
+from coding_agent.safety import PathGuard, SafetyCode, SafetyViolation
 from coding_agent.tools.base import (
     ExecutionContext,
     ToolArgumentError,
@@ -162,11 +163,12 @@ def test_list_directory_accepts_windows_separators_and_normalizes_output(
 
 
 def test_list_directory_rejects_missing_directory(tmp_path: Path) -> None:
-    with pytest.raises(ToolArgumentError, match="directory does not exist"):
+    with pytest.raises(SafetyViolation) as exc_info:
         ListDirectoryTool().execute(
             _list_arguments(path="missing"),
             _context(tmp_path),
         )
+    assert exc_info.value.code is SafetyCode.PATH_NOT_FOUND
 
 
 def test_list_directory_rejects_file_path(tmp_path: Path) -> None:
@@ -187,11 +189,6 @@ def test_list_directory_rejects_file_path(tmp_path: Path) -> None:
             {**_list_arguments(), "extra": True},
             "list_directory arguments must contain exactly",
         ),
-        (_list_arguments(path=""), "path must be a non-empty string"),
-        (_list_arguments(path=None), "path must be a non-empty string"),
-        (_list_arguments(path="bad\x00path"), "path must not contain NUL"),
-        (_list_arguments(path="..\\outside"), "path must not contain '..'"),
-        (_list_arguments(path=Path.cwd().anchor), "path must be relative"),
         (_list_arguments(recursive=1), "recursive must be a boolean"),
         (_list_arguments(max_depth=0), "max_depth must be between 1 and 3"),
         (_list_arguments(max_depth=4), "max_depth must be between 1 and 3"),
@@ -208,6 +205,29 @@ def test_list_directory_rejects_invalid_arguments(
 ) -> None:
     with pytest.raises(ToolArgumentError, match=message):
         ListDirectoryTool().execute(arguments, _context(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("path", "code"),
+    [
+        ("", SafetyCode.INVALID_PATH),
+        (None, SafetyCode.INVALID_PATH),
+        ("bad\x00path", SafetyCode.INVALID_PATH),
+        ("..\\outside", SafetyCode.PATH_OUTSIDE_WORKSPACE),
+        (Path.cwd().anchor, SafetyCode.PATH_OUTSIDE_WORKSPACE),
+    ],
+)
+def test_list_directory_rejects_unsafe_paths_with_stable_code(
+    tmp_path: Path,
+    path: object,
+    code: SafetyCode,
+) -> None:
+    with pytest.raises(SafetyViolation) as exc_info:
+        ListDirectoryTool().execute(
+            _list_arguments(path=path),
+            _context(tmp_path),
+        )
+    assert exc_info.value.code is code
 
 
 def _build_depth_tree(tmp_path: Path) -> None:
@@ -435,14 +455,14 @@ def test_read_file_start_beyond_end_returns_empty_truncated_result(
 
 
 @pytest.mark.parametrize(
-    ("arguments", "message"),
+    ("arguments", "expected"),
     [
         ({}, "read_file arguments must contain exactly"),
         (
             {**_read_arguments(), "extra": True},
             "read_file arguments must contain exactly",
         ),
-        (_read_arguments(path=""), "path must be a non-empty string"),
+        (_read_arguments(path=""), SafetyCode.INVALID_PATH),
         (_read_arguments(start_line=0), "start_line must be a positive integer"),
         (_read_arguments(start_line=True), "start_line must be a positive integer"),
         (_read_arguments(end_line=0), "end_line must be a positive integer"),
@@ -453,20 +473,26 @@ def test_read_file_start_beyond_end_returns_empty_truncated_result(
 def test_read_file_rejects_invalid_arguments(
     tmp_path: Path,
     arguments: JSONObject,
-    message: str,
+    expected: str | SafetyCode,
 ) -> None:
     (tmp_path / "notes.txt").write_text("content", encoding="utf-8")
 
-    with pytest.raises(ToolArgumentError, match=message):
-        ReadFileTool().execute(arguments, _context(tmp_path))
+    if isinstance(expected, SafetyCode):
+        with pytest.raises(SafetyViolation) as exc_info:
+            ReadFileTool().execute(arguments, _context(tmp_path))
+        assert exc_info.value.code is expected
+    else:
+        with pytest.raises(ToolArgumentError, match=expected):
+            ReadFileTool().execute(arguments, _context(tmp_path))
 
 
 def test_read_file_rejects_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(ToolArgumentError, match="file does not exist"):
+    with pytest.raises(SafetyViolation) as exc_info:
         ReadFileTool().execute(
             _read_arguments(path="missing.txt"),
             _context(tmp_path),
         )
+    assert exc_info.value.code is SafetyCode.PATH_NOT_FOUND
 
 
 def test_read_file_rejects_directory_path(tmp_path: Path) -> None:
@@ -599,3 +625,101 @@ import coding_agent.tools.filesystem
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_list_directory_omits_protected_entries_without_hiding_similar_names(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("secret", encoding="utf-8")
+    (tmp_path / ".coding-agent").mkdir()
+    (tmp_path / ".coding-agent" / "log.jsonl").write_text(
+        "secret",
+        encoding="utf-8",
+    )
+    (tmp_path / ".gitignore").write_text("ok", encoding="utf-8")
+
+    execution = ListDirectoryTool().execute(
+        _list_arguments(recursive=True, max_depth=3),
+        _context(tmp_path),
+    )
+
+    assert _json_output(execution) == {
+        "entries": [{"path": ".gitignore", "type": "file"}]
+    }
+    for protected in (".git", ".coding-agent"):
+        with pytest.raises(SafetyViolation) as exc_info:
+            ListDirectoryTool().execute(
+                _list_arguments(path=protected),
+                _context(tmp_path),
+            )
+        assert exc_info.value.code is SafetyCode.PROTECTED_PATH
+
+
+def test_list_directory_omits_reparse_children(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    link = tmp_path / "linked"
+    try:
+        os.symlink(outside, link, target_is_directory=True)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror == 1314:
+            pytest.fail(
+                "Task 8 directory-symlink behavior remains unverified because "
+                "the test account lacks symlink privilege (winerror=1314)"
+            )
+        pytest.fail(
+            "Task 8 requires a real Windows directory symlink; "
+            f"unexpected winerror={winerror}"
+        )
+    (tmp_path / "visible.txt").write_text("ok", encoding="utf-8")
+
+    execution = ListDirectoryTool().execute(
+        _list_arguments(recursive=True, max_depth=3),
+        _context(tmp_path),
+    )
+
+    assert _json_output(execution) == {
+        "entries": [{"path": "visible.txt", "type": "file"}]
+    }
+
+
+@pytest.mark.parametrize("protected", [".git/config", ".GIT/config", ".coding-agent/log.jsonl"])
+def test_read_file_uses_path_guard_for_protected_paths(
+    tmp_path: Path,
+    protected: str,
+) -> None:
+    target = tmp_path.joinpath(*protected.split("/"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("secret", encoding="utf-8")
+
+    with pytest.raises(SafetyViolation) as exc_info:
+        ReadFileTool().execute(_read_arguments(path=protected), _context(tmp_path))
+    assert exc_info.value.code is SafetyCode.PROTECTED_PATH
+
+
+def test_read_and_list_call_public_path_guard_methods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "notes.txt").write_text("text", encoding="utf-8")
+    calls: list[tuple[str, object]] = []
+    real_file = PathGuard.existing_file
+    real_directory = PathGuard.existing_directory
+
+    def observed_file(self: PathGuard, raw_path: object):
+        calls.append(("file", raw_path))
+        return real_file(self, raw_path)
+
+    def observed_directory(self: PathGuard, raw_path: object):
+        calls.append(("directory", raw_path))
+        return real_directory(self, raw_path)
+
+    monkeypatch.setattr(PathGuard, "existing_file", observed_file)
+    monkeypatch.setattr(PathGuard, "existing_directory", observed_directory)
+    ReadFileTool().execute(_read_arguments(), _context(tmp_path))
+    ListDirectoryTool().execute(_list_arguments(), _context(tmp_path))
+
+    assert ("file", "notes.txt") in calls
+    assert ("directory", ".") in calls

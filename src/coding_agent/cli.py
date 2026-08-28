@@ -21,7 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verify",
         default=None,
-        help="Optional final verification command; execution is added later",
+        help=(
+            "Optional final verification command; authorized now and "
+            "executed by Task 11."
+        ),
     )
     parser.add_argument(
         "--model",

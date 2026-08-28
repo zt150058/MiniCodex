@@ -10,13 +10,20 @@ import time
 import pytest
 
 from coding_agent.messages import ToolCall
+from coding_agent.safety import (
+    AuthorizedCommand,
+    CommandPolicy,
+    CommandSource,
+    SafetyCode,
+    SafetyViolation,
+)
 from coding_agent.tools.base import ExecutionContext, ToolArgumentError
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.tools.shell import RunCommandTool, parse_windows_command_line
 
 
 def _command_for_script(script: Path, *arguments: str) -> str:
-    return subprocess.list2cmdline([sys.executable, str(script), *arguments])
+    return subprocess.list2cmdline([sys.executable, script.name, *arguments])
 
 
 def _execute_script(
@@ -73,7 +80,7 @@ def test_run_command_schema_is_strict_and_timeout_is_not_model_facing() -> None:
     assert RunCommandTool.name == "run_command"
     assert RunCommandTool.schema == {
         "name": "run_command",
-        "description": "Run a temporarily authorized Python command in the workspace.",
+        "description": "Run an authorized command in the workspace.",
         "strict": True,
         "parameters": {
             "type": "object",
@@ -110,10 +117,6 @@ def test_run_command_schema_is_strict_and_timeout_is_not_model_facing() -> None:
             "command must be a non-empty string",
         ),
         (
-            {"command": "python\x00x", "purpose": "test"},
-            "command must not contain NUL",
-        ),
-        (
             {"command": "python", "purpose": "build"},
             "purpose must be inspect, test, or verification",
         ),
@@ -133,6 +136,15 @@ def test_run_command_rejects_invalid_arguments(
             arguments,
             ExecutionContext(tmp_path),
         )
+
+
+def test_run_command_rejects_nul_with_safety_code(tmp_path: Path) -> None:
+    with pytest.raises(SafetyViolation) as exc_info:
+        RunCommandTool().execute(
+            {"command": "python\x00x", "purpose": "test"},
+            ExecutionContext(tmp_path),
+        )
+    assert exc_info.value.code is SafetyCode.SHELL_SYNTAX_DENIED
 
 
 def test_run_command_registers_without_registry_changes(tmp_path: Path) -> None:
@@ -189,11 +201,7 @@ def test_parse_windows_command_line_handles_spaced_python_script_path() -> None:
 def test_parse_windows_command_line_rejects_empty_or_unclosed_input(
     command: str,
 ) -> None:
-    expected = (
-        "command must be a non-empty string"
-        if not command.strip()
-        else "command contains an unclosed quote"
-    )
+    expected = "command could not be parsed"
     with pytest.raises(ToolArgumentError, match=expected):
         parse_windows_command_line(command)
 
@@ -214,12 +222,12 @@ def test_parse_windows_command_line_maps_native_failure(
         return None
 
     monkeypatch.setattr(
-        "coding_agent.tools.shell._COMMAND_LINE_TO_ARGV_W",
+        "coding_agent.safety._COMMAND_LINE_TO_ARGV_W",
         native_failure,
     )
     with pytest.raises(
         ToolArgumentError,
-        match="command could not be parsed by Windows",
+        match="command could not be parsed",
     ):
         parse_windows_command_line("python.exe")
 
@@ -290,23 +298,21 @@ def test_run_command_does_not_pass_openai_api_key(
 
 
 @pytest.mark.parametrize(
-    "argv",
+    ("argv", "code"),
     [
-        ["cmd.exe", "/c", "echo", "unsafe"],
-        ["powershell.exe", "-Command", "Write-Output unsafe"],
-        [sys.executable, "-c", "print('unsafe')"],
-        [sys.executable, "-"],
-        [sys.executable, "-m", "pip", "list"],
+        (["cmd.exe", "/c", "echo", "unsafe"], SafetyCode.EXECUTABLE_DENIED),
+        (["powershell.exe", "-Command", "Write-Output unsafe"], SafetyCode.EXECUTABLE_DENIED),
+        ([sys.executable, "-c", "print('unsafe')"], SafetyCode.ARGUMENT_DENIED),
+        ([sys.executable, "-"], SafetyCode.ARGUMENT_DENIED),
+        ([sys.executable, "-m", "pip", "list"], SafetyCode.ARGUMENT_DENIED),
     ],
 )
 def test_temporary_boundary_rejects_nonapproved_entry_points(
     tmp_path: Path,
     argv: list[str],
+    code: SafetyCode,
 ) -> None:
-    with pytest.raises(
-        ToolArgumentError,
-        match="command is outside the temporary Task 7 boundary",
-    ):
+    with pytest.raises(SafetyViolation) as exc_info:
         RunCommandTool().execute(
             {
                 "command": subprocess.list2cmdline(argv),
@@ -314,6 +320,7 @@ def test_temporary_boundary_rejects_nonapproved_entry_points(
             },
             ExecutionContext(tmp_path),
         )
+    assert exc_info.value.code is code
 
 
 def test_temporary_boundary_rejects_script_outside_workspace(tmp_path: Path) -> None:
@@ -321,10 +328,7 @@ def test_temporary_boundary_rejects_script_outside_workspace(tmp_path: Path) -> 
     workspace.mkdir()
     outside = tmp_path / "outside.py"
     outside.write_text("print('unsafe')\n", encoding="utf-8")
-    with pytest.raises(
-        ToolArgumentError,
-        match="command is outside the temporary Task 7 boundary",
-    ):
+    with pytest.raises(SafetyViolation) as exc_info:
         RunCommandTool().execute(
             {
                 "command": _command_for_script(outside),
@@ -332,6 +336,7 @@ def test_temporary_boundary_rejects_script_outside_workspace(tmp_path: Path) -> 
             },
             ExecutionContext(workspace),
         )
+    assert exc_info.value.code is SafetyCode.PATH_NOT_FOUND
 
 
 @pytest.mark.parametrize("module", ["pytest", "unittest"])
@@ -603,7 +608,7 @@ def test_timeout_terminates_child_process_tree_before_child_side_effect(
 
     execution = RunCommandTool().execute(
         {
-            "command": _command_for_script(parent, str(child), str(marker)),
+            "command": _command_for_script(parent, child.name, marker.name),
             "purpose": "test",
         },
         ExecutionContext(tmp_path, command_timeout_seconds=0.35),
@@ -729,3 +734,127 @@ def test_process_launch_uses_shell_false_fixed_cwd_and_sanitized_environment(
     assert environment["PYTHONUTF8"] == "1"
     assert environment["PYTHONIOENCODING"] == "utf-8"
     assert environment["PYTHONUNBUFFERED"] == "1"
+
+
+def test_run_command_executes_only_policy_returned_argv(tmp_path: Path) -> None:
+    requested = "this raw string must not be parsed or executed"
+    safe_script = tmp_path / "safe.py"
+    safe_script.write_text("print('safe')\n", encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    class RecordingPolicy:
+        workspace = tmp_path.resolve()
+
+        def authorize(
+            self,
+            command: object,
+            *,
+            purpose: str,
+            source: CommandSource,
+        ) -> AuthorizedCommand:
+            observed["command"] = command
+            observed["purpose"] = purpose
+            observed["source"] = source
+            argv = (sys.executable, str(safe_script.resolve()))
+            return AuthorizedCommand(
+                argv=argv,
+                normalized_command=subprocess.list2cmdline(argv),
+                purpose=purpose,
+                source=source,
+            )
+
+    execution = RunCommandTool(
+        policy_factory=lambda workspace: RecordingPolicy(),  # type: ignore[arg-type]
+    ).execute(
+        {"command": requested, "purpose": "inspect"},
+        ExecutionContext(tmp_path),
+    )
+
+    payload = json.loads(execution.output or "")
+    assert observed == {
+        "command": requested,
+        "purpose": "inspect",
+        "source": CommandSource.MODEL,
+    }
+    assert payload["argv"] == [sys.executable, str(safe_script.resolve())]
+    assert payload["stdout"] == "safe\r\n"
+
+
+def test_run_command_security_rejection_does_not_start_process(tmp_path: Path) -> None:
+    started = False
+
+    def forbidden_factory(*args: object, **kwargs: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("process must not start")
+
+    with pytest.raises(SafetyViolation) as exc_info:
+        RunCommandTool(process_factory=forbidden_factory).execute(
+            {"command": "powershell.exe -Command Get-Date", "purpose": "inspect"},
+            ExecutionContext(tmp_path),
+        )
+    assert exc_info.value.code is SafetyCode.EXECUTABLE_DENIED
+    assert started is False
+
+
+def test_child_environment_removes_policy_widening_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key, value in {
+        "OPENAI_API_KEY": "secret",
+        "PYTHONPATH": "outside",
+        "PYTHONHOME": "outside",
+        "PYTEST_ADDOPTS": "-p dangerous",
+        "PYTEST_PLUGINS": "dangerous",
+        "MYPYPATH": "outside",
+        "MYPY_CONFIG_FILE": "outside.ini",
+        "GIT_DIR": "outside",
+        "GIT_WORK_TREE": "outside",
+        "GIT_OBJECT_DIRECTORY": "outside",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": "outside",
+        "GIT_EXTERNAL_DIFF": "dangerous.exe",
+        "GIT_SSH": "dangerous.exe",
+        "GIT_SSH_COMMAND": "dangerous.exe",
+        "GIT_ASKPASS": "dangerous.exe",
+        "SSH_ASKPASS": "dangerous.exe",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "alias.x",
+        "GIT_CONFIG_VALUE_0": "!dangerous.exe",
+    }.items():
+        monkeypatch.setenv(key, value)
+    script = tmp_path / "env.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    def recording_factory(
+        argv: tuple[str, ...],
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        observed.update(kwargs)
+        return subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
+
+    execution = RunCommandTool(process_factory=recording_factory).execute(
+        {"command": _command_for_script(script), "purpose": "test"},
+        ExecutionContext(tmp_path),
+    )
+
+    assert execution.metadata.exit_code == 0
+    environment = observed["env"]
+    assert isinstance(environment, dict)
+    folded = {key.casefold() for key in environment}
+    for denied in {
+        "openai_api_key", "pythonpath", "pythonhome", "pytest_addopts",
+        "pytest_plugins", "mypypath", "mypy_config_file", "git_dir", "git_work_tree", "git_object_directory",
+        "git_alternate_object_directories", "git_external_diff",
+        "git_ssh", "git_ssh_command", "git_askpass", "ssh_askpass",
+        "git_config_count", "git_config_key_0", "git_config_value_0",
+    }:
+        assert denied not in folded
+    assert environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == "NUL"
+    assert environment["GIT_PAGER"] == "cat"
+    assert environment["PAGER"] == "cat"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["GIT_NO_LAZY_FETCH"] == "1"

@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from coding_agent.messages import JSONObject, ToolCall, ToolResultMetadata
+from coding_agent.safety import PathGuard, SafetyCode, SafetyViolation
 from coding_agent.tools.base import (
     ExecutionContext,
     ToolArgumentError,
@@ -155,14 +156,14 @@ def test_replace_text_preserves_bom_and_unaffected_line_endings(
 
 
 @pytest.mark.parametrize(
-    ("arguments", "message"),
+    ("arguments", "expected"),
     [
         ({}, "replace_text arguments must contain exactly"),
         (
             {**_replace_arguments(), "extra": True},
             "replace_text arguments must contain exactly",
         ),
-        (_replace_arguments(path=None), "path must be a non-empty string"),
+        (_replace_arguments(path=None), SafetyCode.INVALID_PATH),
         (_replace_arguments(old_text=7), "old_text must be a string"),
         (_replace_arguments(old_text=""), "old_text must not be empty"),
         (_replace_arguments(new_text=7), "new_text must be a string"),
@@ -187,20 +188,26 @@ def test_replace_text_preserves_bom_and_unaffected_line_endings(
 def test_replace_text_rejects_invalid_arguments(
     tmp_path: Path,
     arguments: JSONObject,
-    message: str,
+    expected: str | SafetyCode,
 ) -> None:
     (tmp_path / "sample.txt").write_text("old", encoding="utf-8")
 
-    with pytest.raises(ToolArgumentError, match=message):
-        ReplaceTextTool().execute(arguments, _context(tmp_path))
+    if isinstance(expected, SafetyCode):
+        with pytest.raises(SafetyViolation) as exc_info:
+            ReplaceTextTool().execute(arguments, _context(tmp_path))
+        assert exc_info.value.code is expected
+    else:
+        with pytest.raises(ToolArgumentError, match=expected):
+            ReplaceTextTool().execute(arguments, _context(tmp_path))
 
 
 def test_replace_text_rejects_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(ToolArgumentError, match="file does not exist"):
+    with pytest.raises(SafetyViolation) as exc_info:
         ReplaceTextTool().execute(
             _replace_arguments(path="missing.txt"),
             _context(tmp_path),
         )
+    assert exc_info.value.code is SafetyCode.PATH_NOT_FOUND
 
 
 def test_replace_text_rejects_directory_target(tmp_path: Path) -> None:
@@ -452,11 +459,12 @@ def test_write_file_never_overwrites_existing_file(tmp_path: Path) -> None:
     target = tmp_path / "created.txt"
     target.write_bytes(b"original")
 
-    with pytest.raises(ToolArgumentError, match="file already exists"):
+    with pytest.raises(SafetyViolation) as exc_info:
         WriteFileTool().execute(
             _write_arguments(content="replacement"),
             _context(tmp_path),
         )
+    assert exc_info.value.code is SafetyCode.PATH_TYPE_MISMATCH
 
     assert target.read_bytes() == b"original"
 
@@ -464,11 +472,12 @@ def test_write_file_never_overwrites_existing_file(tmp_path: Path) -> None:
 def test_write_file_rejects_existing_directory(tmp_path: Path) -> None:
     (tmp_path / "created.txt").mkdir()
 
-    with pytest.raises(ToolArgumentError, match="path is an existing directory"):
+    with pytest.raises(SafetyViolation) as exc_info:
         WriteFileTool().execute(
             _write_arguments(),
             _context(tmp_path),
         )
+    assert exc_info.value.code is SafetyCode.PATH_TYPE_MISMATCH
 
 
 def test_write_file_rejects_missing_parent_without_creating_directories(
@@ -502,14 +511,14 @@ def test_write_file_rejects_parent_that_is_a_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("arguments", "message"),
+    ("arguments", "expected"),
     [
         ({}, "write_file arguments must contain exactly"),
         (
             {**_write_arguments(), "extra": True},
             "write_file arguments must contain exactly",
         ),
-        (_write_arguments(path=None), "path must be a non-empty string"),
+        (_write_arguments(path=None), SafetyCode.INVALID_PATH),
         (_write_arguments(content=None), "content must be a string"),
         (_write_arguments(content=7), "content must be a string"),
     ],
@@ -517,10 +526,15 @@ def test_write_file_rejects_parent_that_is_a_file(tmp_path: Path) -> None:
 def test_write_file_rejects_invalid_arguments_without_creating_target(
     tmp_path: Path,
     arguments: JSONObject,
-    message: str,
+    expected: str | SafetyCode,
 ) -> None:
-    with pytest.raises(ToolArgumentError, match=message):
-        WriteFileTool().execute(arguments, _context(tmp_path))
+    if isinstance(expected, SafetyCode):
+        with pytest.raises(SafetyViolation) as exc_info:
+            WriteFileTool().execute(arguments, _context(tmp_path))
+        assert exc_info.value.code is expected
+    else:
+        with pytest.raises(ToolArgumentError, match=expected):
+            WriteFileTool().execute(arguments, _context(tmp_path))
 
     assert not (tmp_path / "created.txt").exists()
 
@@ -600,3 +614,98 @@ import coding_agent.tools.filesystem
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    "path",
+    [".git/config", ".GIT/config", ".coding-agent/logs/run.jsonl"],
+)
+def test_write_tools_reject_protected_paths_without_side_effect(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    target = tmp_path.joinpath(*path.split("/"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        target.unlink()
+    before = {
+        item.relative_to(tmp_path).as_posix()
+        for item in tmp_path.rglob("*")
+    }
+
+    with pytest.raises(SafetyViolation) as exc_info:
+        WriteFileTool().execute(
+            {"path": path, "content": "secret"},
+            _context(tmp_path),
+        )
+
+    assert exc_info.value.code is SafetyCode.PROTECTED_PATH
+    assert not target.exists()
+    assert {
+        item.relative_to(tmp_path).as_posix()
+        for item in tmp_path.rglob("*")
+    } == before
+
+
+def test_replace_reparse_path_is_denied_and_target_bytes_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_bytes(b"old\r\n")
+    link = tmp_path / "linked.txt"
+    try:
+        os.symlink(outside, link, target_is_directory=False)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror == 1314:
+            pytest.fail(
+                "Task 8 file-symlink behavior remains unverified because "
+                "the test account lacks symlink privilege (winerror=1314)"
+            )
+        pytest.fail(
+            "Task 8 requires a real Windows file symlink; "
+            f"unexpected winerror={winerror}"
+        )
+    before = outside.read_bytes()
+
+    with pytest.raises(SafetyViolation) as exc_info:
+        ReplaceTextTool().execute(
+            _replace_arguments(
+                path="linked.txt",
+                old_text="old",
+                new_text="new",
+                expected_count=1,
+            ),
+            _context(tmp_path),
+        )
+
+    assert exc_info.value.code is SafetyCode.REPARSE_POINT_DENIED
+    assert outside.read_bytes() == before
+
+
+def test_replace_and_write_call_public_path_guard_methods(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "sample.txt").write_text("old", encoding="utf-8")
+    calls: list[tuple[str, object]] = []
+    real_file = PathGuard.existing_file
+    real_new = PathGuard.new_file
+
+    def observed_file(self: PathGuard, raw_path: object):
+        calls.append(("file", raw_path))
+        return real_file(self, raw_path)
+
+    def observed_new(self: PathGuard, raw_path: object):
+        calls.append(("new", raw_path))
+        return real_new(self, raw_path)
+
+    monkeypatch.setattr(PathGuard, "existing_file", observed_file)
+    monkeypatch.setattr(PathGuard, "new_file", observed_new)
+    ReplaceTextTool().execute(_replace_arguments(), _context(tmp_path))
+    WriteFileTool().execute(
+        {"path": "created.txt", "content": "content"},
+        _context(tmp_path),
+    )
+
+    assert calls == [("file", "sample.txt"), ("new", "created.txt")]

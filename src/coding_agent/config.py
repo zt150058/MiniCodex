@@ -5,6 +5,15 @@ import os
 from pathlib import Path
 from typing import Mapping
 
+from coding_agent.safety import (
+    AuthorizedCommand,
+    CommandPolicy,
+    CommandSource,
+    PathGuard,
+    SafetyCode,
+    SafetyViolation,
+)
+
 
 class ConfigError(ValueError):
     """Raised when task-1 CLI configuration is invalid."""
@@ -16,7 +25,7 @@ class RunConfig:
     workspace: Path
     model: str
     api_key: str = field(repr=False)
-    verify_command: str | None = None
+    verify_command: AuthorizedCommand | None = field(default=None, repr=False)
 
 
 def load_run_config(
@@ -35,11 +44,16 @@ def load_run_config(
 
     workspace_path = Path(workspace).expanduser()
     try:
-        normalized_workspace = workspace_path.resolve(strict=True)
-    except FileNotFoundError as exc:
-        raise ConfigError(f"workspace does not exist: {workspace_path}") from exc
-    if not normalized_workspace.is_dir():
-        raise ConfigError(f"workspace must be a directory: {workspace_path}")
+        normalized_workspace = PathGuard(workspace_path).workspace
+    except SafetyViolation as exc:
+        if exc.code is SafetyCode.WORKSPACE_INVALID:
+            if not workspace_path.exists():
+                raise ConfigError("workspace does not exist") from None
+            if not workspace_path.is_dir():
+                raise ConfigError("workspace must be a directory") from None
+        raise ConfigError(
+            f"workspace rejected ({exc.code.value}): {exc.public_message}"
+        ) from None
 
     selected_model = model if model is not None else source.get("OPENAI_MODEL", "")
     normalized_model = selected_model.strip()
@@ -50,16 +64,26 @@ def load_run_config(
     if not normalized_api_key:
         raise ConfigError("OPENAI_API_KEY is not configured")
 
-    normalized_verify: str | None = None
+    authorized_verify: AuthorizedCommand | None = None
     if verify_command is not None:
         normalized_verify = verify_command.strip()
         if not normalized_verify:
             raise ConfigError("--verify must not be empty")
+        try:
+            authorized_verify = CommandPolicy(normalized_workspace).authorize(
+                normalized_verify,
+                purpose="verification",
+                source=CommandSource.USER_VERIFY,
+            )
+        except SafetyViolation as exc:
+            raise ConfigError(
+                f"--verify rejected ({exc.code.value}): {exc.public_message}"
+            ) from None
 
     return RunConfig(
         task=normalized_task,
         workspace=normalized_workspace,
         model=normalized_model,
         api_key=normalized_api_key,
-        verify_command=normalized_verify,
+        verify_command=authorized_verify,
     )

@@ -10,6 +10,12 @@ import pytest
 
 from coding_agent.cli import main
 from coding_agent.config import ConfigError, RunConfig, load_run_config
+from coding_agent.safety import (
+    AuthorizedCommand,
+    CommandSource,
+    SafetyCode,
+    SafetyViolation,
+)
 
 
 SECRET_SENTINEL = "do-not-print-this-test-value"
@@ -34,13 +40,14 @@ def test_config_normalizes_workspace(tmp_path: Path) -> None:
         environ=valid_environ(),
     )
 
-    assert config == RunConfig(
-        task="inspect the project",
-        workspace=workspace.resolve(),
-        model="env-model",
-        api_key=SECRET_SENTINEL,
-        verify_command="pytest -q",
-    )
+    assert config.task == "inspect the project"
+    assert config.workspace == workspace.resolve()
+    assert config.model == "env-model"
+    assert config.api_key == SECRET_SENTINEL
+    assert isinstance(config.verify_command, AuthorizedCommand)
+    assert config.verify_command.purpose == "verification"
+    assert config.verify_command.source is CommandSource.USER_VERIFY
+    assert config.verify_command.argv[-1] == "-q"
 
 
 def test_config_cli_model_overrides_environment(tmp_path: Path) -> None:
@@ -305,3 +312,147 @@ def test_standard_console_command_runs(tmp_path: Path) -> None:
     assert completed.stderr == ""
     assert SECRET_SENTINEL not in completed.stdout
     assert SECRET_SENTINEL not in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("verify", "code"),
+    [
+        ("powershell.exe -Command Get-Date", "executable_denied"),
+        ("git commit -m unsafe", "git_subcommand_denied"),
+        ("curl.exe https://example.com", "executable_denied"),
+        ('python "unterminated', "command_parse_error"),
+    ],
+)
+def test_config_rejects_unsafe_verify_without_echoing_command(
+    tmp_path: Path,
+    verify: str,
+    code: str,
+) -> None:
+    with pytest.raises(ConfigError) as exc_info:
+        load_run_config(
+            task="inspect",
+            workspace=tmp_path,
+            model=None,
+            verify_command=verify,
+            environ=valid_environ(),
+        )
+
+    message = str(exc_info.value)
+    assert message.startswith(f"--verify rejected ({code}): ")
+    assert verify not in message
+    assert SECRET_SENTINEL not in message
+
+
+def test_config_rejects_verify_script_outside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("print('unsafe')", encoding="utf-8")
+    command = subprocess.list2cmdline([sys.executable, str(outside)])
+
+    with pytest.raises(ConfigError, match="path_outside_workspace"):
+        load_run_config(
+            task="inspect",
+            workspace=workspace,
+            model=None,
+            verify_command=command,
+            environ=valid_environ(),
+        )
+
+
+def test_config_routes_workspace_validation_through_path_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RejectingPathGuard:
+        def __init__(self, workspace: Path) -> None:
+            assert workspace == tmp_path
+            raise SafetyViolation(
+                SafetyCode.REPARSE_POINT_DENIED,
+                "workspace reparse points are unavailable",
+            )
+
+    monkeypatch.setattr("coding_agent.config.PathGuard", RejectingPathGuard)
+
+    with pytest.raises(
+        ConfigError,
+        match=(
+            r"workspace rejected \(reparse_point_denied\): "
+            r"workspace reparse points are unavailable"
+        ),
+    ):
+        load_run_config(
+            task="inspect",
+            workspace=tmp_path,
+            model=None,
+            verify_command=None,
+            environ=valid_environ(),
+        )
+
+
+@pytest.mark.parametrize(
+    "verify",
+    ["pytest -q", "python -m pytest -q"],
+)
+def test_cli_authorizes_safe_verify_before_returning_success(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verify: str,
+) -> None:
+    exit_code = main(
+        ["inspect", "--workspace", str(tmp_path), "--verify", verify],
+        environ=valid_environ(),
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert verify not in captured.out
+    assert verify not in captured.err
+    assert SECRET_SENTINEL not in captured.out + captured.err
+
+
+def test_cli_unsafe_verify_exits_two_before_agent_or_model_import(
+    tmp_path: Path,
+) -> None:
+    script = f"""
+import builtins
+real_import = builtins.__import__
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name in {{'coding_agent.agent', 'coding_agent.model'}}:
+        raise AssertionError('agent/model imported before verify authorization')
+    return real_import(name, globals, locals, fromlist, level)
+builtins.__import__ = guarded_import
+from coding_agent.cli import main
+code = main(
+    ['inspect', '--workspace', {str(tmp_path)!r}, '--verify', 'git commit -m unsafe'],
+    environ={{'OPENAI_MODEL': 'fake', 'OPENAI_API_KEY': 'not-printed'}},
+)
+raise SystemExit(code)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "git_subcommand_denied" in completed.stderr
+    assert "git commit -m unsafe" not in completed.stderr
+    assert "not-printed" not in completed.stdout + completed.stderr
+
+
+def test_run_config_repr_hides_authorized_verify_and_secret(tmp_path: Path) -> None:
+    config = load_run_config(
+        task="inspect",
+        workspace=tmp_path,
+        model=None,
+        verify_command="pytest -q",
+        environ=valid_environ(),
+    )
+    rendered = repr(config)
+    assert config.verify_command is not None
+    assert config.verify_command.normalized_command not in rendered
+    assert "verify_command=" not in rendered
+    assert SECRET_SENTINEL not in rendered

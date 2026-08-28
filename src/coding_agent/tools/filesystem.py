@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import json
-import os
 from pathlib import Path
 
 from coding_agent.messages import JSONObject, ToolResultMetadata
+from coding_agent.safety import (
+    GuardedPath,
+    PathGuard,
+    SafetyCode,
+    SafetyViolation,
+)
 from coding_agent.tools.base import (
     ExecutionContext,
     ToolArgumentError,
@@ -47,32 +52,6 @@ def _positive_integer(value: object, name: str) -> int:
     return value
 
 
-def _functional_workspace_path(
-    value: object,
-    context: ExecutionContext,
-) -> tuple[Path, Path]:
-    if not isinstance(value, str) or not value.strip():
-        raise ToolArgumentError("path must be a non-empty string")
-    if "\x00" in value:
-        raise ToolArgumentError("path must not contain NUL")
-
-    relative = Path(value)
-    if relative.is_absolute() or relative.drive:
-        raise ToolArgumentError("path must be relative to the workspace")
-    if ".." in relative.parts:
-        raise ToolArgumentError("path must not contain '..'")
-
-    workspace = context.workspace.absolute()
-    candidate = (workspace / relative).absolute()
-    try:
-        common = os.path.commonpath((str(workspace), str(candidate)))
-    except ValueError as exc:
-        raise ToolArgumentError("path must remain inside the workspace") from exc
-    if os.path.normcase(common) != os.path.normcase(str(workspace)):
-        raise ToolArgumentError("path must remain inside the workspace")
-    return workspace, candidate
-
-
 def _entry_type(path: Path) -> str:
     if path.is_dir():
         return "directory"
@@ -84,17 +63,29 @@ def _directory_children(path: Path) -> list[Path]:
 
 
 def _iter_directory_entries(
-    directory: Path,
+    guard: PathGuard,
+    directory: GuardedPath,
     *,
     recursive: bool,
     max_depth: int,
     depth: int = 1,
-) -> Iterator[Path]:
-    for child in _directory_children(directory):
-        yield child
-        if recursive and child.is_dir() and depth < max_depth:
+) -> Iterator[GuardedPath]:
+    for child in _directory_children(directory.absolute):
+        raw_relative = child.relative_to(guard.workspace).as_posix()
+        try:
+            guarded_child = guard.existing_entry(raw_relative)
+        except SafetyViolation as exc:
+            if exc.code in {
+                SafetyCode.PROTECTED_PATH,
+                SafetyCode.REPARSE_POINT_DENIED,
+            }:
+                continue
+            raise
+        yield guarded_child
+        if recursive and guarded_child.absolute.is_dir() and depth < max_depth:
             yield from _iter_directory_entries(
-                child,
+                guard,
+                guarded_child,
                 recursive=True,
                 max_depth=max_depth,
                 depth=depth + 1,
@@ -177,10 +168,6 @@ def _decode_utf8_file(path: Path) -> tuple[bytes, str]:
         raise ToolArgumentError("file is not valid UTF-8") from exc
 
 
-def _relative_output_path(workspace: Path, target: Path) -> str:
-    return target.relative_to(workspace).as_posix()
-
-
 class ListDirectoryTool:
     name = "list_directory"
     schema: JSONObject = {
@@ -225,23 +212,20 @@ class ListDirectoryTool:
             1,
             500,
         )
-        workspace, directory = _functional_workspace_path(values["path"], context)
-        if not directory.exists():
-            raise ToolArgumentError("directory does not exist")
-        if not directory.is_dir():
-            raise ToolArgumentError("path is not a directory")
-
+        guard = PathGuard(context.workspace)
+        directory = guard.existing_directory(values["path"])
         entries: list[JSONObject] = []
         truncated = False
         for child in _iter_directory_entries(
+            guard,
             directory,
             recursive=recursive,
             max_depth=max_depth,
         ):
             entries.append(
                 {
-                    "path": child.relative_to(workspace).as_posix(),
-                    "type": _entry_type(child),
+                    "path": child.relative,
+                    "type": _entry_type(child.absolute),
                 }
             )
             if len(entries) == max_entries:
@@ -289,11 +273,9 @@ class ReadFileTool:
         if end_line is not None and start_line > end_line:
             raise ToolArgumentError("start_line must not exceed end_line")
 
-        _, target = _functional_workspace_path(values["path"], context)
-        if not target.exists():
-            raise ToolArgumentError("file does not exist")
-        if not target.is_file():
-            raise ToolArgumentError("path is not a file")
+        target = PathGuard(context.workspace).existing_file(
+            values["path"]
+        ).absolute
 
         text, size_truncated = _decode_utf8_prefix(target)
         source_lines = text.splitlines(keepends=True)
@@ -355,14 +337,11 @@ class ReplaceTextTool:
             "expected_count",
         )
 
-        workspace, target = _functional_workspace_path(
-            values["path"],
-            context,
+        guarded_target = PathGuard(context.workspace).existing_file(
+            values["path"]
         )
-        if not target.exists():
-            raise ToolArgumentError("file does not exist")
-        if not target.is_file():
-            raise ToolArgumentError("path is not a file")
+        target = guarded_target.absolute
+        relative = guarded_target.relative
 
         _, source = _decode_utf8_file(target)
         actual_count = source.count(old_text)
@@ -378,13 +357,12 @@ class ReplaceTextTool:
             raise ToolArgumentError("result exceeds 512 KiB UTF-8 limit")
 
         target.write_bytes(encoded)
-        relative_path = _relative_output_path(workspace, target)
         return _json_execution(
             {
-                "path": relative_path,
+                "path": relative,
                 "replacements": actual_count,
             },
-            changed_paths=(relative_path,),
+            changed_paths=(relative,),
         )
 
 
@@ -420,18 +398,9 @@ class WriteFileTool:
         if len(encoded) > _MAX_WRITE_BYTES:
             raise ToolArgumentError("content exceeds 512 KiB UTF-8 limit")
 
-        workspace, target = _functional_workspace_path(
-            values["path"],
-            context,
-        )
-        if target.exists():
-            if target.is_dir():
-                raise ToolArgumentError("path is an existing directory")
-            raise ToolArgumentError("file already exists")
-        if not target.parent.exists():
-            raise ToolArgumentError("parent directory does not exist")
-        if not target.parent.is_dir():
-            raise ToolArgumentError("parent path is not a directory")
+        guarded_target = PathGuard(context.workspace).new_file(values["path"])
+        target = guarded_target.absolute
+        relative = guarded_target.relative
 
         try:
             with target.open("xb") as stream:
@@ -439,11 +408,10 @@ class WriteFileTool:
         except FileExistsError as exc:
             raise ToolArgumentError("file already exists") from exc
 
-        relative_path = _relative_output_path(workspace, target)
         return _json_execution(
             {
                 "bytes_written": len(encoded),
-                "path": relative_path,
+                "path": relative,
             },
-            changed_paths=(relative_path,),
+            changed_paths=(relative,),
         )

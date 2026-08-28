@@ -630,3 +630,68 @@ def test_rejection_and_exception_after_success_preserve_existing_ledger(
     assert state.mutation_index == 1
     assert state.modified_paths == ("created.txt",)
     assert state.verification_status is VerificationStatus.STALE
+
+
+def test_registry_distinguishes_stable_safety_rejection(tmp_path: Path) -> None:
+    class SafetyRejectingTool:
+        name = "safety_reject"
+        schema: JSONObject = {
+            "name": "safety_reject",
+            "description": "Reject for a deterministic safety reason.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        }
+
+        def execute(
+            self,
+            arguments: JSONObject,
+            context: ExecutionContext,
+        ) -> ToolExecution:
+            from coding_agent.safety import SafetyCode, SafetyViolation
+
+            raise SafetyViolation(
+                SafetyCode.PROTECTED_PATH,
+                "protected path is unavailable",
+            )
+
+    registry = ToolRegistry((SafetyRejectingTool(),))
+    result = registry.execute(
+        ToolCall(call_id="safe_1", name="safety_reject", arguments={}),
+        ExecutionContext(tmp_path),
+    )
+
+    assert result.status == "rejected"
+    assert result.error == (
+        "security_rejected:protected_path: protected path is unavailable"
+    )
+    assert result.metadata.changed_paths == ()
+
+
+def test_agent_safety_rejection_has_no_mutation_ledger_effect(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("secret", encoding="utf-8")
+    call = ToolCall(
+        call_id="protected_read",
+        name="read_file",
+        arguments={"path": ".GIT/config", "start_line": 1, "end_line": None},
+    )
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="stopped")),
+        tools=(ReadFileTool(),),
+    )
+
+    state = runner.run("attempt protected read")
+
+    result = client.requests[1].messages[2]
+    assert isinstance(result, ToolResult)
+    assert result.status == "rejected"
+    assert result.error == "security_rejected:protected_path: protected path is unavailable"
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN

@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import codecs
 from collections.abc import Callable
-import ctypes
-from ctypes import wintypes
 from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 from threading import Thread
 import time
 from typing import BinaryIO
 
 from coding_agent.messages import JSONObject, ToolResultMetadata
+from coding_agent.safety import (
+    CommandPolicy,
+    CommandSource,
+    parse_windows_command_line,
+)
 from coding_agent.tools.base import ExecutionContext, ToolArgumentError, ToolExecution
 
 _ARGUMENT_NAMES = {"command", "purpose"}
@@ -22,17 +24,6 @@ _PURPOSES = {"inspect", "test", "verification"}
 _OUTPUT_LIMIT_BYTES = 64 * 1024
 _READ_CHUNK_BYTES = 8 * 1024
 _POST_TERMINATION_WAIT_SECONDS = 0.5
-
-_COMMAND_LINE_TO_ARGV_W = ctypes.windll.shell32.CommandLineToArgvW
-_COMMAND_LINE_TO_ARGV_W.argtypes = [
-    wintypes.LPCWSTR,
-    ctypes.POINTER(ctypes.c_int),
-]
-_COMMAND_LINE_TO_ARGV_W.restype = ctypes.POINTER(wintypes.LPWSTR)
-_LOCAL_FREE = ctypes.windll.kernel32.LocalFree
-_LOCAL_FREE.argtypes = [wintypes.HLOCAL]
-_LOCAL_FREE.restype = wintypes.HLOCAL
-
 
 def _validated_arguments(arguments: object) -> tuple[str, str]:
     if not isinstance(arguments, dict) or set(arguments) != _ARGUMENT_NAMES:
@@ -42,99 +33,46 @@ def _validated_arguments(arguments: object) -> tuple[str, str]:
     command = arguments["command"]
     if not isinstance(command, str) or not command.strip():
         raise ToolArgumentError("command must be a non-empty string")
-    if "\x00" in command:
-        raise ToolArgumentError("command must not contain NUL")
     purpose = arguments["purpose"]
     if not isinstance(purpose, str) or purpose not in _PURPOSES:
         raise ToolArgumentError("purpose must be inspect, test, or verification")
     return command.strip(), purpose
 
 
-def _has_unclosed_quote(command: str) -> bool:
-    quoted = False
-    backslashes = 0
-    for character in command:
-        if character == "\\":
-            backslashes += 1
-            continue
-        if character == '"' and backslashes % 2 == 0:
-            quoted = not quoted
-        backslashes = 0
-    return quoted
-
-
-def parse_windows_command_line(command: str) -> tuple[str, ...]:
-    command, _ = _validated_arguments(
-        {"command": command, "purpose": "inspect"}
-    )
-    if _has_unclosed_quote(command):
-        raise ToolArgumentError("command contains an unclosed quote")
-
-    argc = ctypes.c_int()
-    argv_pointer = _COMMAND_LINE_TO_ARGV_W(command, ctypes.byref(argc))
-    if not argv_pointer or argc.value <= 0:
-        raise ToolArgumentError("command could not be parsed by Windows")
-    try:
-        argv = tuple(argv_pointer[index] for index in range(argc.value))
-    finally:
-        _LOCAL_FREE(ctypes.cast(argv_pointer, wintypes.HLOCAL))
-    if not argv or not argv[0]:
-        raise ToolArgumentError("command could not be parsed by Windows")
-    return argv
-
-
-def _normalized_workspace(context: ExecutionContext) -> Path:
-    try:
-        workspace = context.workspace.resolve(strict=True)
-    except OSError as exc:
-        raise ToolArgumentError("workspace must be an existing directory") from exc
-    if not workspace.is_dir():
-        raise ToolArgumentError("workspace must be an existing directory")
-    return workspace
-
-
-def _same_path(left: Path, right: Path) -> bool:
-    return os.path.normcase(str(left)) == os.path.normcase(str(right))
-
-
-def _authorize_temporary_command(argv: tuple[str, ...], workspace: Path) -> None:
-    try:
-        executable = Path(argv[0]).resolve(strict=True)
-        current_python = Path(sys.executable).resolve(strict=True)
-    except OSError as exc:
-        raise ToolArgumentError(
-            "command is outside the temporary Task 7 boundary"
-        ) from exc
-    if not _same_path(executable, current_python) or len(argv) < 2:
-        raise ToolArgumentError("command is outside the temporary Task 7 boundary")
-
-    if argv[1] == "-m":
-        if len(argv) >= 3 and argv[2] in {"pytest", "unittest"}:
-            return
-        raise ToolArgumentError("command is outside the temporary Task 7 boundary")
-    if argv[1].startswith("-"):
-        raise ToolArgumentError("command is outside the temporary Task 7 boundary")
-
-    script = Path(argv[1])
-    if not script.is_absolute():
-        script = workspace / script
-    try:
-        script = script.resolve(strict=True)
-        script.relative_to(workspace)
-    except (OSError, ValueError) as exc:
-        raise ToolArgumentError(
-            "command is outside the temporary Task 7 boundary"
-        ) from exc
-    if not script.is_file() or script.suffix.casefold() != ".py":
-        raise ToolArgumentError("command is outside the temporary Task 7 boundary")
+_REMOVED_ENVIRONMENT_KEYS = {
+    "openai_api_key", "pythonpath", "pythonhome", "pytest_addopts",
+    "pytest_plugins", "mypypath", "mypy_config_file", "git_dir",
+    "git_work_tree", "git_object_directory",
+    "git_alternate_object_directories", "git_external_diff", "git_ssh",
+    "git_ssh_command", "git_askpass", "ssh_askpass",
+}
 
 
 def _child_environment() -> dict[str, str]:
     environment = os.environ.copy()
-    environment.pop("OPENAI_API_KEY", None)
-    environment["PYTHONUTF8"] = "1"
-    environment["PYTHONIOENCODING"] = "utf-8"
-    environment["PYTHONUNBUFFERED"] = "1"
+    for key in tuple(environment):
+        folded = key.casefold()
+        if (
+            folded in _REMOVED_ENVIRONMENT_KEYS
+            or folded == "git_config_count"
+            or folded.startswith("git_config_key_")
+            or folded.startswith("git_config_value_")
+        ):
+            environment.pop(key, None)
+    environment.update(
+        {
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUNBUFFERED": "1",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "NUL",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_LAZY_FETCH": "1",
+        }
+    )
     return environment
 
 
@@ -210,6 +148,7 @@ def _reader(pipe: BinaryIO, capture: _BoundedBytes) -> Thread:
 
 ProcessFactory = Callable[..., subprocess.Popen[bytes]]
 TreeTerminator = Callable[[subprocess.Popen[bytes]], str | None]
+PolicyFactory = Callable[[Path], CommandPolicy]
 
 
 def _taskkill_path() -> Path:
@@ -246,7 +185,7 @@ class RunCommandTool:
     name = "run_command"
     schema: JSONObject = {
         "name": "run_command",
-        "description": "Run a temporarily authorized Python command in the workspace.",
+        "description": "Run an authorized command in the workspace.",
         "strict": True,
         "parameters": {
             "type": "object",
@@ -267,12 +206,16 @@ class RunCommandTool:
         *,
         process_factory: ProcessFactory | None = None,
         tree_terminator: TreeTerminator | None = None,
+        policy_factory: PolicyFactory | None = None,
     ) -> None:
         self._process_factory = (
             subprocess.Popen if process_factory is None else process_factory
         )
         self._tree_terminator = (
             _terminate_process_tree if tree_terminator is None else tree_terminator
+        )
+        self._policy_factory = (
+            CommandPolicy if policy_factory is None else policy_factory
         )
 
     def execute(
@@ -281,9 +224,14 @@ class RunCommandTool:
         context: ExecutionContext,
     ) -> ToolExecution:
         command, purpose = _validated_arguments(arguments)
-        argv = parse_windows_command_line(command)
-        workspace = _normalized_workspace(context)
-        _authorize_temporary_command(argv, workspace)
+        policy = self._policy_factory(context.workspace)
+        authorized = policy.authorize(
+            command,
+            purpose=purpose,
+            source=CommandSource.MODEL,
+        )
+        argv = authorized.argv
+        workspace = policy.workspace
 
         started = time.monotonic_ns()
         try:
