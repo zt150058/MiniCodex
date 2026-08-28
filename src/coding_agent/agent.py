@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import hashlib
 import time
 
 from coding_agent.context import ContextManager, ContextPreparationError
+from coding_agent.logging import EventSink, EventType, RunLogError
 from coding_agent.messages import (
     AssistantMessage,
     ModelRequest,
@@ -36,6 +38,7 @@ from coding_agent.verification import (
     VerificationError,
     VerificationGate,
     VerificationOutcome,
+    VerificationResult,
 )
 
 
@@ -71,6 +74,7 @@ class AgentRunner:
         termination_policy: TerminationPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
         verification_gate: VerificationGate | None = None,
+        event_sink: EventSink | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable")
@@ -83,6 +87,39 @@ class AgentRunner:
         self._termination_policy = termination_policy or TerminationPolicy()
         self._clock = clock
         self._verification_gate = verification_gate
+        self._event_sink = event_sink
+
+    def _emit(self, event_type: EventType, data: dict[str, object]) -> None:
+        if self._event_sink is not None:
+            self._event_sink.emit(event_type, data)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _hash_text(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _safe_tool_error_code(result: ToolResult) -> str | None:
+        if result.status == "ok":
+            return None
+        if result.error is not None and result.error.startswith("security_rejected:"):
+            return result.error.split(": ", 1)[0]
+        return "tool_error" if result.status == "error" else "tool_rejected"
+
+    @staticmethod
+    def _verification_event_data(result: VerificationResult) -> dict[str, object]:
+        return {
+            "source": result.source.value,
+            "status": result.status.value,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "truncated": result.truncated,
+            "duration_ms": result.duration_ms,
+            "validation_index": result.validation_index,
+            "mutation_index": result.validation_index,
+            "stdout_chars": len(result.stdout),
+            "stderr_chars": len(result.stderr),
+            "error_code": result.error,
+        }
 
     @staticmethod
     def _terminate(
@@ -111,13 +148,23 @@ class AgentRunner:
         )
         return decision.reason if decision.should_stop else None
 
-    @staticmethod
     def _append_unexecuted_results(
+        self,
         state: AgentState,
         calls: tuple[ToolCall, ...],
         reason: TerminationReason,
     ) -> None:
-        for call in calls:
+        for offset, call in enumerate(calls, start=1):
+            self._emit(
+                EventType.TOOL_CALL_BLOCKED,
+                {
+                    "ordinal": state.tool_call_count + offset,
+                    "tool_name": call.name,
+                    "call_id_hash": self._hash_text(call.call_id),
+                    "reason": reason.value,
+                    "executed": False,
+                },
+            )
             state.messages += (
                 ToolResult(
                     call_id=call.call_id,
@@ -175,15 +222,57 @@ class AgentRunner:
         budget = ModelCallBudget(
             max_logical_calls=limits.max_logical_model_calls,
             max_provider_attempts=limits.max_provider_attempts,
+            observer=self._event_sink,
         )
         try:
-            return self._run_loop(state, budget)
+            self._emit(
+                EventType.RUN_STARTED,
+                {"task_chars": len(task), "mutation_index": state.mutation_index},
+            )
+            result = self._run_loop(state, budget)
+            self._emit_run_completed(result)
+            return result
+        except RunLogError:
+            self._sync_budget(state, budget)
+            return self._terminate(state, TerminationReason.AUDIT_LOG_FAILURE)
         except KeyboardInterrupt:
             self._sync_budget(state, budget)
             state.status = AgentStatus.INTERRUPTED
             state.termination_reason = TerminationReason.USER_INTERRUPTED
             state.failure_reason = TerminationReason.USER_INTERRUPTED.value
+            try:
+                self._emit_run_completed(state)
+            except Exception:
+                pass
             raise AgentInterrupted(state) from None
+
+    def _emit_run_completed(self, state: AgentState) -> None:
+        if self._event_sink is None:
+            return
+        elapsed_ms = max(
+            0,
+            int((self._clock() - state.started_at_monotonic) * 1000),
+        )
+        self._event_sink.metadata.finished_elapsed_ms = elapsed_ms
+        event = self._event_sink.emit(
+            EventType.RUN_COMPLETED,
+            {
+                "status": state.status.value,
+                "termination_reason": (
+                    None
+                    if state.termination_reason is None
+                    else state.termination_reason.value
+                ),
+                "logical_model_calls": state.logical_model_call_count,
+                "provider_attempts": state.model_call_count,
+                "tool_calls": state.tool_call_count,
+                "verification_attempts": state.verification_attempt_count,
+                "mutation_index": state.mutation_index,
+                "validation_index": state.validation_index,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+        self._event_sink.metadata.finished_elapsed_ms = event.elapsed_ms
 
     def _run_loop(
         self,
@@ -196,19 +285,59 @@ class AgentRunner:
             if reason is not None:
                 return self._terminate(state, reason)
 
+            before_size = self._context_manager.measure(state.messages)
+            compression_expected = self._context_manager.requires_compression(
+                state.messages
+            )
+            if compression_expected:
+                self._emit(
+                    EventType.CONTEXT_COMPRESSION_STARTED,
+                    {
+                        "before_chars": before_size.serialized_chars,
+                        "before_items": before_size.history_items,
+                        "continuation_count": len(state.continuation_items),
+                    },
+                )
             try:
                 try:
                     prepared = self._context_manager.prepare(state, budget)
                 finally:
                     self._sync_budget(state, budget)
             except ContextPreparationError as exc:
+                if compression_expected:
+                    self._emit(
+                        EventType.CONTEXT_COMPRESSION_FAILED,
+                        {
+                            "before_chars": before_size.serialized_chars,
+                            "before_items": before_size.history_items,
+                            "reason": exc.reason.value,
+                        },
+                    )
                 return self._terminate(state, exc.reason)
             except ModelBudgetExceeded as exc:
+                if compression_expected:
+                    self._emit(
+                        EventType.CONTEXT_COMPRESSION_FAILED,
+                        {
+                            "before_chars": before_size.serialized_chars,
+                            "before_items": before_size.history_items,
+                            "reason": exc.reason.value,
+                        },
+                    )
                 return self._terminate(
                     state,
                     TerminationReason(exc.reason.value),
                 )
             except FatalModelError:
+                if compression_expected:
+                    self._emit(
+                        EventType.CONTEXT_COMPRESSION_FAILED,
+                        {
+                            "before_chars": before_size.serialized_chars,
+                            "before_items": before_size.history_items,
+                            "reason": TerminationReason.FATAL_MODEL_ERROR.value,
+                        },
+                    )
                 return self._terminate(
                     state,
                     TerminationReason.FATAL_MODEL_ERROR,
@@ -217,6 +346,20 @@ class AgentRunner:
             state.messages = prepared.messages
             state.continuation_items = prepared.continuation_items
             if prepared.compressed:
+                self._emit(
+                    EventType.CONTEXT_COMPRESSION_COMPLETED,
+                    {
+                        "before_chars": before_size.serialized_chars,
+                        "before_items": before_size.history_items,
+                        "after_chars": prepared.size.serialized_chars,
+                        "after_items": prepared.size.history_items,
+                        "summary_source": prepared.summary_source.value,
+                        "summary_model_failed": prepared.summary_model_failed,
+                        "continuation_cleared": True,
+                    },
+                )
+                if self._event_sink is not None:
+                    self._event_sink.metadata.context_compression_count += 1
                 reason = self._policy_reason(state, NextOperation.MODEL)
                 if reason is not None:
                     return self._terminate(state, reason)
@@ -268,6 +411,17 @@ class AgentRunner:
                             reason,
                         )
                         return self._terminate(state, reason)
+                    ordinal = state.tool_call_count + 1
+                    call_id_hash = self._hash_text(call.call_id)
+                    self._emit(
+                        EventType.TOOL_CALL_STARTED,
+                        {
+                            "ordinal": ordinal,
+                            "tool_name": call.name,
+                            "call_id_hash": call_id_hash,
+                            "mutation_index": state.mutation_index,
+                        },
+                    )
                     result = self._tool_registry.execute(
                         call,
                         self._execution_context,
@@ -282,9 +436,37 @@ class AgentRunner:
                         result,
                         mutation_index_before,
                     )
+                    self._emit(
+                        EventType.TOOL_CALL_COMPLETED,
+                        {
+                            "ordinal": ordinal,
+                            "tool_name": call.name,
+                            "call_id_hash": call_id_hash,
+                            "status": result.status,
+                            "safe_error_code": self._safe_tool_error_code(result),
+                            "output_chars": len(result.output or ""),
+                            "exit_code": result.metadata.exit_code,
+                            "timed_out": result.metadata.timed_out,
+                            "truncated": result.metadata.truncated,
+                            "duration_ms": result.metadata.duration_ms,
+                            "changed_paths": list(result.metadata.changed_paths),
+                            "mutation_index_before": mutation_index_before,
+                            "mutation_index_after": state.mutation_index,
+                            "executed": True,
+                        },
+                    )
+                    if state.mutation_index != mutation_index_before:
+                        self._emit(
+                            EventType.MUTATION_RECORDED,
+                            {
+                                "mutation_index": state.mutation_index,
+                                "changed_paths": list(result.metadata.changed_paths),
+                                "verification_status": state.verification_status.value,
+                            },
+                        )
                     if self._verification_gate is not None:
                         try:
-                            self._verification_gate.observe_tool_result(
+                            evidence_recorded = self._verification_gate.observe_tool_result(
                                 state,
                                 call,
                                 result,
@@ -299,19 +481,60 @@ class AgentRunner:
                                 state,
                                 TerminationReason.INTERNAL_INVARIANT,
                             )
+                        if evidence_recorded:
+                            evidence = state.last_verification
+                            assert evidence is not None
+                            self._emit(
+                                EventType.VERIFICATION_EVIDENCE_RECORDED,
+                                {
+                                    **self._verification_event_data(evidence),
+                                    "command_hash": self._hash_text(evidence.command),
+                                },
+                            )
                 continue
 
             if assistant_text is not None:
                 state.messages += (AssistantMessage(content=assistant_text),)
                 state.status = AgentStatus.COMPLETION_CANDIDATE
                 state.completion_text = assistant_text
+                self._emit(
+                    EventType.COMPLETION_CANDIDATE,
+                    {
+                        "text_chars": len(assistant_text),
+                        "mutation_index": state.mutation_index,
+                        "validation_index": state.validation_index,
+                        "verification_status": state.verification_status.value,
+                    },
+                )
                 gate = self._verification_gate
                 if gate is None:
                     return state
                 if gate.requires_execution:
                     reason = self._policy_reason(state, NextOperation.TOOL)
                     if reason is not None:
+                        self._emit(
+                            EventType.VERIFICATION_BLOCKED,
+                            {
+                                "source": "user_verify",
+                                "reason": reason.value,
+                                "mutation_index": state.mutation_index,
+                                "executed": False,
+                            },
+                        )
                         return self._terminate(state, reason)
+                    required_command = gate._required_command
+                    assert required_command is not None
+                    self._emit(
+                        EventType.VERIFICATION_STARTED,
+                        {
+                            "source": required_command.source.value,
+                            "command_hash": self._hash_text(
+                                required_command.normalized_command
+                            ),
+                            "mutation_index": state.mutation_index,
+                            "attempt_index": state.verification_attempt_count + 1,
+                        },
+                    )
                     state.tool_call_count += 1
                 try:
                     decision = gate.evaluate(state)
@@ -319,6 +542,11 @@ class AgentRunner:
                     return self._terminate(
                         state,
                         TerminationReason.INTERNAL_INVARIANT,
+                    )
+                if gate.requires_execution and decision.result is not None:
+                    self._emit(
+                        EventType.VERIFICATION_COMPLETED,
+                        self._verification_event_data(decision.result),
                     )
                 if decision.command_executed and not gate.requires_execution:
                     state.tool_call_count += 1

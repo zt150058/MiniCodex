@@ -45,6 +45,8 @@ from coding_agent.model import (
 class InvalidOpenAIResponseError(ModelError):
     """The provider returned a completed but unusable Responses payload."""
 
+    observation_error_code = "invalid_model_response"
+
 
 _STRICT_SCHEMA_ERROR = (
     "OpenAI Responses request is invalid: tool schema is not strict"
@@ -386,11 +388,12 @@ class OpenAIResponsesClient:
     ) -> ModelResponse:
         mapped_input = _map_messages(request)
         mapped_tools = _map_tools(request.tool_schemas)
+        purpose = budget.active_purpose
 
         response = None
         for attempt in range(3):
+            provider_attempt_index = budget.begin_provider_attempt(purpose)
             try:
-                budget.claim_provider_attempt()
                 response = self._client.responses.create(
                     model=self._model,
                     input=mapped_input,
@@ -399,18 +402,50 @@ class OpenAIResponsesClient:
                     store=False,
                     include=["reasoning.encrypted_content"],
                 )
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code=None,
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
                 break
             except OpenAIError as exc:
                 if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=(
+                            "authentication_rejected"
+                            if isinstance(exc, AuthenticationError)
+                            else "permission_rejected"
+                        ),
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
                     raise FatalModelError(
                         "OpenAI Responses request failed: authentication rejected"
                     ) from None
                 if isinstance(exc, NotFoundError):
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code="not_found",
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
                     raise FatalModelError(
                         "OpenAI Responses request failed: "
                         "model or endpoint not found"
                     ) from None
                 if isinstance(exc, (BadRequestError, UnprocessableEntityError)):
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code="request_rejected",
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
                     raise FatalModelError(
                         "OpenAI Responses request failed: request rejected"
                     ) from None
@@ -430,17 +465,53 @@ class OpenAIResponsesClient:
                     and 500 <= status_code <= 599
                 )
                 if is_transient:
+                    if isinstance(exc, RateLimitError):
+                        error_code = "rate_limit"
+                    elif isinstance(exc, APITimeoutError):
+                        error_code = "timeout"
+                    elif isinstance(exc, APIConnectionError):
+                        error_code = "connection_error"
+                    else:
+                        error_code = "server_error"
                     if attempt == 2:
+                        budget.finish_provider_attempt(
+                            purpose,
+                            provider_attempt_index,
+                            error_code=error_code,
+                            retry_scheduled=False,
+                            retry_delay_ms=None,
+                        )
                         raise TransientModelError(
                             "OpenAI Responses request failed after 3 attempts: "
                             "transient provider error"
                         ) from None
                     if budget.remaining_provider_attempts == 0:
-                        raise ModelBudgetExceeded(
-                            ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT
-                        ) from None
-                    self._sleeper((0.25, 0.50)[attempt])
+                        budget.finish_provider_attempt(
+                            purpose,
+                            provider_attempt_index,
+                            error_code=error_code,
+                            retry_scheduled=False,
+                            retry_delay_ms=None,
+                        )
+                        budget.begin_provider_attempt(purpose)
+                        raise AssertionError("unreachable provider budget branch")
+                    delay = (0.25, 0.50)[attempt]
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=error_code,
+                        retry_scheduled=True,
+                        retry_delay_ms=int(delay * 1000),
+                    )
+                    self._sleeper(delay)
                     continue
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="provider_error",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
                 raise FatalModelError(
                     "OpenAI Responses request failed: provider error"
                 ) from None

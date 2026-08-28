@@ -14,6 +14,7 @@ from coding_agent.messages import (
 )
 from coding_agent.model import (
     ModelCallBudget,
+    ModelCallPurpose,
     ModelClient,
     TransientModelError,
     invoke_model,
@@ -394,6 +395,13 @@ class ContextManager:
             raise TypeError("messages must be a tuple")
         return _measure_messages(messages)
 
+    def requires_compression(self, messages: tuple[Message, ...]) -> bool:
+        size = self.measure(messages)
+        return (
+            size.serialized_chars > self._limits.max_serialized_chars
+            or size.history_items > self._limits.max_history_items
+        )
+
     def prepare(
         self,
         state: AgentState,
@@ -404,10 +412,7 @@ class ContextManager:
         if not isinstance(budget, ModelCallBudget):
             raise TypeError("budget must be ModelCallBudget")
         size = self.measure(state.messages)
-        if (
-            size.serialized_chars <= self._limits.max_serialized_chars
-            and size.history_items <= self._limits.max_history_items
-        ):
+        if not self.requires_compression(state.messages):
             return PreparedContext(
                 messages=state.messages,
                 continuation_items=state.continuation_items,
@@ -438,6 +443,7 @@ class ContextManager:
                     continuation_items=(),
                 ),
                 budget,
+                purpose=ModelCallPurpose.SUMMARY,
             )
             if (
                 response.text is None

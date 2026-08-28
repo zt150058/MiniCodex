@@ -22,7 +22,9 @@ from coding_agent.model import (
     FatalModelError,
     ModelBudgetExceeded,
     ModelCallBudget,
+    ModelCallPurpose,
     ModelClient,
+    ModelObservation,
     TransientModelError,
 )
 from coding_agent.safety import CommandSource
@@ -31,6 +33,14 @@ from coding_agent.verification import VerificationResult
 
 
 SUMMARY_PREFIX = "coding-agent context summary\n"
+
+
+class RecordingModelObserver:
+    def __init__(self) -> None:
+        self.items: list[ModelObservation] = []
+
+    def observe_model(self, observation: ModelObservation) -> None:
+        self.items.append(observation)
 
 
 def make_state_with_n_complete_turns(
@@ -151,6 +161,26 @@ def test_context_at_exact_threshold_is_not_compressed(tmp_path: Path) -> None:
     assert context.continuation_items is state.continuation_items
 
 
+def test_requires_compression_uses_the_same_exact_boundary_as_prepare(
+    tmp_path: Path,
+) -> None:
+    state = AgentState.start("task", tmp_path, 0.0)
+    measured = ContextManager.measure(state.messages)
+    exact = manager(
+        FakeModelClient(()),
+        max_serialized_chars=measured.serialized_chars,
+        max_history_items=measured.history_items,
+    )
+    one_char_over = manager(
+        FakeModelClient(()),
+        max_serialized_chars=measured.serialized_chars - 1,
+        max_history_items=measured.history_items,
+    )
+
+    assert exact.requires_compression(state.messages) is False
+    assert one_char_over.requires_compression(state.messages) is True
+
+
 def test_one_character_past_threshold_requests_compression(
     tmp_path: Path,
 ) -> None:
@@ -269,7 +299,8 @@ def test_model_summary_request_and_local_invariants(tmp_path: Path) -> None:
     state.modified_paths = ("src/local.py",)
     state.mutation_index = 2
     client = FakeModelClient((valid_summary_response(),))
-    budget = ModelCallBudget()
+    observer = RecordingModelObserver()
+    budget = ModelCallBudget(observer=observer)
 
     prepared = triggered_manager(client).prepare(state, budget)
 
@@ -292,6 +323,7 @@ def test_model_summary_request_and_local_invariants(tmp_path: Path) -> None:
     }
     assert budget.logical_calls == 1
     assert budget.provider_attempts == 1
+    assert {item.purpose for item in observer.items} == {ModelCallPurpose.SUMMARY}
 
 
 def test_compression_preserves_minimal_fresh_verification_facts(

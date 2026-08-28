@@ -38,6 +38,8 @@ from coding_agent.model import (
     ModelBudgetExceeded,
     ModelBudgetReason,
     ModelCallBudget,
+    ModelObservation,
+    ModelObservationKind,
     ModelClient,
     TransientModelError,
     invoke_model,
@@ -49,6 +51,14 @@ from coding_agent.openai_client import (
 
 
 FAKE_KEY = "unit-test-key-never-send"
+
+
+class RecordingModelObserver:
+    def __init__(self) -> None:
+        self.items: list[ModelObservation] = []
+
+    def observe_model(self, observation: ModelObservation) -> None:
+        self.items.append(observation)
 
 
 class FakeOutputItem:
@@ -934,6 +944,33 @@ def test_parse_failure_is_not_retried() -> None:
     assert len(sdk.responses.calls) == 1
 
 
+def test_parse_failure_observation_uses_stable_invalid_response_code() -> None:
+    observer = RecordingModelObserver()
+    sdk = FakeSDKClient(FakeResponse(output=()))
+    client = OpenAIResponsesClient(
+        model="gpt-test",
+        api_key=FAKE_KEY,
+        sdk_client=sdk,
+        sleeper=lambda delay: None,
+    )
+    budget = ModelCallBudget(observer=observer)
+
+    with pytest.raises(InvalidOpenAIResponseError):
+        invoke_model(
+            client,
+            ModelRequest(messages=(UserMessage("parse"),)),
+            budget,
+        )
+
+    logical_failed = [
+        item
+        for item in observer.items
+        if item.kind is ModelObservationKind.LOGICAL_FAILED
+    ]
+    assert len(logical_failed) == 1
+    assert logical_failed[0].error_code == "invalid_model_response"
+
+
 def test_adapter_tests_use_injected_client_without_env_key_or_network() -> None:
     script = r'''
 import os
@@ -1024,6 +1061,61 @@ def test_openai_retries_claim_each_shared_provider_attempt() -> None:
     assert (budget.logical_calls, budget.provider_attempts) == (1, 2)
     assert len(sdk.responses.calls) == 2
     assert delays == [0.25]
+
+
+def test_openai_retries_emit_exact_physical_attempt_sequence() -> None:
+    delays: list[float] = []
+    observer = RecordingModelObserver()
+    sdk = FakeSDKClient(
+        FakeRateLimitError("sensitive first error"),
+        FakeServerError("sensitive second error"),
+        text_response("recovered"),
+    )
+    client = OpenAIResponsesClient(
+        model="gpt-test",
+        api_key=FAKE_KEY,
+        sdk_client=sdk,
+        sleeper=delays.append,
+    )
+    budget = ModelCallBudget(
+        max_logical_calls=1,
+        max_provider_attempts=3,
+        observer=observer,
+    )
+
+    response = invoke_model(
+        client,
+        ModelRequest(messages=(UserMessage("retry"),)),
+        budget,
+    )
+
+    provider = [
+        item
+        for item in observer.items
+        if item.kind.value.startswith("provider_")
+    ]
+    assert response.text == "recovered"
+    assert [item.kind for item in provider] == [
+        ModelObservationKind.PROVIDER_STARTED,
+        ModelObservationKind.PROVIDER_FAILED,
+        ModelObservationKind.PROVIDER_STARTED,
+        ModelObservationKind.PROVIDER_FAILED,
+        ModelObservationKind.PROVIDER_STARTED,
+        ModelObservationKind.PROVIDER_COMPLETED,
+    ]
+    failures = [
+        item for item in provider if item.kind is ModelObservationKind.PROVIDER_FAILED
+    ]
+    assert [item.error_code for item in failures] == ["rate_limit", "server_error"]
+    assert [item.retry_delay_ms for item in failures] == [250, 500]
+    assert [item.retry_scheduled for item in failures] == [True, True]
+    assert len(sdk.responses.calls) == 3
+    assert delays == [0.25, 0.50]
+    assert budget.provider_attempts == 3
+    rendered = repr(observer.items)
+    assert "sensitive first error" not in rendered
+    assert "sensitive second error" not in rendered
+    assert FAKE_KEY not in rendered
 
 
 def test_openai_shared_provider_budget_prevents_third_physical_request() -> None:

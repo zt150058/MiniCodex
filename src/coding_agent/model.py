@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
+import hashlib
 from typing import Protocol, TypeAlias, runtime_checkable
 
-from coding_agent.messages import ModelRequest, ModelResponse
+from coding_agent.messages import ModelRequest, ModelResponse, TokenUsage
 
 
 @runtime_checkable
@@ -29,6 +30,139 @@ class FatalModelError(ModelError):
 class ModelBudgetReason(StrEnum):
     LOGICAL_CALL_LIMIT = "logical_model_call_limit"
     PROVIDER_ATTEMPT_LIMIT = "provider_attempt_limit"
+
+
+class ModelCallPurpose(StrEnum):
+    MAIN = "main"
+    SUMMARY = "summary"
+
+
+class ModelObservationKind(StrEnum):
+    LOGICAL_STARTED = "logical_started"
+    LOGICAL_COMPLETED = "logical_completed"
+    LOGICAL_FAILED = "logical_failed"
+    LOGICAL_BLOCKED = "logical_blocked"
+    PROVIDER_STARTED = "provider_started"
+    PROVIDER_COMPLETED = "provider_completed"
+    PROVIDER_FAILED = "provider_failed"
+    PROVIDER_BLOCKED = "provider_blocked"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelObservation:
+    kind: ModelObservationKind
+    purpose: ModelCallPurpose
+    logical_call_index: int
+    provider_attempt_index: int | None = None
+    message_count: int | None = None
+    tool_schema_count: int | None = None
+    continuation_count: int | None = None
+    has_text: bool | None = None
+    text_chars: int | None = None
+    tool_call_count: int | None = None
+    usage: TokenUsage | None = None
+    provider_response_id_hash: str | None = None
+    error_code: str | None = None
+    retry_scheduled: bool | None = None
+    retry_delay_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ModelObservationKind):
+            raise TypeError("kind must be ModelObservationKind")
+        if not isinstance(self.purpose, ModelCallPurpose):
+            raise TypeError("purpose must be ModelCallPurpose")
+        for name in (
+            "logical_call_index",
+            "provider_attempt_index",
+            "message_count",
+            "tool_schema_count",
+            "continuation_count",
+            "text_chars",
+            "tool_call_count",
+            "retry_delay_ms",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer or null")
+        if self.logical_call_index < 1:
+            raise ValueError("logical_call_index must be positive")
+        if self.provider_attempt_index == 0:
+            raise ValueError("provider_attempt_index must be positive")
+        for name in ("has_text", "retry_scheduled"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean or null")
+        if self.usage is not None and not isinstance(self.usage, TokenUsage):
+            raise TypeError("usage must be TokenUsage or null")
+        if self.provider_response_id_hash is not None and (
+            len(self.provider_response_id_hash) != 64
+            or any(ch not in "0123456789abcdef" for ch in self.provider_response_id_hash)
+        ):
+            raise ValueError("provider_response_id_hash must be lowercase SHA-256")
+        if self.error_code is not None and (
+            not isinstance(self.error_code, str) or not self.error_code
+        ):
+            raise ValueError("error_code must be a non-empty string or null")
+
+        populated = {
+            name
+            for name in (
+                "provider_attempt_index",
+                "message_count",
+                "tool_schema_count",
+                "continuation_count",
+                "has_text",
+                "text_chars",
+                "tool_call_count",
+                "usage",
+                "provider_response_id_hash",
+                "error_code",
+                "retry_scheduled",
+                "retry_delay_ms",
+            )
+            if getattr(self, name) is not None
+        }
+        required: dict[ModelObservationKind, set[str]] = {
+            ModelObservationKind.LOGICAL_STARTED: {
+                "message_count", "tool_schema_count", "continuation_count"
+            },
+            ModelObservationKind.LOGICAL_COMPLETED: {
+                "continuation_count", "has_text", "text_chars", "tool_call_count"
+            },
+            ModelObservationKind.LOGICAL_FAILED: {"error_code"},
+            ModelObservationKind.LOGICAL_BLOCKED: {"error_code"},
+            ModelObservationKind.PROVIDER_STARTED: {"provider_attempt_index"},
+            ModelObservationKind.PROVIDER_COMPLETED: {"provider_attempt_index"},
+            ModelObservationKind.PROVIDER_FAILED: {
+                "provider_attempt_index", "error_code", "retry_scheduled"
+            },
+            ModelObservationKind.PROVIDER_BLOCKED: {"error_code"},
+        }
+        allowed = {
+            ModelObservationKind.LOGICAL_STARTED: required[ModelObservationKind.LOGICAL_STARTED],
+            ModelObservationKind.LOGICAL_COMPLETED: required[ModelObservationKind.LOGICAL_COMPLETED]
+            | {"usage", "provider_response_id_hash"},
+            ModelObservationKind.LOGICAL_FAILED: {"error_code"},
+            ModelObservationKind.LOGICAL_BLOCKED: {"error_code"},
+            ModelObservationKind.PROVIDER_STARTED: {"provider_attempt_index"},
+            ModelObservationKind.PROVIDER_COMPLETED: {"provider_attempt_index"},
+            ModelObservationKind.PROVIDER_FAILED: required[ModelObservationKind.PROVIDER_FAILED]
+            | {"retry_delay_ms"},
+            ModelObservationKind.PROVIDER_BLOCKED: {"error_code"},
+        }
+        if not required[self.kind] <= populated or not populated <= allowed[self.kind]:
+            raise ValueError(f"invalid fields for {self.kind.value}")
+        if self.kind is ModelObservationKind.PROVIDER_FAILED:
+            if self.retry_scheduled is True and self.retry_delay_ms is None:
+                raise ValueError("retry_delay_ms is required for a scheduled retry")
+            if self.retry_scheduled is False and self.retry_delay_ms is not None:
+                raise ValueError("retry_delay_ms requires a scheduled retry")
+
+
+class ModelObservationSink(Protocol):
+    def observe_model(self, observation: ModelObservation) -> None: ...
 
 
 class ModelBudgetExceeded(ModelError):
@@ -70,6 +204,23 @@ class ModelCallBudget:
     max_provider_attempts: int = 12
     logical_calls: int = 0
     provider_attempts: int = 0
+    observer: ModelObservationSink | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _active_purpose: ModelCallPurpose | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _observer_failed: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         self.max_logical_calls = _positive_integer(
@@ -96,10 +247,144 @@ class ModelCallBudget:
             raise ModelBudgetExceeded(ModelBudgetReason.LOGICAL_CALL_LIMIT)
         self.logical_calls += 1
 
+    def _observe(self, observation: ModelObservation) -> None:
+        if self.observer is None:
+            return
+        try:
+            self.observer.observe_model(observation)
+        except Exception:
+            self._observer_failed = True
+            raise
+
+    @property
+    def active_purpose(self) -> ModelCallPurpose:
+        return self._active_purpose or ModelCallPurpose.MAIN
+
+    def begin_logical_call(
+        self,
+        purpose: ModelCallPurpose,
+        request: ModelRequest,
+    ) -> int:
+        logical_call_index = self.logical_calls + 1
+        if self.logical_calls >= self.max_logical_calls:
+            self._observe(
+                ModelObservation(
+                    ModelObservationKind.LOGICAL_BLOCKED,
+                    purpose,
+                    logical_call_index,
+                    error_code=ModelBudgetReason.LOGICAL_CALL_LIMIT.value,
+                )
+            )
+            raise ModelBudgetExceeded(ModelBudgetReason.LOGICAL_CALL_LIMIT)
+        self._observe(
+            ModelObservation(
+                ModelObservationKind.LOGICAL_STARTED,
+                purpose,
+                logical_call_index,
+                message_count=len(request.messages),
+                tool_schema_count=len(request.tool_schemas),
+                continuation_count=len(request.continuation_items),
+            )
+        )
+        self.start_logical_call()
+        self._active_purpose = purpose
+        return logical_call_index
+
+    def finish_logical_call(
+        self,
+        purpose: ModelCallPurpose,
+        logical_call_index: int,
+        *,
+        response: ModelResponse | None,
+        error_code: str | None,
+    ) -> None:
+        if (response is None) == (error_code is None):
+            raise ValueError("provide exactly one of response or error_code")
+        try:
+            if response is None:
+                observation = ModelObservation(
+                    ModelObservationKind.LOGICAL_FAILED,
+                    purpose,
+                    logical_call_index,
+                    error_code=error_code,
+                )
+            else:
+                response_id_hash = (
+                    None
+                    if response.provider_response_id is None
+                    else hashlib.sha256(
+                        response.provider_response_id.encode("utf-8")
+                    ).hexdigest()
+                )
+                observation = ModelObservation(
+                    ModelObservationKind.LOGICAL_COMPLETED,
+                    purpose,
+                    logical_call_index,
+                    continuation_count=len(response.continuation_items),
+                    has_text=response.text is not None,
+                    text_chars=0 if response.text is None else len(response.text),
+                    tool_call_count=len(response.tool_calls),
+                    usage=response.usage,
+                    provider_response_id_hash=response_id_hash,
+                )
+            self._observe(observation)
+        finally:
+            self._active_purpose = None
+
     def claim_provider_attempt(self) -> None:
         if self.provider_attempts >= self.max_provider_attempts:
             raise ModelBudgetExceeded(ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT)
         self.provider_attempts += 1
+
+    def begin_provider_attempt(self, purpose: ModelCallPurpose) -> int:
+        provider_attempt_index = self.provider_attempts + 1
+        logical_call_index = max(1, self.logical_calls)
+        if self.provider_attempts >= self.max_provider_attempts:
+            self._observe(
+                ModelObservation(
+                    ModelObservationKind.PROVIDER_BLOCKED,
+                    purpose,
+                    logical_call_index,
+                    error_code=ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT.value,
+                )
+            )
+            raise ModelBudgetExceeded(ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT)
+        self._observe(
+            ModelObservation(
+                ModelObservationKind.PROVIDER_STARTED,
+                purpose,
+                logical_call_index,
+                provider_attempt_index=provider_attempt_index,
+            )
+        )
+        self.claim_provider_attempt()
+        return provider_attempt_index
+
+    def finish_provider_attempt(
+        self,
+        purpose: ModelCallPurpose,
+        provider_attempt_index: int,
+        *,
+        error_code: str | None,
+        retry_scheduled: bool,
+        retry_delay_ms: int | None,
+    ) -> None:
+        kind = (
+            ModelObservationKind.PROVIDER_COMPLETED
+            if error_code is None
+            else ModelObservationKind.PROVIDER_FAILED
+        )
+        self._observe(
+            ModelObservation(
+                kind,
+                purpose,
+                max(1, self.logical_calls),
+                provider_attempt_index=provider_attempt_index,
+                error_code=error_code,
+                retry_scheduled=(None if error_code is None else retry_scheduled),
+                retry_delay_ms=(None if error_code is None else retry_delay_ms),
+            )
+        )
 
     @property
     def remaining_provider_attempts(self) -> int:
@@ -155,17 +440,107 @@ class FakeModelClient:
         request: ModelRequest,
         budget: ModelCallBudget,
     ) -> ModelResponse:
-        budget.claim_provider_attempt()
-        return self.complete(request)
+        purpose = budget.active_purpose
+        provider_attempt_index = budget.begin_provider_attempt(purpose)
+        try:
+            response = self.complete(request)
+        except Exception as exc:
+            budget.finish_provider_attempt(
+                purpose,
+                provider_attempt_index,
+                error_code=_model_error_code(exc),
+                retry_scheduled=False,
+                retry_delay_ms=None,
+            )
+            raise
+        budget.finish_provider_attempt(
+            purpose,
+            provider_attempt_index,
+            error_code=None,
+            retry_scheduled=False,
+            retry_delay_ms=None,
+        )
+        return response
+
+
+def _model_error_code(error: Exception) -> str:
+    if getattr(error, "observation_error_code", None) == "invalid_model_response":
+        return "invalid_model_response"
+    if isinstance(error, ModelBudgetExceeded):
+        return "model_budget_exceeded"
+    if isinstance(error, TransientModelError):
+        return "transient_model_error"
+    if isinstance(error, FatalModelError):
+        return "fatal_model_error"
+    if isinstance(error, ModelError):
+        return "model_client_error"
+    return "model_client_error"
 
 
 def invoke_model(
     client: ModelClient,
     request: ModelRequest,
     budget: ModelCallBudget,
+    *,
+    purpose: ModelCallPurpose = ModelCallPurpose.MAIN,
 ) -> ModelResponse:
-    budget.start_logical_call()
+    logical_call_index = budget.begin_logical_call(purpose, request)
     if isinstance(client, BudgetAwareModelClient):
-        return client.complete_with_budget(request, budget)
-    budget.claim_provider_attempt()
-    return client.complete(request)
+        try:
+            response = client.complete_with_budget(request, budget)
+        except Exception as exc:
+            if budget._observer_failed:
+                raise
+            budget.finish_logical_call(
+                purpose,
+                logical_call_index,
+                response=None,
+                error_code=_model_error_code(exc),
+            )
+            raise
+    else:
+        try:
+            provider_attempt_index = budget.begin_provider_attempt(purpose)
+        except Exception as exc:
+            if budget._observer_failed:
+                raise
+            budget.finish_logical_call(
+                purpose,
+                logical_call_index,
+                response=None,
+                error_code=_model_error_code(exc),
+            )
+            raise
+        try:
+            response = client.complete(request)
+        except Exception as exc:
+            budget.finish_provider_attempt(
+                purpose,
+                provider_attempt_index,
+                error_code=_model_error_code(exc),
+                retry_scheduled=False,
+                retry_delay_ms=None,
+            )
+            if budget._observer_failed:
+                raise
+            budget.finish_logical_call(
+                purpose,
+                logical_call_index,
+                response=None,
+                error_code=_model_error_code(exc),
+            )
+            raise
+        budget.finish_provider_attempt(
+            purpose,
+            provider_attempt_index,
+            error_code=None,
+            retry_scheduled=False,
+            retry_delay_ms=None,
+        )
+    budget.finish_logical_call(
+        purpose,
+        logical_call_index,
+        response=response,
+        error_code=None,
+    )
+    return response

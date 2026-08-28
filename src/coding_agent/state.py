@@ -21,6 +21,7 @@ class AgentStatus(StrEnum):
 
 
 class TerminationReason(StrEnum):
+    AUDIT_LOG_FAILURE = "audit_log_failure"
     LOGICAL_MODEL_CALL_LIMIT = "logical_model_call_limit"
     PROVIDER_ATTEMPT_LIMIT = "provider_attempt_limit"
     TOOL_CALL_LIMIT = "tool_call_limit"

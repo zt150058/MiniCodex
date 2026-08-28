@@ -16,6 +16,7 @@ from openai import RateLimitError
 import coding_agent.agent as agent_module
 from coding_agent.agent import AgentInterrupted, AgentRunner
 from coding_agent.context import ContextLimits, ContextManager
+from coding_agent.logging import RunEventLogger
 from coding_agent.messages import (
     AssistantMessage,
     JSONObject,
@@ -65,6 +66,7 @@ def _runner(
     clock: Callable[[], float] = lambda: 0.0,
     context_limits: ContextLimits | None = None,
     verification_gate: VerificationGate | None = None,
+    event_sink: object | None = None,
 ) -> tuple[AgentRunner, FakeModelClient]:
     client = FakeModelClient(responses)
     runner = AgentRunner(
@@ -79,6 +81,7 @@ def _runner(
         termination_policy=TerminationPolicy(limits or TerminationLimits()),
         clock=clock,
         verification_gate=verification_gate,
+        event_sink=event_sink,  # type: ignore[arg-type]
     )
     return runner, client
 
@@ -583,6 +586,68 @@ def test_provider_attempt_limit_blocks_third_retry(tmp_path: Path) -> None:
     assert len(sdk.responses.calls) == 2
 
 
+def test_agent_emits_ordered_tool_mutation_candidate_and_terminal_events(
+    tmp_path: Path,
+) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="5" * 32)
+    call = ToolCall(
+        call_id="private-call-id",
+        name="record",
+        arguments={"value": "private arguments"},
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(call,)),
+            ModelResponse(text="private completion"),
+        ),
+        tools=(
+            RecordingTool(
+                ToolExecution(
+                    output="private tool output",
+                    metadata=ToolResultMetadata(changed_paths=("z.py", "a.py")),
+                )
+            ),
+        ),
+        event_sink=logger,
+    )
+
+    state = runner.run("private task")
+    logger.close()
+
+    raw = (
+        tmp_path / ".coding-agent" / "logs" / ("5" * 32 + ".jsonl")
+    ).read_text(encoding="utf-8")
+    events = [json.loads(line) for line in raw.splitlines()]
+    event_types = [event["event_type"] for event in events]
+    assert event_types == [
+        "run_started",
+        "model_call_started",
+        "provider_attempt_started",
+        "provider_attempt_completed",
+        "model_call_completed",
+        "tool_call_started",
+        "tool_call_completed",
+        "mutation_recorded",
+        "model_call_started",
+        "provider_attempt_started",
+        "provider_attempt_completed",
+        "model_call_completed",
+        "completion_candidate",
+        "run_completed",
+    ]
+    assert state.status is AgentStatus.COMPLETION_CANDIDATE
+    assert events[6]["data"]["mutation_index_before"] == 0
+    assert events[6]["data"]["mutation_index_after"] == 1
+    assert events[7]["data"]["changed_paths"] == ["z.py", "a.py"]
+    assert events[-1]["data"]["status"] == "completion_candidate"
+    assert "private-call-id" not in raw
+    assert "private arguments" not in raw
+    assert "private tool output" not in raw
+    assert "private completion" not in raw
+    assert "private task" not in raw
+
+
 def test_tool_limit_pairs_unexecuted_call_without_dispatch(tmp_path: Path) -> None:
     tool = EchoTool()
     first = ToolCall("call-1", "echo", {"text": "first"})
@@ -873,6 +938,60 @@ def test_summary_and_main_call_share_one_run_budget(tmp_path: Path) -> None:
     assert client.requests[10].messages[1].content.startswith(
         "coding-agent context summary\n"  # type: ignore[union-attr]
     )
+
+
+def test_compression_events_wrap_summary_and_clear_continuation(
+    tmp_path: Path,
+) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="6" * 32)
+    tool = RecordingTool(*_nine_tool_outcomes())
+    runner, _ = _runner(
+        tmp_path,
+        _nine_tool_turns()
+        + (
+            _summary_response(continuation=("summary-private",)),
+            ModelResponse(text="done"),
+        ),
+        tools=(tool,),
+        context_limits=_compression_limits(),
+        event_sink=logger,
+    )
+
+    state = runner.run("compress and continue")
+    logger.close()
+
+    raw = (
+        tmp_path / ".coding-agent" / "logs" / ("6" * 32 + ".jsonl")
+    ).read_text(encoding="utf-8")
+    events = [json.loads(line) for line in raw.splitlines()]
+    started = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "context_compression_started"
+    )
+    summary_model_started = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "model_call_started"
+        and event["data"]["purpose"] == "summary"
+    )
+    completed = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "context_compression_completed"
+    )
+    next_main = next(
+        index
+        for index, event in enumerate(events[completed + 1 :], completed + 1)
+        if event["event_type"] == "model_call_started"
+        and event["data"]["purpose"] == "main"
+    )
+    assert started < summary_model_started < completed < next_main
+    assert events[completed]["data"]["continuation_cleared"] is True
+    assert events[completed]["data"]["summary_source"] == "model"
+    assert logger.metadata.context_compression_count == 1
+    assert state.continuation_items == ()
+    assert "summary-private" not in raw
 
 
 def test_summary_exhausts_provider_budget_before_main_call(
@@ -1393,6 +1512,82 @@ def test_last_permitted_model_call_can_still_run_required_verification(
     assert state.verification_attempt_count == 1
     assert len(client.requests) == 1
     assert len(executor.calls) == 1
+
+
+def test_required_verification_events_precede_success_terminal(
+    tmp_path: Path,
+) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="7" * 32)
+    executor = FakeVerificationExecutor(
+        _verification_execution(0, stdout="private verification output")
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        verification_gate=_verification_gate(tmp_path, executor),
+        event_sink=logger,
+    )
+
+    state = runner.run("verify before success")
+    logger.close()
+
+    raw = (
+        tmp_path / ".coding-agent" / "logs" / ("7" * 32 + ".jsonl")
+    ).read_text(encoding="utf-8")
+    events = [json.loads(line) for line in raw.splitlines()]
+    event_types = [event["event_type"] for event in events]
+    assert event_types[-4:] == [
+        "completion_candidate",
+        "verification_started",
+        "verification_completed",
+        "run_completed",
+    ]
+    assert state.status is AgentStatus.SUCCESS
+    assert events[-2]["data"]["status"] == "passed"
+    assert events[-2]["data"]["validation_index"] == state.mutation_index
+    assert events[-1]["data"]["status"] == "success"
+    assert "private verification output" not in raw
+
+
+class FailingWriteStream:
+    def __init__(self) -> None:
+        self.write_calls = 0
+
+    def write(self, value: str) -> int:
+        self.write_calls += 1
+        raise OSError("Authorization: Bearer private-provider-body")
+
+    def flush(self) -> None:
+        raise AssertionError("flush must not follow failed write")
+
+    def close(self) -> None:
+        return None
+
+
+def test_run_started_log_failure_stops_before_model_and_is_stable(
+    tmp_path: Path,
+) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="8" * 32)
+    stream = FailingWriteStream()
+    logger._stream = stream  # type: ignore[attr-defined]
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="must not run"),),
+        event_sink=logger,
+    )
+
+    state = runner.run("stop if the audit trail is unavailable")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.AUDIT_LOG_FAILURE
+    assert state.failure_reason == "audit_log_failure"
+    assert client.requests == ()
+    assert state.logical_model_call_count == 0
+    assert state.model_call_count == 0
+    assert stream.write_calls == 1
+    assert logger.metadata.log_failure_code == "log_write_failed"
+    assert "private-provider-body" not in repr(state)
+    assert "private-provider-body" not in repr(logger.metadata)
 
 
 def test_failed_verification_then_exhausted_model_budget_stops_before_request(

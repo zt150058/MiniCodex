@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import os
 import subprocess
 import sys
@@ -11,6 +12,7 @@ import pytest
 from coding_agent.messages import (
     ModelRequest,
     ModelResponse,
+    TokenUsage,
     ToolCall,
     UserMessage,
 )
@@ -21,11 +23,22 @@ from coding_agent.model import (
     ModelBudgetExceeded,
     ModelBudgetReason,
     ModelCallBudget,
+    ModelCallPurpose,
     ModelClient,
     ModelError,
+    ModelObservation,
+    ModelObservationKind,
     TransientModelError,
     invoke_model,
 )
+
+
+class RecordingModelObserver:
+    def __init__(self) -> None:
+        self.items: list[ModelObservation] = []
+
+    def observe_model(self, observation: ModelObservation) -> None:
+        self.items.append(observation)
 
 
 def _request(content: str) -> ModelRequest:
@@ -230,6 +243,103 @@ def test_invoke_model_counts_one_logical_and_one_physical_attempt() -> None:
     assert budget.logical_calls == 1
     assert budget.provider_attempts == 1
     assert len(client.requests) == 1
+
+
+def test_generic_client_emits_one_logical_and_one_physical_attempt() -> None:
+    observer = RecordingModelObserver()
+    budget = ModelCallBudget(observer=observer)
+    response = ModelResponse(
+        text="ok",
+        usage=TokenUsage(input_tokens=3, output_tokens=2, total_tokens=5),
+        provider_response_id="response-safe-id",
+    )
+
+    returned = invoke_model(
+        FakeModelClient((response,)),
+        _request("observe without recording the body"),
+        budget,
+        purpose=ModelCallPurpose.MAIN,
+    )
+
+    assert returned is response
+    assert [item.kind for item in observer.items] == [
+        ModelObservationKind.LOGICAL_STARTED,
+        ModelObservationKind.PROVIDER_STARTED,
+        ModelObservationKind.PROVIDER_COMPLETED,
+        ModelObservationKind.LOGICAL_COMPLETED,
+    ]
+    assert observer.items[0].message_count == 1
+    assert observer.items[0].tool_schema_count == 0
+    assert observer.items[0].continuation_count == 0
+    assert observer.items[-1].usage == response.usage
+    assert observer.items[-1].provider_response_id_hash == hashlib.sha256(
+        b"response-safe-id"
+    ).hexdigest()
+    assert budget.logical_calls == 1
+    assert budget.provider_attempts == 1
+
+
+def test_transient_model_error_emits_stable_failure_without_exception_body() -> None:
+    observer = RecordingModelObserver()
+    budget = ModelCallBudget(observer=observer)
+    secret = "Authorization: Bearer provider-private"
+
+    with pytest.raises(TransientModelError):
+        invoke_model(
+            FakeModelClient((TransientModelError(secret),)),
+            _request("retry"),
+            budget,
+        )
+
+    assert [item.kind for item in observer.items] == [
+        ModelObservationKind.LOGICAL_STARTED,
+        ModelObservationKind.PROVIDER_STARTED,
+        ModelObservationKind.PROVIDER_FAILED,
+        ModelObservationKind.LOGICAL_FAILED,
+    ]
+    assert observer.items[2].error_code == "transient_model_error"
+    assert observer.items[3].error_code == "transient_model_error"
+    assert secret not in repr(observer.items)
+    assert (budget.logical_calls, budget.provider_attempts) == (1, 1)
+
+
+def test_blocked_logical_call_emits_only_blocked_and_does_not_increment() -> None:
+    observer = RecordingModelObserver()
+    client = FakeModelClient((ModelResponse(text="must not run"),))
+    budget = ModelCallBudget(
+        max_logical_calls=1,
+        logical_calls=1,
+        observer=observer,
+    )
+
+    with pytest.raises(ModelBudgetExceeded):
+        invoke_model(client, _request("blocked"), budget)
+
+    assert [item.kind for item in observer.items] == [
+        ModelObservationKind.LOGICAL_BLOCKED
+    ]
+    assert observer.items[0].error_code == "logical_model_call_limit"
+    assert budget.logical_calls == 1
+    assert budget.provider_attempts == 0
+    assert client.requests == ()
+
+
+class FailingModelObserver:
+    def observe_model(self, observation: ModelObservation) -> None:
+        raise RuntimeError("observer unavailable")
+
+
+def test_observer_failure_before_logical_claim_prevents_operation() -> None:
+    client = FakeModelClient((ModelResponse(text="must not run"),))
+    budget = ModelCallBudget(observer=FailingModelObserver())
+
+    with pytest.raises(RuntimeError, match="observer unavailable"):
+        invoke_model(client, _request("blocked by observer"), budget)
+
+    assert budget.logical_calls == 0
+    assert budget.provider_attempts == 0
+    assert client.requests == ()
+    assert "FailingModelObserver" not in repr(budget)
 
 
 @pytest.mark.parametrize(
