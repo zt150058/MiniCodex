@@ -24,6 +24,7 @@ from coding_agent.model import (
     ModelCallBudget,
     ModelCallPurpose,
     ModelClient,
+    ModelError,
     ModelObservation,
     TransientModelError,
 )
@@ -41,6 +42,14 @@ class RecordingModelObserver:
 
     def observe_model(self, observation: ModelObservation) -> None:
         self.items.append(observation)
+
+
+class InterruptingSummaryClient:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def complete(self, request: object) -> ModelResponse:
+        raise self.error
 
 
 def make_state_with_n_complete_turns(
@@ -499,6 +508,20 @@ def test_summary_failure_uses_deterministic_fallback(
     assert first.messages == second.messages
 
 
+def test_nonfatal_model_error_summary_uses_deterministic_fallback(
+    tmp_path: Path,
+) -> None:
+    state = make_compressible_state(tmp_path)
+
+    prepared = triggered_manager(
+        FakeModelClient((ModelError("provider response could not be parsed"),))
+    ).prepare(state, ModelCallBudget())
+
+    assert prepared.summary_source is SummarySource.FALLBACK
+    assert prepared.summary_model_failed is True
+    assert _parsed_summary(prepared.messages)["goal"] == state.task
+
+
 def test_fatal_summary_error_propagates(tmp_path: Path) -> None:
     error = FatalModelError("fatal summary configuration")
     state = make_compressible_state(tmp_path)
@@ -507,6 +530,26 @@ def test_fatal_summary_error_propagates(tmp_path: Path) -> None:
             state,
             ModelCallBudget(),
         )
+    assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(9)],
+    ids=["keyboard_interrupt", "system_exit"],
+)
+def test_summary_base_exception_propagates(
+    tmp_path: Path,
+    error: BaseException,
+) -> None:
+    state = make_compressible_state(tmp_path)
+
+    with pytest.raises(type(error)) as caught:
+        triggered_manager(InterruptingSummaryClient(error)).prepare(
+            state,
+            ModelCallBudget(),
+        )
+
     assert caught.value is error
 
 

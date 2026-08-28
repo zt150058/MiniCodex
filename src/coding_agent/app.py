@@ -195,5 +195,12 @@ def run_application(
     except (ReportInvariantError, Exception):
         stderr.write("error: internal application failure\n")
         return 1
-    stdout.write(rendered)
+    try:
+        stdout.write(rendered)
+    except Exception:
+        try:
+            stderr.write("error: final report output failed\n")
+        except Exception:
+            pass
+        return 1
     return report.exit_code

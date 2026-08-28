@@ -10,7 +10,7 @@ from typing import TextIO
 
 import pytest
 
-from coding_agent.cli import main
+from coding_agent.cli import build_parser, main
 from coding_agent.config import ConfigError, RunConfig, load_run_config
 from coding_agent.safety import (
     AuthorizedCommand,
@@ -28,6 +28,22 @@ def valid_environ() -> dict[str, str]:
         "OPENAI_MODEL": "env-model",
         "OPENAI_API_KEY": SECRET_SENTINEL,
     }
+
+
+def test_help_describes_local_agent_execution_and_verification() -> None:
+    help_text = " ".join(build_parser().format_help().split())
+
+    assert "Run a one-shot local coding agent" in help_text
+    assert "read and modify workspace files and run authorized commands" in help_text
+    assert "User-specified required final verification command" in help_text
+    for stale_text in (
+        "Validate configuration",
+        "Task to validate",
+        "executed by Task 11",
+        "Task 1",
+        "Task1",
+    ):
+        assert stale_text not in help_text
 
 
 def test_config_normalizes_workspace(tmp_path: Path) -> None:

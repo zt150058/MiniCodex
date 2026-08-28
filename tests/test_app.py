@@ -4,6 +4,8 @@ from io import StringIO
 import json
 from pathlib import Path
 
+import pytest
+
 from coding_agent.app import ApplicationFactories, production_factories, run_application
 from coding_agent.config import RunConfig, load_run_config
 from coding_agent.logging import (
@@ -94,6 +96,14 @@ class UnexpectedCloseLogger:
         raise RuntimeError("private provider payload " + FAKE_KEY)
 
 
+class RaisingWriter:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def write(self, value: str) -> int:
+        raise self.error
+
+
 def _config(workspace: Path) -> RunConfig:
     return load_run_config(
         task="repair demo",
@@ -101,6 +111,25 @@ def _config(workspace: Path) -> RunConfig:
         model="fake-model",
         verify_command="pytest -q",
         environ={"OPENAI_API_KEY": FAKE_KEY},
+    )
+
+
+def _successful_factories() -> ApplicationFactories:
+    executor = RecordingExecutor()
+
+    def logger_factory(config: RunConfig, clock: object) -> RunEventLogger:
+        return RunEventLogger.create(
+            config.workspace,
+            run_id="5" * 32,
+            sensitive_values=(config.api_key,),
+            monotonic_clock=clock,  # type: ignore[arg-type]
+        )
+
+    return ApplicationFactories(
+        model_client=lambda config: FakeModelClient((ModelResponse(text="done"),)),
+        logger=logger_factory,
+        command_executor=lambda: executor,  # type: ignore[arg-type]
+        clock=lambda: 0.0,
     )
 
 
@@ -329,3 +358,68 @@ def test_internal_failure_is_stable_and_redacted(tmp_path: Path) -> None:
     assert FAKE_KEY not in stderr.getvalue()
     assert "private provider payload" not in stderr.getvalue()
     assert logger_holder[0].wrapped._closed is True  # type: ignore[attr-defined]
+
+
+def test_final_report_stdout_oserror_is_stable_and_redacted(tmp_path: Path) -> None:
+    stderr = StringIO()
+
+    code = run_application(
+        _config(tmp_path),
+        stdout=RaisingWriter(OSError("private output path " + FAKE_KEY)),  # type: ignore[arg-type]
+        stderr=stderr,
+        factories=_successful_factories(),
+    )
+
+    assert code == 1
+    assert stderr.getvalue() == "error: final report output failed\n"
+    assert FAKE_KEY not in stderr.getvalue()
+    assert "private output path" not in stderr.getvalue()
+
+
+def test_closed_stdout_is_a_stable_application_failure(tmp_path: Path) -> None:
+    stdout = StringIO()
+    stdout.close()
+    stderr = StringIO()
+
+    code = run_application(
+        _config(tmp_path),
+        stdout=stdout,
+        stderr=stderr,
+        factories=_successful_factories(),
+    )
+
+    assert code == 1
+    assert stderr.getvalue() == "error: final report output failed\n"
+
+
+def test_stdout_and_stderr_failure_returns_without_recursive_reporting(
+    tmp_path: Path,
+) -> None:
+    code = run_application(
+        _config(tmp_path),
+        stdout=RaisingWriter(OSError("stdout failed")),  # type: ignore[arg-type]
+        stderr=RaisingWriter(OSError("stderr failed")),  # type: ignore[arg-type]
+        factories=_successful_factories(),
+    )
+
+    assert code == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyboardInterrupt(), SystemExit(7)],
+    ids=["keyboard_interrupt", "system_exit"],
+)
+def test_final_report_stdout_base_exception_propagates(
+    tmp_path: Path,
+    error: BaseException,
+) -> None:
+    with pytest.raises(type(error)) as caught:
+        run_application(
+            _config(tmp_path),
+            stdout=RaisingWriter(error),  # type: ignore[arg-type]
+            stderr=StringIO(),
+            factories=_successful_factories(),
+        )
+
+    assert caught.value is error

@@ -13,9 +13,12 @@ if TYPE_CHECKING:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="coding-agent",
-        description="Validate configuration for a one-shot local coding-agent task.",
+        description=(
+            "Run a one-shot local coding agent. It may read and modify workspace "
+            "files and run authorized commands."
+        ),
     )
-    parser.add_argument("task", help="One-shot coding task to validate")
+    parser.add_argument("task", help="Coding task for the local agent")
     parser.add_argument(
         "--workspace",
         required=True,
@@ -25,8 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--verify",
         default=None,
         help=(
-            "Optional final verification command; authorized now and "
-            "executed by Task 11."
+            "User-specified required final verification command; authorized "
+            "before the agent starts and run after the latest file modification."
         ),
     )
     parser.add_argument(

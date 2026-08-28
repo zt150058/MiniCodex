@@ -506,50 +506,53 @@
 
 **当前状态**
 
-`进行中`
+`已完成`
 
 ## 14. README、视频和提交物检查
 
 **任务目标**
 
-完成公开仓库说明、考核用 `README.txt`、两分钟演示视频和最终 ZIP 检查，确保满足题目提交规则且不泄露凭据。
+完成 Task 1–13 的证据化只读代码审查，只修复用户明确批准的问题，并完善公开仓库说明、考核用 `README.txt`、离线安装和最终安全审计。视频、ZIP、release、上传和远程仓库操作不属于本任务范围。
 
 **涉及模块**
 
 - `README.md`
 - `README.txt`
-- 演示脚本或拍摄清单文档
-- 最终 MP4 和提交 ZIP，仅在发布阶段生成
+- `docs/USAGE.md`
+- `docs/OPENAI_API.md`
+- `tests/test_docs.py`
+- 用户明确批准的 finding 对应源码和测试
 
 **验收标准**
 
-- 公开仓库为题目发布后新建，保留完整提交历史。
+- Task 1–13 的全部生产代码、测试、演示项目和设计边界经过证据化审查。
+- 只修复用户明确批准、可复现且不改变设计或依赖的 finding。
 - `README.md` 说明架构、运行、限制、测试和安全边界。
 - `README.txt` 不超过 1000 汉字，包含仓库地址、运行方法、特色功能和必要说明。
-- 视频不超过 2 分钟，MP4 格式且不超过 200 MB。
-- 视频展示真实失败测试修复，并简要解释主循环、验证门槛和上下文压缩。
-- 仓库、文档、Git 历史、日志、截图和视频均不包含 API Key。
-- 最终 ZIP 使用本人姓名命名，且只包含 `README.txt` 和视频文件。
-- 截止时间为 2026 年 9 月 2 日 24:00 北京时间；截止后不再推送提交。
-- 推送远程仓库必须由用户明确授权，Codex 不自动推送。
+- `docs/USAGE.md` 说明安装、配置、运行、验证、日志、退出码、故障排查和安全边界。
+- `docs/OPENAI_API.md` 说明 Responses API 映射、重试、continuation、隐私边界和未实现扩展。
+- 干净离线 wheel 安装、CLI 入口、默认离线测试、Windows reparse 和进程树行为均有新鲜验证证据。
+- 仓库和公开文档不包含 API Key、认证头、个人绝对路径或 continuation payload。
+- 本任务不创建或检查视频、ZIP、release 或上传产物，也不修改远程仓库。
 
 **需要编写的测试**
 
-- 全量自动测试和演示命令实际运行。
+- 文档存在性、UTF-8、链接、CLI、工具、退出码、API 和隐私合同测试。
+- approved finding 各自的 RED、GREEN 和回归测试。
+- 全量自动测试、离线集成测试和干净安装实际运行。
 - 凭据模式扫描。
-- `README.txt` 汉字长度检查。
-- 视频格式、时长和文件大小检查。
-- ZIP 文件名及内容清单检查。
-- Git 状态、远程地址和提交历史人工复核。
+- `README.txt` 总 Unicode 字符、汉字、UTF-8 字节和行数检查。
+- Windows symlink、junction、reparse point、timeout 和进程树专项测试。
+- Git 状态、diff、依赖、Agent 框架、占位符和测试抑制检查。
 - 记录所有实际执行命令和真实结果，不声称未执行的检查。
 
 **建议的 Git 提交说明**
 
-`docs: finalize readme demo and submission checklist`
+`docs: complete final review and offline documentation audit`
 
 **当前状态**
 
-`未开始`
+`进行中`
 
 ## 任务完成规则
 

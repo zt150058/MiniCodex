@@ -13,10 +13,12 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import (
+    FatalModelError,
+    ModelBudgetExceeded,
     ModelCallBudget,
     ModelCallPurpose,
     ModelClient,
-    TransientModelError,
+    ModelError,
     invoke_model,
 )
 from coding_agent.state import AgentState, TerminationReason
@@ -457,7 +459,9 @@ class ContextManager:
             )
             if len(summary.to_json()) > self._limits.max_summary_chars:
                 raise _SummaryValidationError("summary is too large")
-        except (TransientModelError, _SummaryValidationError):
+        except (FatalModelError, ModelBudgetExceeded):
+            raise
+        except (ModelError, _SummaryValidationError):
             summary = _fallback_summary(state, removed_messages)
             summary_source = SummarySource.FALLBACK
             summary_model_failed = True
