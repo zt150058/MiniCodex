@@ -4,13 +4,18 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import math
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from coding_agent.messages import Message, UserMessage
+
+if TYPE_CHECKING:
+    from coding_agent.verification import VerificationResult
 
 
 class AgentStatus(StrEnum):
     RUNNING = "running"
     COMPLETION_CANDIDATE = "completion_candidate"
+    SUCCESS = "success"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
 
@@ -34,6 +39,11 @@ class TerminationReason(StrEnum):
 class VerificationStatus(StrEnum):
     NOT_RUN = "not_run"
     STALE = "stale"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    ERROR = "error"
 
 
 @dataclass(slots=True)
@@ -58,9 +68,17 @@ class AgentState:
     mutation_index: int = 0
     modified_paths: tuple[str, ...] = ()
     verification_status: VerificationStatus = VerificationStatus.NOT_RUN
+    verification_attempt_count: int = 0
+    last_verification: VerificationResult | None = field(default=None, repr=False)
     completion_text: str | None = None
     failure_reason: str | None = None
     continuation_items: tuple[object, ...] = field(default=(), repr=False)
+
+    @property
+    def validation_index(self) -> int | None:
+        if self.last_verification is None:
+            return None
+        return self.last_verification.validation_index
 
     @classmethod
     def start(

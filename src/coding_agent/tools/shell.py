@@ -13,8 +13,10 @@ from typing import BinaryIO
 
 from coding_agent.messages import JSONObject, ToolResultMetadata
 from coding_agent.safety import (
+    AuthorizedCommand,
     CommandPolicy,
     CommandSource,
+    PathGuard,
     parse_windows_command_line,
 )
 from coding_agent.tools.base import ExecutionContext, ToolArgumentError, ToolExecution
@@ -181,32 +183,12 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> str | None:
     return None
 
 
-class RunCommandTool:
-    name = "run_command"
-    schema: JSONObject = {
-        "name": "run_command",
-        "description": "Run an authorized command in the workspace.",
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "minLength": 1},
-                "purpose": {
-                    "type": "string",
-                    "enum": ["inspect", "test", "verification"],
-                },
-            },
-            "required": ["command", "purpose"],
-            "additionalProperties": False,
-        },
-    }
-
+class AuthorizedCommandExecutor:
     def __init__(
         self,
         *,
         process_factory: ProcessFactory | None = None,
         tree_terminator: TreeTerminator | None = None,
-        policy_factory: PolicyFactory | None = None,
     ) -> None:
         self._process_factory = (
             subprocess.Popen if process_factory is None else process_factory
@@ -214,24 +196,19 @@ class RunCommandTool:
         self._tree_terminator = (
             _terminate_process_tree if tree_terminator is None else tree_terminator
         )
-        self._policy_factory = (
-            CommandPolicy if policy_factory is None else policy_factory
-        )
 
     def execute(
         self,
-        arguments: JSONObject,
+        command: AuthorizedCommand,
         context: ExecutionContext,
     ) -> ToolExecution:
-        command, purpose = _validated_arguments(arguments)
-        policy = self._policy_factory(context.workspace)
-        authorized = policy.authorize(
-            command,
-            purpose=purpose,
-            source=CommandSource.MODEL,
-        )
-        argv = authorized.argv
-        workspace = policy.workspace
+        if not isinstance(command, AuthorizedCommand):
+            raise TypeError("command must be AuthorizedCommand")
+        if not isinstance(context, ExecutionContext):
+            raise TypeError("context must be ExecutionContext")
+        argv = command.argv
+        purpose = command.purpose
+        workspace = PathGuard(context.workspace).workspace
 
         started = time.monotonic_ns()
         try:
@@ -298,5 +275,73 @@ class RunCommandTool:
                 timed_out=timed_out,
                 truncated=truncated,
                 duration_ms=duration_ms,
+            ),
+        )
+
+
+class RunCommandTool:
+    name = "run_command"
+    schema: JSONObject = {
+        "name": "run_command",
+        "description": "Run an authorized command in the workspace.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "minLength": 1},
+                "purpose": {
+                    "type": "string",
+                    "enum": ["inspect", "test", "verification"],
+                },
+            },
+            "required": ["command", "purpose"],
+            "additionalProperties": False,
+        },
+    }
+
+    def __init__(
+        self,
+        *,
+        process_factory: ProcessFactory | None = None,
+        tree_terminator: TreeTerminator | None = None,
+        policy_factory: PolicyFactory | None = None,
+        authorized_executor: AuthorizedCommandExecutor | None = None,
+    ) -> None:
+        if authorized_executor is not None and (
+            process_factory is not None or tree_terminator is not None
+        ):
+            raise TypeError(
+                "authorized_executor cannot be combined with process_factory "
+                "or tree_terminator"
+            )
+        self._authorized_executor = (
+            AuthorizedCommandExecutor(
+                process_factory=process_factory,
+                tree_terminator=tree_terminator,
+            )
+            if authorized_executor is None
+            else authorized_executor
+        )
+        self._policy_factory = (
+            CommandPolicy if policy_factory is None else policy_factory
+        )
+
+    def execute(
+        self,
+        arguments: JSONObject,
+        context: ExecutionContext,
+    ) -> ToolExecution:
+        command, purpose = _validated_arguments(arguments)
+        policy = self._policy_factory(context.workspace)
+        authorized = policy.authorize(
+            command,
+            purpose=purpose,
+            source=CommandSource.MODEL,
+        )
+        return self._authorized_executor.execute(
+            authorized,
+            ExecutionContext(
+                workspace=policy.workspace,
+                command_timeout_seconds=context.command_timeout_seconds,
             ),
         )

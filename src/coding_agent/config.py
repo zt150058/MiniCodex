@@ -13,6 +13,7 @@ from coding_agent.safety import (
     SafetyCode,
     SafetyViolation,
 )
+from coding_agent.verification import is_credible_verification_command
 
 
 class ConfigError(ValueError):
@@ -79,6 +80,11 @@ def load_run_config(
             raise ConfigError(
                 f"--verify rejected ({exc.code.value}): {exc.public_message}"
             ) from None
+        if not is_credible_verification_command(authorized_verify):
+            raise ConfigError(
+                "--verify rejected (verification_not_credible): "
+                "command is not a credible verification command"
+            )
 
     return RunConfig(
         task=normalized_task,

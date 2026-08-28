@@ -25,7 +25,9 @@ from coding_agent.model import (
     ModelClient,
     TransientModelError,
 )
-from coding_agent.state import AgentState, TerminationReason
+from coding_agent.safety import CommandSource
+from coding_agent.state import AgentState, TerminationReason, VerificationStatus
+from coding_agent.verification import VerificationResult
 
 
 SUMMARY_PREFIX = "coding-agent context summary\n"
@@ -290,6 +292,82 @@ def test_model_summary_request_and_local_invariants(tmp_path: Path) -> None:
     }
     assert budget.logical_calls == 1
     assert budget.provider_attempts == 1
+
+
+def test_compression_preserves_minimal_fresh_verification_facts(
+    tmp_path: Path,
+) -> None:
+    state = make_compressible_state(tmp_path)
+    state.mutation_index = 3
+    state.verification_status = VerificationStatus.PASSED
+    state.last_verification = VerificationResult(
+        status=VerificationStatus.PASSED,
+        validation_index=3,
+        command="python -m pytest -q",
+        source=CommandSource.USER_VERIFY,
+        exit_code=0,
+        stdout="secret-stdout",
+        stderr="secret-stderr",
+        timed_out=False,
+        truncated=False,
+        duration_ms=15,
+        error=None,
+    )
+    continuation_sentinel = "encrypted-reasoning-sentinel"
+    state.continuation_items = (continuation_sentinel,)
+
+    prepared = triggered_manager(
+        FakeModelClient((valid_summary_response(),))
+    ).prepare(state, ModelCallBudget())
+    parsed = _parsed_summary(prepared.messages)
+
+    assert parsed["verification_state"] == {
+        "status": "passed",
+        "mutation_index": 3,
+        "validation_index": 3,
+        "command": "python -m pytest -q",
+        "source": "user_verify",
+        "exit_code": 0,
+    }
+    rendered = json.dumps(parsed, sort_keys=True)
+    assert "secret-stdout" not in rendered
+    assert "secret-stderr" not in rendered
+    assert continuation_sentinel not in rendered
+    assert continuation_sentinel not in repr(prepared)
+
+
+def test_compression_marks_preserved_verification_as_stale(
+    tmp_path: Path,
+) -> None:
+    state = make_compressible_state(tmp_path)
+    state.mutation_index = 4
+    state.verification_status = VerificationStatus.STALE
+    state.last_verification = VerificationResult(
+        status=VerificationStatus.PASSED,
+        validation_index=3,
+        command="python -m pytest -q",
+        source=CommandSource.MODEL,
+        exit_code=0,
+        stdout="old output",
+        stderr="",
+        timed_out=False,
+        truncated=False,
+        duration_ms=9,
+        error=None,
+    )
+
+    prepared = triggered_manager(
+        FakeModelClient((valid_summary_response(),))
+    ).prepare(state, ModelCallBudget())
+
+    assert _parsed_summary(prepared.messages)["verification_state"] == {
+        "status": "stale",
+        "mutation_index": 4,
+        "validation_index": 3,
+        "command": "python -m pytest -q",
+        "source": "model",
+        "exit_code": 0,
+    }
 
 
 def test_model_summary_is_deterministic_for_equivalent_state(

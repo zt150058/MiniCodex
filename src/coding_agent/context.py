@@ -243,13 +243,16 @@ def _merge_local_invariants(
         f"provider_attempts: {state.model_call_count}",
         f"tool_calls: {state.tool_call_count}",
     )
+    verification = state.last_verification
     verification_state: JSONObject = {
         "status": state.verification_status.value,
         "mutation_index": state.mutation_index,
-        "validation_index": None,
-        "command": None,
-        "source": None,
-        "exit_code": None,
+        "validation_index": (
+            None if verification is None else verification.validation_index
+        ),
+        "command": None if verification is None else verification.command,
+        "source": None if verification is None else verification.source.value,
+        "exit_code": None if verification is None else verification.exit_code,
     }
     return ContextSummary(
         goal=state.task,

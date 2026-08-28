@@ -14,7 +14,7 @@ import pytest
 from openai import RateLimitError
 
 import coding_agent.agent as agent_module
-from coding_agent.agent import AgentRunner
+from coding_agent.agent import AgentInterrupted, AgentRunner
 from coding_agent.context import ContextLimits, ContextManager
 from coding_agent.messages import (
     AssistantMessage,
@@ -34,7 +34,12 @@ from coding_agent.model import (
     TransientModelError,
 )
 from coding_agent.openai_client import OpenAIResponsesClient
-from coding_agent.safety import SafetyCode, SafetyViolation
+from coding_agent.safety import (
+    AuthorizedCommand,
+    CommandSource,
+    SafetyCode,
+    SafetyViolation,
+)
 from coding_agent.state import AgentStatus, TerminationReason, VerificationStatus
 from coding_agent.termination import TerminationLimits, TerminationPolicy
 from coding_agent.tools.base import (
@@ -48,6 +53,7 @@ from coding_agent.tools.filesystem import (
     WriteFileTool,
 )
 from coding_agent.tools.registry import ToolRegistry
+from coding_agent.verification import VerificationGate
 
 
 def _runner(
@@ -58,6 +64,7 @@ def _runner(
     limits: TerminationLimits | None = None,
     clock: Callable[[], float] = lambda: 0.0,
     context_limits: ContextLimits | None = None,
+    verification_gate: VerificationGate | None = None,
 ) -> tuple[AgentRunner, FakeModelClient]:
     client = FakeModelClient(responses)
     runner = AgentRunner(
@@ -71,8 +78,81 @@ def _runner(
         ),
         termination_policy=TerminationPolicy(limits or TerminationLimits()),
         clock=clock,
+        verification_gate=verification_gate,
     )
     return runner, client
+
+
+@dataclass(slots=True)
+class FakeVerificationExecutor:
+    queued: deque[ToolExecution | BaseException]
+    calls: list[tuple[AuthorizedCommand, ExecutionContext]] = field(
+        default_factory=list
+    )
+
+    def __init__(self, *queued: ToolExecution | BaseException) -> None:
+        self.queued = deque(queued)
+        self.calls = []
+
+    def execute(
+        self, command: AuthorizedCommand, context: ExecutionContext
+    ) -> ToolExecution:
+        self.calls.append((command, context))
+        value = self.queued.popleft()
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+def _required_verification() -> AuthorizedCommand:
+    argv = (sys.executable, "-m", "pytest", "-q")
+    return AuthorizedCommand(
+        argv=argv,
+        normalized_command=subprocess.list2cmdline(argv),
+        purpose="verification",
+        source=CommandSource.USER_VERIFY,
+    )
+
+
+def _verification_execution(
+    exit_code: int | None,
+    *,
+    timed_out: bool = False,
+    stdout: str = "",
+    stderr: str = "",
+) -> ToolExecution:
+    required = _required_verification()
+    return ToolExecution(
+        output=json.dumps(
+            {
+                "argv": list(required.argv),
+                "cleanup_error": None,
+                "purpose": "verification",
+                "stderr": stderr,
+                "stdout": stdout,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        metadata=ToolResultMetadata(
+            exit_code=exit_code,
+            timed_out=timed_out,
+            duration_ms=5,
+        ),
+    )
+
+
+def _verification_gate(
+    tmp_path: Path,
+    executor: FakeVerificationExecutor,
+    *,
+    required: bool = True,
+) -> VerificationGate:
+    return VerificationGate(
+        required_command=_required_verification() if required else None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=executor,
+    )
 
 
 @dataclass(slots=True)
@@ -117,6 +197,35 @@ class EchoTool:
         text = arguments["text"]
         self.executed.append((text, context.workspace))
         return ToolExecution(output=text)
+
+
+@dataclass(slots=True)
+class OfflineVerificationTool:
+    name: str = field(default="run_command", init=False)
+    schema: JSONObject = field(
+        default_factory=lambda: {
+            "name": "run_command",
+            "description": "Return offline verification evidence.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "purpose": {"type": "string"},
+                },
+                "required": ["command", "purpose"],
+                "additionalProperties": False,
+            },
+        },
+        init=False,
+    )
+
+    def execute(
+        self,
+        arguments: JSONObject,
+        context: ExecutionContext,
+    ) -> ToolExecution:
+        return _verification_execution(0, stdout="offline passed")
 
 
 @dataclass(slots=True)
@@ -1075,6 +1184,406 @@ def test_successful_write_updates_ledger_and_marks_verification_stale(
     assert state.mutation_index == 1
     assert state.modified_paths == ("created.txt",)
     assert state.verification_status is VerificationStatus.STALE
+
+
+def test_required_verification_runs_only_after_text_candidate(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0, stdout="passed"))
+    call = ToolCall("echo-before-verify", "echo", {"text": "working"})
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(EchoTool(),),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("verify after tools")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.completion_text == "done"
+    assert len(client.requests) == 2
+    assert len(executor.calls) == 1
+    assert state.verification_attempt_count == 1
+
+
+def test_required_verification_failure_feedback_reaches_next_model_request(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(
+        _verification_execution(1, stderr="one failed"),
+        _verification_execution(0, stdout="fixed"),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate one"), ModelResponse(text="candidate two")),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("repair after verification")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.completion_text == "candidate two"
+    assert len(client.requests) == 2
+    feedback = client.requests[1].messages[-1]
+    assert isinstance(feedback, AssistantMessage)
+    assert feedback.content is not None
+    assert feedback.content.startswith("coding-agent verification feedback\n")
+    assert '"status":"failed"' in feedback.content
+    assert len(executor.calls) == 2
+    assert state.verification_attempt_count == 2
+
+
+def test_candidate_failure_mutation_and_fresh_pass_reaches_success(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sample.txt").write_text("old", encoding="utf-8")
+    replace = ToolCall(
+        "repair-file",
+        "replace_text",
+        {
+            "path": "sample.txt",
+            "old_text": "old",
+            "new_text": "new",
+            "expected_count": 1,
+        },
+    )
+    executor = FakeVerificationExecutor(
+        _verification_execution(1, stderr="broken"),
+        _verification_execution(0, stdout="passed"),
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(text="first candidate"),
+            ModelResponse(tool_calls=(replace,)),
+            ModelResponse(text="fixed candidate"),
+        ),
+        tools=(ReplaceTextTool(),),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("repair and verify")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.mutation_index == 1
+    assert state.validation_index == 1
+    assert state.verification_status is VerificationStatus.PASSED
+    assert state.verification_attempt_count == 2
+    assert len(executor.calls) == 2
+    assert (tmp_path / "sample.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_model_verification_evidence_allows_success_without_second_execution(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall(
+        "model-verification",
+        "run_command",
+        {"command": "python -m pytest -q", "purpose": "verification"},
+    )
+    executor = FakeVerificationExecutor()
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="done")),
+        tools=(OfflineVerificationTool(),),
+        verification_gate=_verification_gate(tmp_path, executor, required=False),
+    )
+
+    state = runner.run("model verifies")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.tool_call_count == 1
+    assert state.verification_attempt_count == 1
+    assert state.last_verification is not None
+    assert state.last_verification.source is CommandSource.MODEL
+    assert executor.calls == []
+
+
+def test_model_prose_without_evidence_never_becomes_success(tmp_path: Path) -> None:
+    executor = FakeVerificationExecutor()
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="I am done"), ModelResponse(text="still done")),
+        limits=TerminationLimits(max_logical_model_calls=2),
+        verification_gate=_verification_gate(tmp_path, executor, required=False),
+    )
+
+    state = runner.run("require real evidence")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.LOGICAL_MODEL_CALL_LIMIT
+    assert state.verification_attempt_count == 0
+    assert len(client.requests) == 2
+    assert executor.calls == []
+    assert sum(
+        isinstance(message, AssistantMessage)
+        and message.content is not None
+        and message.content.startswith("coding-agent verification feedback\n")
+        for message in state.messages
+    ) == 2
+
+
+def test_tool_budget_at_limit_blocks_required_verification_without_counting_it(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    call = ToolCall("consume-slot", "echo", {"text": "work"})
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="candidate")),
+        tools=(EchoTool(),),
+        limits=TerminationLimits(max_tool_calls=1),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("respect tool budget")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.TOOL_CALL_LIMIT
+    assert state.tool_call_count == 1
+    assert state.verification_attempt_count == 0
+    assert len(client.requests) == 2
+    assert executor.calls == []
+
+
+def test_time_at_exact_limit_blocks_required_verification(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    clock = FakeClock(0.0, 0.0, 10.0)
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        limits=TerminationLimits(max_runtime_seconds=10.0),
+        clock=clock,
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("respect time budget")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.TIME_LIMIT
+    assert state.tool_call_count == 0
+    assert state.verification_attempt_count == 0
+    assert len(client.requests) == 1
+    assert executor.calls == []
+
+
+def test_last_permitted_model_call_can_still_run_required_verification(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        limits=TerminationLimits(
+            max_logical_model_calls=1,
+            max_provider_attempts=1,
+        ),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("last model call")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.logical_model_call_count == 1
+    assert state.model_call_count == 1
+    assert state.tool_call_count == 1
+    assert state.verification_attempt_count == 1
+    assert len(client.requests) == 1
+    assert len(executor.calls) == 1
+
+
+def test_failed_verification_then_exhausted_model_budget_stops_before_request(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(1, stderr="failed"))
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"), ModelResponse(text="must not run")),
+        limits=TerminationLimits(max_logical_model_calls=1),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("bounded repair")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.LOGICAL_MODEL_CALL_LIMIT
+    assert state.logical_model_call_count == 1
+    assert state.model_call_count == 1
+    assert state.tool_call_count == 1
+    assert state.verification_attempt_count == 1
+    assert len(client.requests) == 1
+    assert len(executor.calls) == 1
+
+
+def test_admitted_passing_verification_wins_at_runtime_boundary(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    clock = FakeClock(0.0, 0.0, 9.999, 10.0)
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        limits=TerminationLimits(max_runtime_seconds=10.0),
+        clock=clock,
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("admitted pass wins")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.verification_status is VerificationStatus.PASSED
+    assert state.tool_call_count == 1
+    assert state.verification_attempt_count == 1
+    assert len(executor.calls) == 1
+    assert tuple(clock.values) == (10.0,)
+
+
+def test_repeated_fixed_verification_failures_stop_at_tool_budget(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(
+        _verification_execution(1, stderr="same failure"),
+        _verification_execution(1, stderr="same failure"),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(text="candidate one"),
+            ModelResponse(text="candidate two"),
+            ModelResponse(text="candidate three"),
+        ),
+        limits=TerminationLimits(max_tool_calls=2),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("bounded repeated verification")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.TOOL_CALL_LIMIT
+    assert state.tool_call_count == 2
+    assert state.verification_attempt_count == 2
+    assert len(executor.calls) == 2
+    assert len(client.requests) == 3
+
+
+def test_corrupt_required_verification_terminates_internal_invariant(
+    tmp_path: Path,
+) -> None:
+    corrupt = ToolExecution(
+        output='{"argv":[],"purpose":"verification"}',
+        metadata=ToolResultMetadata(exit_code=0),
+    )
+    executor = FakeVerificationExecutor(corrupt)
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("corrupt evidence")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.INTERNAL_INVARIANT
+    assert state.failure_reason == "internal_invariant"
+    assert state.verification_attempt_count == 1
+    assert state.tool_call_count == 1
+
+
+def test_keyboard_interrupt_during_required_verification_carries_state(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(KeyboardInterrupt())
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    with pytest.raises(AgentInterrupted) as caught:
+        runner.run("interrupt verification")
+
+    state = caught.value.state
+    assert state.status is AgentStatus.INTERRUPTED
+    assert state.termination_reason is TerminationReason.USER_INTERRUPTED
+    assert state.verification_attempt_count == 1
+    assert state.tool_call_count == 1
+
+
+def test_system_exit_during_required_verification_is_not_caught(
+    tmp_path: Path,
+) -> None:
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        verification_gate=_verification_gate(
+            tmp_path, FakeVerificationExecutor(SystemExit(130))
+        ),
+    )
+
+    with pytest.raises(SystemExit) as caught:
+        runner.run("system exit")
+
+    assert caught.value.code == 130
+
+
+def test_failed_verification_feedback_preserves_provider_continuation(
+    tmp_path: Path,
+) -> None:
+    continuation = object()
+    executor = FakeVerificationExecutor(
+        _verification_execution(1, stderr="failed"),
+        _verification_execution(0),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(text="candidate", continuation_items=(continuation,)),
+            ModelResponse(text="fixed"),
+        ),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("preserve continuation")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert client.requests[1].continuation_items == (continuation,)
+    assert client.requests[1].continuation_items[0] is continuation
+    assert isinstance(client.requests[1].messages[-1], AssistantMessage)
+    assert client.requests[1].messages[-1].tool_calls == ()  # type: ignore[union-attr]
+
+
+def test_verification_exception_body_never_reaches_state_or_feedback(
+    tmp_path: Path,
+) -> None:
+    secret = "Authorization: Bearer secret-sentinel"
+    executor = FakeVerificationExecutor(
+        RuntimeError(secret),
+        _verification_execution(0),
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"), ModelResponse(text="retry")),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("redact failure")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert secret not in repr(state)
+    assert all(secret not in repr(message) for message in state.messages)
+    feedbacks = [
+        message.content
+        for message in state.messages
+        if isinstance(message, AssistantMessage)
+        and message.content is not None
+        and message.content.startswith("coding-agent verification feedback\n")
+    ]
+    assert len(feedbacks) == 1
+    assert "verification_internal_error" in feedbacks[0]
+    assert secret not in feedbacks[0]
 
 
 def test_successful_calls_increment_per_call_and_deduplicate_in_first_seen_order(

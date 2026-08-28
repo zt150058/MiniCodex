@@ -17,9 +17,13 @@ from coding_agent.safety import (
     SafetyCode,
     SafetyViolation,
 )
-from coding_agent.tools.base import ExecutionContext, ToolArgumentError
+from coding_agent.tools.base import ExecutionContext, ToolArgumentError, ToolExecution
 from coding_agent.tools.registry import ToolRegistry
-from coding_agent.tools.shell import RunCommandTool, parse_windows_command_line
+from coding_agent.tools.shell import (
+    AuthorizedCommandExecutor,
+    RunCommandTool,
+    parse_windows_command_line,
+)
 
 
 def _command_for_script(script: Path, *arguments: str) -> str:
@@ -734,6 +738,103 @@ def test_process_launch_uses_shell_false_fixed_cwd_and_sanitized_environment(
     assert environment["PYTHONUTF8"] == "1"
     assert environment["PYTHONIOENCODING"] == "utf-8"
     assert environment["PYTHONUNBUFFERED"] == "1"
+
+
+def test_authorized_executor_runs_exact_capability_without_policy(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "authorized.py"
+    script.write_text("print('authorized')\n", encoding="utf-8")
+    argv = (sys.executable, str(script.resolve()))
+    authorized = AuthorizedCommand(
+        argv=argv,
+        normalized_command=subprocess.list2cmdline(argv),
+        purpose="verification",
+        source=CommandSource.USER_VERIFY,
+    )
+    observed: dict[str, object] = {}
+
+    def recording_factory(
+        received_argv: tuple[str, ...],
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        observed["same_argv"] = received_argv is authorized.argv
+        observed.update(kwargs)
+        return subprocess.Popen(received_argv, **kwargs)  # type: ignore[arg-type]
+
+    result = AuthorizedCommandExecutor(
+        process_factory=recording_factory,
+    ).execute(authorized, ExecutionContext(tmp_path))
+
+    payload = json.loads(result.output or "")
+    assert observed["same_argv"] is True
+    assert observed["shell"] is False
+    assert observed["cwd"] == tmp_path.resolve()
+    assert payload["argv"] == list(argv)
+    assert payload["purpose"] == "verification"
+    assert payload["stdout"] == "authorized\r\n"
+    assert result.metadata.exit_code == 0
+
+
+def test_run_command_delegates_to_authorized_executor_once(
+    tmp_path: Path,
+) -> None:
+    argv = (sys.executable, "-m", "pytest", "-q")
+    authorized = AuthorizedCommand(
+        argv=argv,
+        normalized_command=subprocess.list2cmdline(argv),
+        purpose="verification",
+        source=CommandSource.MODEL,
+    )
+
+    class RecordingPolicy:
+        workspace = tmp_path.resolve()
+
+        def authorize(
+            self,
+            command: object,
+            *,
+            purpose: str,
+            source: CommandSource,
+        ) -> AuthorizedCommand:
+            assert command == "pytest -q"
+            assert purpose == "verification"
+            assert source is CommandSource.MODEL
+            return authorized
+
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[AuthorizedCommand, ExecutionContext]] = []
+
+        def execute(
+            self, command: AuthorizedCommand, context: ExecutionContext
+        ) -> ToolExecution:
+            self.calls.append((command, context))
+            return ToolExecution(output="delegated")
+
+    executor = RecordingExecutor()
+    result = RunCommandTool(
+        authorized_executor=executor,  # type: ignore[arg-type]
+        policy_factory=lambda workspace: RecordingPolicy(),  # type: ignore[arg-type]
+    ).execute(
+        {"command": "pytest -q", "purpose": "verification"},
+        ExecutionContext(tmp_path, command_timeout_seconds=17),
+    )
+
+    assert result.output == "delegated"
+    assert len(executor.calls) == 1
+    delegated, context = executor.calls[0]
+    assert delegated is authorized
+    assert context.workspace == tmp_path.resolve()
+    assert context.command_timeout_seconds == 17
+
+
+def test_authorized_executor_cannot_be_combined_with_low_level_seams() -> None:
+    with pytest.raises(TypeError, match="cannot be combined"):
+        RunCommandTool(
+            authorized_executor=AuthorizedCommandExecutor(),
+            process_factory=subprocess.Popen,
+        )
 
 
 def test_run_command_executes_only_policy_returned_argv(tmp_path: Path) -> None:

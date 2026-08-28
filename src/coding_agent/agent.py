@@ -32,6 +32,11 @@ from coding_agent.termination import (
 )
 from coding_agent.tools.base import ExecutionContext
 from coding_agent.tools.registry import ToolRegistry
+from coding_agent.verification import (
+    VerificationError,
+    VerificationGate,
+    VerificationOutcome,
+)
 
 
 def _record_successful_mutation(
@@ -65,6 +70,7 @@ class AgentRunner:
         context_manager: ContextManager | None = None,
         termination_policy: TerminationPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
+        verification_gate: VerificationGate | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable")
@@ -76,6 +82,7 @@ class AgentRunner:
         )
         self._termination_policy = termination_policy or TerminationPolicy()
         self._clock = clock
+        self._verification_gate = verification_gate
 
     @staticmethod
     def _terminate(
@@ -275,13 +282,56 @@ class AgentRunner:
                         result,
                         mutation_index_before,
                     )
+                    if self._verification_gate is not None:
+                        try:
+                            self._verification_gate.observe_tool_result(
+                                state,
+                                call,
+                                result,
+                            )
+                        except VerificationError:
+                            self._append_unexecuted_results(
+                                state,
+                                response.tool_calls[index + 1 :],
+                                TerminationReason.INTERNAL_INVARIANT,
+                            )
+                            return self._terminate(
+                                state,
+                                TerminationReason.INTERNAL_INVARIANT,
+                            )
                 continue
 
             if assistant_text is not None:
                 state.messages += (AssistantMessage(content=assistant_text),)
                 state.status = AgentStatus.COMPLETION_CANDIDATE
                 state.completion_text = assistant_text
-                return state
+                gate = self._verification_gate
+                if gate is None:
+                    return state
+                if gate.requires_execution:
+                    reason = self._policy_reason(state, NextOperation.TOOL)
+                    if reason is not None:
+                        return self._terminate(state, reason)
+                    state.tool_call_count += 1
+                try:
+                    decision = gate.evaluate(state)
+                except VerificationError:
+                    return self._terminate(
+                        state,
+                        TerminationReason.INTERNAL_INVARIANT,
+                    )
+                if decision.command_executed and not gate.requires_execution:
+                    state.tool_call_count += 1
+                if decision.outcome is VerificationOutcome.SUCCESS:
+                    state.status = AgentStatus.SUCCESS
+                    state.termination_reason = None
+                    state.failure_reason = None
+                    return state
+                if decision.feedback is not None:
+                    state.messages += (decision.feedback,)
+                state.status = AgentStatus.RUNNING
+                state.completion_text = None
+                continue
 
             state.status = AgentStatus.FAILED
             return self._terminate(

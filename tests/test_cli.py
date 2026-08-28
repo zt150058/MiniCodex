@@ -456,3 +456,23 @@ def test_run_config_repr_hides_authorized_verify_and_secret(tmp_path: Path) -> N
     assert config.verify_command.normalized_command not in rendered
     assert "verify_command=" not in rendered
     assert SECRET_SENTINEL not in rendered
+
+
+def test_config_rejects_noncredible_user_verify_without_echoing_it(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        load_run_config(
+            task="inspect",
+            workspace=tmp_path,
+            model="gpt-test",
+            verify_command="git status --short",
+            environ={"OPENAI_API_KEY": "secret-sentinel"},
+        )
+
+    assert str(caught.value) == (
+        "--verify rejected (verification_not_credible): "
+        "command is not a credible verification command"
+    )
+    assert "git status" not in str(caught.value)
+    assert "secret-sentinel" not in str(caught.value)
