@@ -173,6 +173,8 @@ Agent 使用同步、显式的 `while` 循环。每轮按以下顺序执行：
 
 `status` 只能是 `ok`、`error` 或 `rejected`。工具调用和结果必须通过 `call_id` 一一对应。任何可空字段都显式使用 `null`，不靠字段缺失表达含义。
 
+`ModelRequest.instructions` 是独立于消息历史的可空运行指令字段。`RunInstructionBuilder` 在每次应用运行开始时只构建一次不可变 `RunInstructionSnapshot`，顺序固定为内置基础指令、工作区根目录 `AGENTS.md`、可选的已选择 Skill 指令。根 `AGENTS.md` 和 Skill 指令分别限制为 65,536 个 UTF-8 字节；根文件使用 `PathGuard` 拒绝 reparse/symlink 逃逸，只接受 UTF-8（可带 BOM），并统一换行。快照正文不进入 repr、日志、工具或 FinalReport，只把 SHA-256 和字符数作为可安全比较的元数据。
+
 `ModelResponse` 包含：
 
 - 可空文本。
@@ -187,9 +189,12 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 
 两个生产适配器都实现既有 `ModelClient.complete(ModelRequest) -> ModelResponse` 边界，使用官方 SDK 作为 HTTP 客户端，但不让 SDK 类型越过各自适配层。Agent、消息、工具、上下文、验证和报告层不感知 API 模式。
 
+`StreamingModelClient` 是加法式、可选的 provider-neutral 协议；它不会改变 `ModelClient.complete` 的公共签名。主模型调用在配置了内存回调时通过 `invoke_model_stream` 发送 `TEXT_DELTA`、`RESPONSE_COMPLETED` 或 `RESPONSE_DISCARDED`。没有回调时保持原有同步路径；上下文摘要始终使用同步调用并且不接收运行指令或流事件。结构化“不支持流式”只允许在首个 provider delta 前回退到同步请求，且流式尝试与回退共享同一次 logical call 和 run-scoped provider attempt 预算。
+
 `OpenAIResponsesClient` 的既有行为保持不变：
 
 - 请求设置 `store=False`。
+- 流式路径额外设置 `stream=True`，只接受明确列入 allowlist 的 Responses 生命周期事件；普通文本 delta 对外发送，函数参数、reasoning 和 encrypted content 只在适配器内校验且不外发。
 - 不使用 `conversation` 或 `previous_response_id` 代替本地历史。
 - 将本地消息和 strict function schemas 转成 Responses API 输入。
 - 保存当前响应中续接所需的 `response.output` 项。
@@ -209,6 +214,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - `usage` 若存在，必须完整提供非负的 prompt、completion 和 total token；非空响应 ID 只以哈希形式进入观察日志。
 - SDK 在返回对象前抛出的 `APIResponseValidationError` 或 `json.JSONDecodeError` 与解析器拒绝一样归为非致命 `invalid_model_response`，不重试，并丢弃异常文本、响应体和 JSON doc。
 - 不使用服务端 conversation、`previous_response_id` 或其他持久状态；`ModelResponse.continuation` 始终为空。
+- 流式路径使用 `stream=True`，按 tool index 聚合可交错的函数调用参数片段，保持 call ID、名称、类型和响应 ID 稳定，再复用同步解析器生成内部响应。
 
 配置组合在任何 SDK 构造或网络请求前验证：Responses 使用官方默认 endpoint 且拒绝 `--base-url`；Chat Completions 要求合法 HTTPS `--base-url`。两种模式使用互不回退的环境变量凭据。可配置 base URL 不代表任意服务兼容，目标 endpoint 还必须正确实现标准 Chat Completions 函数工具调用、call ID 和 tool result 语义。
 
@@ -219,6 +225,8 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - 不完整或不可解析响应：记录错误并进入连续失败计数，必要时把简洁错误反馈给下一轮。
 
 两个生产适配器都关闭 SDK 内建重试，由本地适配器执行 0.25 秒和 0.50 秒的最多两次重试。每次真实 provider 尝试都领取共享 `ModelCallBudget`；预算不足时不发请求。外部异常统一转换为稳定、脱敏的本地错误，不输出密钥、Authorization header、原始响应体或 SDK exception repr。
+
+流式请求只在首个文本或函数参数 delta 到达前允许上述瞬时错误重试。任何 delta 到达后发生中断都丢弃本轮部分文本、禁止重试和同步回退，并产生稳定的 `StreamInterruptedError`。适配器总会尽力关闭流；清理失败不能覆盖已经存在的主异常或 `BaseException`。
 
 `FakeModelClient` 接收预设的响应序列，记录收到的请求，并在序列耗尽时明确报错，以支持完全离线、确定性的主循环测试。
 
@@ -455,6 +463,8 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 10. **显式 API mode 和严格 endpoint 组合**：默认保持 Responses；Chat Completions 必须显式配置 HTTPS base URL，Responses 则拒绝自定义 URL，避免猜测和误发凭据。
 11. **模式专用凭据**：`OPENAI_API_KEY` 与 `CHAT_COMPLETIONS_API_KEY` 不互相回退，降低把密钥发送到错误 endpoint 的风险。
 12. **Chat Completions 完全依赖本地历史**：continuation 始终为空，工具调用和结果作为完整消息留在上下文中；压缩仍由现有 `ContextManager` 管理。
+13. **运行指令与消息历史分离**：每次运行固定一份受限、可哈希但正文 repr-private 的快照，避免摘要污染指令或运行中读取到变化的工作区策略。
+14. **流式能力是可选内存边界**：核心只认识少量生命周期事件，供应商片段、reasoning 和 SDK 类型留在适配器内；当前 CLI 不展示增量，后续界面无需改动 Agent 消息模型。
 
 ## 18. 首版不实现的功能
 
@@ -467,7 +477,9 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 - macOS、Linux 正式支持。
 - 自定义 Responses endpoint、Azure 专用协议或供应商专用非标准 API。
 - 自动 endpoint 探测、按 URL 猜测 API 模式或凭据回退。
-- Chat Completions streaming、异步、多个 choices、旧式 `function_call` 或非函数工具。
+- SSE/WebSocket/GUI 流式传输、异步客户端、多个 choices、旧式 `function_call` 或非函数工具。
+- 跨运行的 Skill 管理与可执行 Skill；当前仅支持构造器接收已选择的纯文本 Skill 指令。
+- MCP 客户端或服务端集成。
 - 任意 Shell、网络访问、包安装或服务端托管工具。
 - 文件删除、移动、权限修改和二进制文件编辑。
 - Git 写操作、自动提交、自动推送或远程仓库操作。

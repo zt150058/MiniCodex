@@ -196,6 +196,25 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         assert required in text
 
 
+def test_model_instructions_and_streaming_are_documented_accurately() -> None:
+    design = _read_utf8(ROOT / "DESIGN.md")
+    api_guide = _read_utf8(ROOT / "docs" / "OPENAI_API.md")
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+    unsupported_or_deferred_section = _section(
+        api_guide,
+        "## 当前未实现的扩展",
+    )
+
+    assert "ModelRequest.instructions" in design
+    assert "RunInstructionBuilder" in design
+    assert "StreamingModelClient" in design
+    assert "stream=True" in api_guide
+    assert "首个 delta 前" in api_guide
+    assert "delta 后不重试" in api_guide
+    assert "CLI 仍使用同步最终报告" in usage
+    assert "SSE" in unsupported_or_deferred_section
+
+
 def test_api_guide_matches_both_adapters_and_declares_unsupported_features() -> None:
     text = _read_utf8(ROOT / "docs" / "OPENAI_API.md")
     headings = (
@@ -226,7 +245,7 @@ def test_api_guide_matches_both_adapters_and_declares_unsupported_features() -> 
         ROOT / "src" / "coding_agent" / "chat_completions_client.py"
     )
     assert ".responses.create(" in responses_source
-    assert "store=False" in responses_source
+    assert '"store": False' in responses_source
     assert "max_retries=0" in responses_source
     assert '"strict": True' in responses_source
     assert "chat.completions" not in responses_source
@@ -274,9 +293,12 @@ def test_api_guide_matches_both_adapters_and_declares_unsupported_features() -> 
         "Azure-specific API",
         "proxy 配置",
         "server conversation",
-        "streaming",
+        "session persistence",
+        "SSE / GUI",
         "async API",
         "automatic endpoint detection",
+        "executable Skills",
+        "MCP",
         "legacy function_call",
         "non-function Chat tools",
     )

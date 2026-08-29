@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from collections.abc import Callable
+from pathlib import Path
+import stat
+from types import SimpleNamespace
+
+import pytest
+
+from coding_agent.instructions import (
+    MAX_AGENTS_FILE_BYTES,
+    MAX_SKILL_INSTRUCTIONS_BYTES,
+    InstructionBuildError,
+    InstructionErrorCode,
+    RunInstructionBuilder,
+    RunInstructionSnapshot,
+)
+
+
+def _assert_code(
+    code: InstructionErrorCode,
+    operation: Callable[[], object],
+) -> InstructionBuildError:
+    with pytest.raises(InstructionBuildError) as caught:
+        operation()
+    assert caught.value.code is code
+    assert "AGENTS body sentinel" not in str(caught.value)
+    assert "AGENTS body sentinel" not in repr(caught.value)
+    return caught.value
+
+
+def _create_symlink_or_fail(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=False)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror == 1314:
+            pytest.fail(
+                "real Windows symlink behavior remains unverified because "
+                "the test account lacks symlink privilege (winerror=1314)"
+            )
+        pytest.fail(
+            "real Windows symlink creation failed unexpectedly; "
+            f"winerror={winerror}"
+        )
+
+
+def test_builder_layers_sources_once_in_deterministic_order(tmp_path: Path) -> None:
+    (tmp_path / "AGENTS.md").write_bytes(
+        b"\xef\xbb\xbfworkspace\r\ninstruction\r\n"
+    )
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "AGENTS.md").write_text("must not load", encoding="utf-8")
+
+    snapshot = RunInstructionBuilder().build(
+        tmp_path,
+        skill_instructions="skill\r\ninstruction",
+    )
+    repeated = RunInstructionBuilder().build(
+        tmp_path,
+        skill_instructions="skill\r\ninstruction",
+    )
+
+    assert snapshot == repeated
+    assert snapshot.text.count("## MiniCodex base instructions") == 1
+    assert snapshot.text.endswith(
+        "## Workspace instructions (AGENTS.md)\n"
+        "workspace\ninstruction\n\n"
+        "## Selected skill instructions\nskill\ninstruction"
+    )
+    assert "must not load" not in snapshot.text
+    assert snapshot.char_count == len(snapshot.text)
+    assert snapshot.sha256 == hashlib.sha256(
+        snapshot.text.encode("utf-8")
+    ).hexdigest()
+    assert "workspace" not in repr(snapshot)
+    assert "skill" not in repr(snapshot)
+
+
+def test_missing_and_blank_agents_files_are_normal(tmp_path: Path) -> None:
+    missing = RunInstructionBuilder().build(tmp_path)
+    (tmp_path / "AGENTS.md").write_text(" \r\n", encoding="utf-8")
+    blank = RunInstructionBuilder().build(tmp_path)
+
+    assert missing.text == blank.text
+    assert "Workspace instructions" not in missing.text
+
+
+def test_agents_file_exact_limit_is_allowed_and_next_byte_is_rejected(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_bytes(b"x" * MAX_AGENTS_FILE_BYTES)
+    assert "x" * 64 in RunInstructionBuilder().build(tmp_path).text
+
+    target.write_bytes(b"x" * (MAX_AGENTS_FILE_BYTES + 1))
+    _assert_code(
+        InstructionErrorCode.AGENTS_FILE_TOO_LARGE,
+        lambda: RunInstructionBuilder().build(tmp_path),
+    )
+
+
+def test_invalid_utf8_and_non_file_are_stable_errors(tmp_path: Path) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_bytes(b"\xffAGENTS body sentinel")
+    _assert_code(
+        InstructionErrorCode.AGENTS_FILE_NOT_UTF8,
+        lambda: RunInstructionBuilder().build(tmp_path),
+    )
+
+    target.unlink()
+    target.mkdir()
+    _assert_code(
+        InstructionErrorCode.AGENTS_FILE_UNSAFE,
+        lambda: RunInstructionBuilder().build(tmp_path),
+    )
+
+
+@pytest.mark.parametrize("value", ["", "  ", 9, False])
+def test_skill_instructions_must_be_nonempty_text(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    _assert_code(
+        InstructionErrorCode.SKILL_INSTRUCTIONS_INVALID,
+        lambda: RunInstructionBuilder().build(
+            tmp_path,
+            skill_instructions=value,  # type: ignore[arg-type]
+        ),
+    )
+
+
+def test_skill_instructions_reject_text_not_encodable_as_utf8(
+    tmp_path: Path,
+) -> None:
+    _assert_code(
+        InstructionErrorCode.SKILL_INSTRUCTIONS_INVALID,
+        lambda: RunInstructionBuilder().build(
+            tmp_path,
+            skill_instructions="invalid-\ud800-text",
+        ),
+    )
+
+
+def test_skill_utf8_byte_limit(tmp_path: Path) -> None:
+    allowed = "界" * (MAX_SKILL_INSTRUCTIONS_BYTES // 3) + "x"
+    assert len(allowed.encode("utf-8")) == MAX_SKILL_INSTRUCTIONS_BYTES
+    RunInstructionBuilder().build(tmp_path, skill_instructions=allowed)
+
+    _assert_code(
+        InstructionErrorCode.SKILL_INSTRUCTIONS_TOO_LARGE,
+        lambda: RunInstructionBuilder().build(
+            tmp_path,
+            skill_instructions=allowed + "x",
+        ),
+    )
+
+
+def test_real_root_agents_symlink_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("AGENTS body sentinel", encoding="utf-8")
+    _create_symlink_or_fail(workspace / "AGENTS.md", outside)
+
+    _assert_code(
+        InstructionErrorCode.AGENTS_FILE_UNSAFE,
+        lambda: RunInstructionBuilder().build(workspace),
+    )
+
+
+def test_reparse_attribute_on_root_agents_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text("AGENTS body sentinel", encoding="utf-8")
+    real_lstat = os.lstat
+
+    def marked_lstat(path: object, *args: object, **kwargs: object) -> object:
+        if Path(path).name == "AGENTS.md":
+            result = real_lstat(path, *args, **kwargs)
+            values = {
+                name: getattr(result, name)
+                for name in dir(result)
+                if name.startswith("st_")
+            }
+            values["st_file_attributes"] = stat.FILE_ATTRIBUTE_REPARSE_POINT
+            return SimpleNamespace(**values)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr("coding_agent.safety.os.lstat", marked_lstat)
+
+    _assert_code(
+        InstructionErrorCode.AGENTS_FILE_UNSAFE,
+        lambda: RunInstructionBuilder().build(tmp_path),
+    )
+
+
+def test_agents_read_oserror_is_stable_and_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text("AGENTS body sentinel", encoding="utf-8")
+    real_open = Path.open
+
+    def failing_open(path: Path, *args: object, **kwargs: object) -> object:
+        if path.name == "AGENTS.md":
+            raise OSError(f"private path: {path}")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    error = _assert_code(
+        InstructionErrorCode.AGENTS_FILE_UNREADABLE,
+        lambda: RunInstructionBuilder().build(tmp_path),
+    )
+
+    assert str(target) not in str(error)
+
+
+def test_snapshot_rejects_inconsistent_public_metadata() -> None:
+    digest = hashlib.sha256(b"text").hexdigest()
+
+    with pytest.raises(ValueError, match="char_count"):
+        RunInstructionSnapshot("text", digest, 3)
+    with pytest.raises(ValueError, match="sha256"):
+        RunInstructionSnapshot("text", "0" * 64, 4)

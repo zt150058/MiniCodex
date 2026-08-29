@@ -513,6 +513,35 @@ def test_complete_sends_exact_no_tool_request_fields() -> None:
     ]
 
 
+def test_chat_maps_instructions_to_one_provider_only_system_message() -> None:
+    sdk = FakeSDKClient(
+        chat_response(content="ok"),
+        chat_response(content="ok"),
+    )
+    client = ChatCompletionsModelClient(
+        model="chat-model",
+        api_key=FAKE_KEY,
+        base_url=FAKE_BASE_URL,
+        sdk_client=sdk,
+    )
+
+    client.complete(ModelRequest(messages=(UserMessage("one"),)))
+    client.complete(
+        ModelRequest(
+            messages=(UserMessage("two"),),
+            instructions="system sentinel",
+        )
+    )
+
+    assert sdk.chat.completions.calls[0]["messages"] == [
+        {"role": "user", "content": "one"}
+    ]
+    assert sdk.chat.completions.calls[1]["messages"][:2] == [
+        {"role": "system", "content": "system sentinel"},
+        {"role": "user", "content": "two"},
+    ]
+
+
 def test_complete_adds_nested_tools_only_when_present() -> None:
     sdk = FakeSDKClient(chat_response(content="done"))
     client = ChatCompletionsModelClient(

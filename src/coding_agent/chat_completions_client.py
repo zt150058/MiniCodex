@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 import json
 import time
 from urllib.parse import urlsplit
@@ -37,7 +38,17 @@ from coding_agent.model import (
     ModelCallBudget,
     ModelError,
     TransientModelError,
+    _model_error_code,
     invoke_model,
+)
+from coding_agent.streaming import (
+    ModelStreamEvent,
+    ModelStreamEventKind,
+    ModelStreamHandler,
+    StreamInterruptedError,
+    StreamingUnsupportedError,
+    _StreamCallbackError,
+    invoke_model_stream,
 )
 
 
@@ -362,6 +373,8 @@ def _map_messages(request: ModelRequest) -> list[dict[str, object]]:
         raise FatalModelError(_CONTINUATION_ERROR)
     _validate_message_order(request)
     mapped: list[dict[str, object]] = []
+    if request.instructions is not None:
+        mapped.append({"role": "system", "content": request.instructions})
     for message in request.messages:
         if isinstance(message, UserMessage):
             mapped.append({"role": "user", "content": message.content})
@@ -392,6 +405,222 @@ def _map_messages(request: ModelRequest) -> list[dict[str, object]]:
                 }
             )
     return mapped
+
+
+def _request_kwargs(
+    model: str,
+    request: ModelRequest,
+    *,
+    stream: bool,
+) -> dict[str, object]:
+    request_kwargs: dict[str, object] = {
+        "model": model,
+        "messages": _map_messages(request),
+        "max_tokens": request.max_output_tokens,
+    }
+    mapped_tools = _map_tools(request.tool_schemas)
+    if mapped_tools:
+        request_kwargs["tools"] = mapped_tools
+    if stream:
+        request_kwargs["stream"] = True
+    return request_kwargs
+
+
+@dataclass(slots=True)
+class _ChatToolAccumulator:
+    call_id: str | None = None
+    call_type: str | None = None
+    name: str | None = None
+    argument_fragments: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.argument_fragments is None:
+            self.argument_fragments = []
+
+
+@dataclass(slots=True)
+class _ChatStreamProgress:
+    provider_delta: bool = False
+
+
+def _stable_fragment(
+    current: str | None,
+    incoming: object,
+    *,
+    field_name: str,
+) -> str | None:
+    if incoming is None:
+        return current
+    if not isinstance(incoming, str) or not incoming.strip():
+        raise _invalid_response(f"tool {field_name} is invalid")
+    normalized = incoming.strip()
+    if current is not None and current != normalized:
+        raise _invalid_response(f"tool {field_name} changed during stream")
+    return normalized
+
+
+def _consume_chat_stream(
+    stream: object,
+    emit: ModelStreamHandler,
+    progress: _ChatStreamProgress,
+) -> ModelResponse:
+    text_parts: list[str] = []
+    finish_reason: object = None
+    response_id: str | None = None
+    usage: object = None
+    tool_accumulators: dict[int, _ChatToolAccumulator] = {}
+    for chunk in stream:  # type: ignore[union-attr]
+        raw_id = _optional_field(chunk, "id")
+        if raw_id is not None:
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                raise _invalid_response("response id is invalid")
+            normalized_id = raw_id.strip()
+            if response_id is not None and response_id != normalized_id:
+                raise _invalid_response("response id changed during stream")
+            response_id = normalized_id
+        raw_usage = _optional_field(chunk, "usage")
+        if raw_usage is not None:
+            if usage is not None:
+                raise _invalid_response("duplicate usage")
+            usage = raw_usage
+        choices = _field(
+            chunk,
+            "choices",
+            "stream chunk choices are invalid",
+        )
+        if not isinstance(choices, (list, tuple)) or len(choices) > 1:
+            raise _invalid_response("stream chunk choices are invalid")
+        if not choices:
+            if raw_usage is None:
+                raise _invalid_response("empty stream chunk is invalid")
+            continue
+        choice = choices[0]
+        next_finish = _optional_field(choice, "finish_reason")
+        if finish_reason is not None:
+            if next_finish is not None:
+                raise _invalid_response("duplicate finish reason")
+            raise _invalid_response("chunk follows finish reason")
+        if _field(choice, "index", "stream choice index is invalid") != 0:
+            raise _invalid_response("stream choice index is invalid")
+        delta = _field(choice, "delta", "stream delta is invalid")
+        role = _optional_field(delta, "role")
+        if role not in {None, "assistant"}:
+            raise _invalid_response("stream delta role is invalid")
+        if _optional_field(delta, "function_call") is not None:
+            raise _invalid_response("legacy function_call is not supported")
+        if _optional_field(delta, "refusal") is not None:
+            raise _invalid_response("stream refusal is not supported")
+        raw_tool_calls = _optional_field(delta, "tool_calls")
+        if raw_tool_calls is not None:
+            if not isinstance(raw_tool_calls, (list, tuple)):
+                raise _invalid_response("stream tool calls are invalid")
+            for raw_call in raw_tool_calls:
+                raw_index = _field(
+                    raw_call,
+                    "index",
+                    "tool index is invalid",
+                )
+                if (
+                    isinstance(raw_index, bool)
+                    or not isinstance(raw_index, int)
+                    or raw_index < 0
+                ):
+                    raise _invalid_response("tool index is invalid")
+                accumulator = tool_accumulators.setdefault(
+                    raw_index,
+                    _ChatToolAccumulator(),
+                )
+                accumulator.call_id = _stable_fragment(
+                    accumulator.call_id,
+                    _optional_field(raw_call, "id"),
+                    field_name="identifier",
+                )
+                accumulator.call_type = _stable_fragment(
+                    accumulator.call_type,
+                    _optional_field(raw_call, "type"),
+                    field_name="type",
+                )
+                if (
+                    accumulator.call_type is not None
+                    and accumulator.call_type != "function"
+                ):
+                    raise _invalid_response("unsupported tool call type")
+                function = _field(
+                    raw_call,
+                    "function",
+                    "stream function call is invalid",
+                )
+                accumulator.name = _stable_fragment(
+                    accumulator.name,
+                    _optional_field(function, "name"),
+                    field_name="name",
+                )
+                arguments = _optional_field(function, "arguments")
+                if arguments is not None:
+                    if not isinstance(arguments, str):
+                        raise _invalid_response(
+                            "function argument fragment is invalid"
+                        )
+                    progress.provider_delta = True
+                    assert accumulator.argument_fragments is not None
+                    accumulator.argument_fragments.append(arguments)
+        content = _optional_field(delta, "content")
+        if content is not None:
+            if not isinstance(content, str):
+                raise _invalid_response("stream content is invalid")
+            if content:
+                progress.provider_delta = True
+                text_parts.append(content)
+                emit(ModelStreamEvent(ModelStreamEventKind.TEXT_DELTA, content))
+        if next_finish is not None:
+            if finish_reason is not None:
+                raise _invalid_response("duplicate finish reason")
+            finish_reason = next_finish
+
+    if finish_reason is None:
+        raise _invalid_response("finish reason is not supported")
+    if sorted(tool_accumulators) != list(range(len(tool_accumulators))):
+        raise _invalid_response("tool index sequence is invalid")
+    raw_calls: list[dict[str, object]] = []
+    seen_call_ids: set[str] = set()
+    for index in range(len(tool_accumulators)):
+        accumulator = tool_accumulators[index]
+        if (
+            accumulator.call_id is None
+            or accumulator.call_type != "function"
+            or accumulator.name is None
+        ):
+            raise _invalid_response("stream function call is incomplete")
+        if accumulator.call_id in seen_call_ids:
+            raise _invalid_response("duplicate function call id")
+        seen_call_ids.add(accumulator.call_id)
+        assert accumulator.argument_fragments is not None
+        raw_calls.append(
+            {
+                "id": accumulator.call_id,
+                "type": "function",
+                "function": {
+                    "name": accumulator.name,
+                    "arguments": "".join(accumulator.argument_fragments),
+                },
+            }
+        )
+    aggregate = {
+        "id": response_id,
+        "choices": [
+            {
+                "finish_reason": finish_reason,
+                "message": {
+                    "role": "assistant",
+                    "content": "".join(text_parts) or None,
+                    "tool_calls": raw_calls or None,
+                    "function_call": None,
+                },
+            }
+        ],
+        "usage": usage,
+    }
+    return _parse_response(aggregate)
 
 
 def _classify_provider_error(
@@ -481,15 +710,7 @@ class ChatCompletionsModelClient:
         request: ModelRequest,
         budget: ModelCallBudget,
     ) -> ModelResponse:
-        mapped_messages = _map_messages(request)
-        mapped_tools = _map_tools(request.tool_schemas)
-        request_kwargs: dict[str, object] = {
-            "model": self._model,
-            "messages": mapped_messages,
-            "max_tokens": request.max_output_tokens,
-        }
-        if mapped_tools:
-            request_kwargs["tools"] = mapped_tools
+        request_kwargs = _request_kwargs(self._model, request, stream=False)
         purpose = budget.active_purpose
 
         for attempt in range(3):
@@ -563,3 +784,172 @@ class ChatCompletionsModelClient:
             return _parse_response(response)
 
         raise AssertionError("unreachable Chat Completions retry loop")
+
+    def stream(
+        self,
+        request: ModelRequest,
+        emit: ModelStreamHandler,
+    ) -> ModelResponse:
+        budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=3)
+        return invoke_model_stream(self, request, budget, emit)
+
+    def stream_with_budget(
+        self,
+        request: ModelRequest,
+        budget: ModelCallBudget,
+        emit: ModelStreamHandler,
+    ) -> ModelResponse:
+        request_kwargs = _request_kwargs(self._model, request, stream=True)
+        purpose = budget.active_purpose
+        for attempt in range(3):
+            provider_attempt_index = budget.begin_provider_attempt(purpose)
+            progress = _ChatStreamProgress()
+            try:
+                stream = self._client.chat.completions.create(**request_kwargs)
+                close = getattr(stream, "close", None)
+                try:
+                    response = _consume_chat_stream(stream, emit, progress)
+                except BaseException as primary:
+                    if callable(close):
+                        try:
+                            close()
+                        except BaseException:
+                            pass
+                    if progress.provider_delta and isinstance(
+                        primary,
+                        StreamingUnsupportedError,
+                    ):
+                        raise StreamInterruptedError(
+                            "model stream interrupted"
+                        ) from None
+                    if progress.provider_delta and isinstance(primary, OpenAIError):
+                        _, _, transient = _classify_provider_error(primary)
+                        if transient:
+                            raise StreamInterruptedError(
+                                "model stream interrupted"
+                            ) from None
+                    raise
+                else:
+                    if callable(close):
+                        try:
+                            close()
+                        except (KeyboardInterrupt, SystemExit):
+                            raise
+                        except Exception:
+                            raise StreamInterruptedError(
+                                "model stream cleanup failed"
+                            ) from None
+            except _StreamCallbackError as callback_error:
+                if isinstance(callback_error.error, Exception):
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=_model_error_code(callback_error.error),
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                raise
+            except StreamingUnsupportedError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="streaming_unsupported",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except StreamInterruptedError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="stream_interrupted",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except (APIResponseValidationError, json.JSONDecodeError):
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="invalid_model_response",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise InvalidChatCompletionsResponseError(
+                    "invalid Chat Completions payload: "
+                    "provider response could not be decoded"
+                ) from None
+            except InvalidChatCompletionsResponseError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="invalid_model_response",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except OpenAIError as exc:
+                error_code, public_message, transient = _classify_provider_error(
+                    exc
+                )
+                if not transient:
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=error_code,
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                    raise FatalModelError(public_message) from None
+                if attempt == 2:
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=error_code,
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                    raise TransientModelError(
+                        "Chat Completions stream failed after 3 attempts: "
+                        "transient provider error"
+                    ) from None
+                if budget.remaining_provider_attempts == 0:
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=error_code,
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                    budget.begin_provider_attempt(purpose)
+                    raise AssertionError("unreachable provider budget branch")
+                delay = (0.25, 0.50)[attempt]
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code=error_code,
+                    retry_scheduled=True,
+                    retry_delay_ms=int(delay * 1000),
+                )
+                self._sleeper(delay)
+                continue
+            except Exception as exc:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code=_model_error_code(exc),
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+
+            budget.finish_provider_attempt(
+                purpose,
+                provider_attempt_index,
+                error_code=None,
+                retry_scheduled=False,
+                retry_delay_ms=None,
+            )
+            return response
+
+        raise AssertionError("unreachable Chat Completions stream retry loop")

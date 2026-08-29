@@ -65,6 +65,8 @@ coding-agent "修复失败测试" --workspace . --api-mode chat-completions --ba
 
 AgentRunner、messages、ContextManager、工具、验证和报告层不知道具体 API mode。新增 Chat 能力没有修改公共 ModelClient 边界，也没有把 SDK 类型泄漏到核心层。
 
+`ModelRequest.instructions` 与本地历史分离：主调用携带应用启动时生成的一份不可变运行指令快照，摘要调用不携带该字段。可选 `StreamingModelClient` 同样只返回内部 `ModelResponse` 和少量内存事件，不把 SDK chunk 类型传播到核心层。
+
 ## Responses API 请求映射
 
 Responses 适配器调用 `client.responses.create` 并保持既有行为：
@@ -74,6 +76,7 @@ Responses 适配器调用 `client.responses.create` 并保持既有行为：
 - 请求 `include=["reasoning.encrypted_content"]`，但不记录加密推理；
 - 将输出 `function_call` 转成有序内部 ToolCall；
 - 工具完成后发送同一 `call_id` 的 `function_call_output`。
+- 选择流式入口时额外发送 `stream=True`；继续保持 `store=False`，也不发送 `conversation` 或 `previous_response_id`。
 
 strict schema 只提高模型输出可靠性；ToolRegistry 仍在本地重新校验参数和安全策略。
 
@@ -96,6 +99,8 @@ Chat 适配器不依赖服务端状态。每次 provider 调用都接收 Context
 
 请求使用 `max_tokens` 传递输出上限；有工具时才发送 `tools`。函数 arguments 使用稳定 canonical JSON。适配器只接受一个 choice，并校验 role、content、finish reason、usage 和 response ID。
 
+选择流式入口时请求包含 `stream=True`。适配器按 tool index 聚合交错的函数参数片段，要求 call ID、函数名、类型和 response ID 在整个流中保持一致；聚合完成后仍复用同步解析器。Chat 不产生 continuation。
+
 ## assistant tool_calls 与 tool result 配对
 
 每个带工具调用的 assistant 消息必须紧邻其全部 tool 结果。结果数量、顺序、`tool_call_id` 和工具名必须与声明一致；单独、缺失、倒序或被其他消息隔开的 tool 结果在 SDK 调用前被拒绝。压缩后的历史也执行同一校验。
@@ -108,6 +113,10 @@ Chat 适配器不依赖服务端状态。每次 provider 调用都接收 Context
 
 logical call 和 provider attempt 共享 run-scoped `ModelCallBudget`。每次真实请求前领取 provider 额度，预算不足时不会调用 SDK。authentication、permission、not-found、bad request、unprocessable、请求映射错误和响应解析错误不重试。畸形 SDK payload 与解析拒绝统一为稳定的 `invalid_model_response`，不复制异常正文或响应体。
 
+流式请求只有在**首个 delta 前**发生 429、5xx、timeout 或 connection error 才按相同的 0.25、0.50 秒规则重试。文本或函数参数 delta 一旦到达，**delta 后不重试**，也不回退到同步请求；已经展示的部分文本会收到 discarded 生命周期事件。只有适配器明确抛出的结构化“不支持流式”且尚无 provider delta 时，核心才在同一次 logical call、下一次 provider attempt 上自动退回同步 `complete`。普通 400/认证错误和解析错误绝不会触发能力回退。
+
+Responses 只允许已知的文本、函数调用、response/output/content 和 reasoning 生命周期事件。reasoning、encrypted content 与函数参数片段不会作为流事件暴露；Chat 同样只暴露文本。两个适配器都尽力关闭流，清理失败使用稳定脱敏错误，且不能覆盖 `KeyboardInterrupt`、`SystemExit` 或既有主异常。
+
 ## 隐私与日志边界
 
 两个 key 都从 `run_command` 启动的工作区 Python、pytest 和验证子进程环境中按大小写无关方式移除。正常 JSONL 和 FinalReport 不接受 API key、认证头、环境全集、请求正文、完整历史、工具原始内容、SDK exception repr、provider body、continuation 或隐藏推理。
@@ -119,7 +128,7 @@ logical call 和 provider attempt 共享 run-scoped `ModelCallBudget`。每次�
 两套适配器测试都注入 fake SDK response/exception，不读取真实 key、不构造网络客户端：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_openai_client.py tests\test_chat_completions_client.py tests\test_model.py -q -p no:cacheprovider
+.\.venv\Scripts\python.exe -m pytest tests\test_openai_client.py tests\test_openai_streaming_client.py tests\test_chat_completions_client.py tests\test_chat_completions_streaming_client.py tests\test_model.py tests\test_streaming.py -q -p no:cacheprovider
 ```
 
 连续 Chat 工具调用与压缩合同位于 `tests/integration/test_chat_completions_agent.py`，使用真实 AgentRunner、ContextManager 和 Chat 适配器，仅替换最外层 SDK：
@@ -163,9 +172,12 @@ OpenAI-compatible 是协议目标而不是兼容保证。下列扩展仍不在�
 | Azure-specific API | 当前未实现 |
 | proxy 配置 | 当前未实现 |
 | server conversation | 当前未实现 |
-| streaming | 当前未实现 |
+| session persistence | 当前未实现 |
+| SSE / GUI | 当前未实现 |
 | async API | 当前未实现 |
 | automatic endpoint detection | 当前未实现 |
+| executable Skills | 当前未实现 |
+| MCP | 当前未实现 |
 | legacy function_call | 当前未实现 |
 | non-function Chat tools | 当前未实现 |
 

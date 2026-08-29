@@ -364,6 +364,7 @@ class ModelRequest(_JsonMixin):
     continuation_items: tuple[object, ...] = field(
         default=(), repr=False, compare=False
     )
+    instructions: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.messages, tuple) or not self.messages:
@@ -387,6 +388,11 @@ class ModelRequest(_JsonMixin):
             raise ValueError("max_output_tokens must be a positive integer")
         if not isinstance(self.continuation_items, tuple):
             raise ValueError("continuation_items must be a tuple")
+        if self.instructions is not None and (
+            not isinstance(self.instructions, str)
+            or not self.instructions.strip()
+        ):
+            raise ValueError("instructions must be a non-empty string or null")
         _validate_message_sequence(self.messages)
 
     def to_dict(self) -> JSONObject:
@@ -397,11 +403,17 @@ class ModelRequest(_JsonMixin):
                 for schema in self.tool_schemas
             ],
             "max_output_tokens": self.max_output_tokens,
+            "instructions": self.instructions,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> Self:
-        required = {"messages", "tool_schemas", "max_output_tokens"}
+        required = {
+            "messages",
+            "tool_schemas",
+            "max_output_tokens",
+            "instructions",
+        }
         _exact_keys(payload, required, cls.__name__)
         messages = payload["messages"]
         schemas = payload["tool_schemas"]
@@ -420,6 +432,7 @@ class ModelRequest(_JsonMixin):
                 _json_object(schema, "tool_schemas item") for schema in schemas
             ),
             max_output_tokens=payload["max_output_tokens"],  # type: ignore[arg-type]
+            instructions=payload["instructions"],  # type: ignore[arg-type]
         )
 
 

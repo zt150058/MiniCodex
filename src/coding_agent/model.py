@@ -477,6 +477,38 @@ def _model_error_code(error: Exception) -> str:
     return "model_client_error"
 
 
+def _complete_with_active_budget(
+    client: ModelClient,
+    request: ModelRequest,
+    budget: ModelCallBudget,
+) -> ModelResponse:
+    """Complete a request while its logical model call is already active."""
+    if isinstance(client, BudgetAwareModelClient):
+        return client.complete_with_budget(request, budget)
+
+    purpose = budget.active_purpose
+    provider_attempt_index = budget.begin_provider_attempt(purpose)
+    try:
+        response = client.complete(request)
+    except Exception as exc:
+        budget.finish_provider_attempt(
+            purpose,
+            provider_attempt_index,
+            error_code=_model_error_code(exc),
+            retry_scheduled=False,
+            retry_delay_ms=None,
+        )
+        raise
+    budget.finish_provider_attempt(
+        purpose,
+        provider_attempt_index,
+        error_code=None,
+        retry_scheduled=False,
+        retry_delay_ms=None,
+    )
+    return response
+
+
 def invoke_model(
     client: ModelClient,
     request: ModelRequest,
@@ -485,58 +517,18 @@ def invoke_model(
     purpose: ModelCallPurpose = ModelCallPurpose.MAIN,
 ) -> ModelResponse:
     logical_call_index = budget.begin_logical_call(purpose, request)
-    if isinstance(client, BudgetAwareModelClient):
-        try:
-            response = client.complete_with_budget(request, budget)
-        except Exception as exc:
-            if budget._observer_failed:
-                raise
-            budget.finish_logical_call(
-                purpose,
-                logical_call_index,
-                response=None,
-                error_code=_model_error_code(exc),
-            )
+    try:
+        response = _complete_with_active_budget(client, request, budget)
+    except Exception as exc:
+        if budget._observer_failed:
             raise
-    else:
-        try:
-            provider_attempt_index = budget.begin_provider_attempt(purpose)
-        except Exception as exc:
-            if budget._observer_failed:
-                raise
-            budget.finish_logical_call(
-                purpose,
-                logical_call_index,
-                response=None,
-                error_code=_model_error_code(exc),
-            )
-            raise
-        try:
-            response = client.complete(request)
-        except Exception as exc:
-            budget.finish_provider_attempt(
-                purpose,
-                provider_attempt_index,
-                error_code=_model_error_code(exc),
-                retry_scheduled=False,
-                retry_delay_ms=None,
-            )
-            if budget._observer_failed:
-                raise
-            budget.finish_logical_call(
-                purpose,
-                logical_call_index,
-                response=None,
-                error_code=_model_error_code(exc),
-            )
-            raise
-        budget.finish_provider_attempt(
+        budget.finish_logical_call(
             purpose,
-            provider_attempt_index,
-            error_code=None,
-            retry_scheduled=False,
-            retry_delay_ms=None,
+            logical_call_index,
+            response=None,
+            error_code=_model_error_code(exc),
         )
+        raise
     budget.finish_logical_call(
         purpose,
         logical_call_index,

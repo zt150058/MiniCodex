@@ -42,6 +42,7 @@ from coding_agent.safety import (
     SafetyViolation,
 )
 from coding_agent.state import AgentStatus, TerminationReason, VerificationStatus
+from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 from coding_agent.termination import TerminationLimits, TerminationPolicy
 from coding_agent.tools.base import (
     ExecutionContext,
@@ -67,6 +68,7 @@ def _runner(
     context_limits: ContextLimits | None = None,
     verification_gate: VerificationGate | None = None,
     event_sink: object | None = None,
+    instructions: str | None = None,
 ) -> tuple[AgentRunner, FakeModelClient]:
     client = FakeModelClient(responses)
     runner = AgentRunner(
@@ -82,6 +84,7 @@ def _runner(
         clock=clock,
         verification_gate=verification_gate,
         event_sink=event_sink,  # type: ignore[arg-type]
+        instructions=instructions,
     )
     return runner, client
 
@@ -348,6 +351,34 @@ class ExitingModelClient:
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         raise SystemExit(130)
+
+
+class SplitStreamingModelClient:
+    def __init__(
+        self,
+        *,
+        stream_outcomes: tuple[tuple[tuple[str, ...], ModelResponse], ...],
+        complete_outcomes: tuple[ModelResponse, ...],
+    ) -> None:
+        self.stream_outcomes = deque(stream_outcomes)
+        self.complete_outcomes = deque(complete_outcomes)
+        self.stream_requests: list[ModelRequest] = []
+        self.complete_requests: list[ModelRequest] = []
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        self.complete_requests.append(request)
+        return self.complete_outcomes.popleft()
+
+    def stream(
+        self,
+        request: ModelRequest,
+        emit: Callable[[ModelStreamEvent], None],
+    ) -> ModelResponse:
+        self.stream_requests.append(request)
+        deltas, response = self.stream_outcomes.popleft()
+        for delta in deltas:
+            emit(ModelStreamEvent(ModelStreamEventKind.TEXT_DELTA, delta))
+        return response
 
 
 def _record_call(index: int) -> ToolCall:
@@ -938,6 +969,71 @@ def test_summary_and_main_call_share_one_run_budget(tmp_path: Path) -> None:
     assert client.requests[10].messages[1].content.startswith(
         "coding-agent context summary\n"  # type: ignore[union-attr]
     )
+
+
+def test_main_instructions_survive_compression_but_summary_is_isolated(
+    tmp_path: Path,
+) -> None:
+    sentinel = "run instruction sentinel"
+    tool = RecordingTool(*_nine_tool_outcomes())
+    runner, client = _runner(
+        tmp_path,
+        _nine_tool_turns()
+        + (_summary_response(), ModelResponse(text="candidate")),
+        tools=(tool,),
+        context_limits=_compression_limits(),
+        instructions=sentinel,
+    )
+
+    runner.run("repair")
+
+    assert len(client.requests) == 11
+    assert client.requests[9].messages[0].content.startswith(
+        "Summarize the provider-neutral"
+    )
+    assert client.requests[9].instructions is None
+    assert all(
+        request.instructions == sentinel
+        for index, request in enumerate(client.requests)
+        if index != 9
+    )
+
+
+def test_context_summary_remains_synchronous_when_main_calls_stream(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingTool(*_nine_tool_outcomes())
+    main_responses = _nine_tool_turns() + (ModelResponse(text="done"),)
+    client = SplitStreamingModelClient(
+        stream_outcomes=tuple(
+            ((("done",) if response.text else ()), response)
+            for response in main_responses
+        ),
+        complete_outcomes=(_summary_response(),),
+    )
+    events: list[ModelStreamEvent] = []
+    runner = AgentRunner(
+        model_client=client,
+        tool_registry=ToolRegistry((tool,)),
+        execution_context=ExecutionContext(tmp_path),
+        context_manager=ContextManager(
+            model_client=client,
+            limits=_compression_limits(),
+        ),
+        stream_handler=events.append,
+    )
+
+    state = runner.run("compress then finish")
+
+    assert state.status is AgentStatus.COMPLETION_CANDIDATE
+    assert len(client.stream_requests) == 10
+    assert len(client.complete_requests) == 1
+    assert client.complete_requests[0].instructions is None
+    assert [
+        event.delta
+        for event in events
+        if event.kind is ModelStreamEventKind.TEXT_DELTA
+    ] == ["done"]
 
 
 def test_compression_events_wrap_summary_and_clear_continuation(

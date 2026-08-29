@@ -8,6 +8,7 @@ import pytest
 
 from coding_agent.app import ApplicationFactories, production_factories, run_application
 from coding_agent.config import ApiMode, RunConfig, load_run_config
+from coding_agent.instructions import RunInstructionBuilder
 from coding_agent.logging import (
     EventType,
     RunEvent,
@@ -297,6 +298,57 @@ def test_composition_uses_fixed_tools_and_shared_executor(tmp_path: Path) -> Non
         "write_file",
         "run_command",
     ]
+
+
+def test_composition_builds_private_run_instructions_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = "workspace instruction sentinel"
+    (tmp_path / "AGENTS.md").write_text(sentinel, encoding="utf-8")
+    config = _config(tmp_path)
+    model = FakeModelClient((ModelResponse(text="done"),))
+    factories = _successful_factories()
+    original = RunInstructionBuilder.build
+    calls = 0
+
+    def counting_build(
+        builder: RunInstructionBuilder,
+        workspace: Path,
+        *,
+        skill_instructions: str | None = None,
+    ) -> object:
+        nonlocal calls
+        calls += 1
+        return original(
+            builder,
+            workspace,
+            skill_instructions=skill_instructions,
+        )
+
+    monkeypatch.setattr(RunInstructionBuilder, "build", counting_build)
+    stdout = StringIO()
+    stderr = StringIO()
+
+    code = run_application(
+        config,
+        stdout=stdout,
+        stderr=stderr,
+        factories=ApplicationFactories(
+            model_client=lambda received: model,
+            logger=factories.logger,
+            command_executor=factories.command_executor,
+            clock=factories.clock,
+        ),
+    )
+
+    payload = json.loads(stdout.getvalue())
+    raw_log = (tmp_path / payload["log_path"]).read_text(encoding="utf-8")
+    assert code == 0
+    assert calls == 1
+    assert "## MiniCodex base instructions" in model.requests[0].instructions
+    assert sentinel in model.requests[0].instructions
+    assert sentinel not in raw_log
 
 
 def test_logger_create_failure_stops_before_agent(tmp_path: Path) -> None:

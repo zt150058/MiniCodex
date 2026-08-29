@@ -26,6 +26,7 @@ from coding_agent.state import (
     TerminationReason,
     VerificationStatus,
 )
+from coding_agent.streaming import ModelStreamHandler, invoke_model_stream
 from coding_agent.termination import (
     NextOperation,
     TerminationPolicy,
@@ -75,9 +76,17 @@ class AgentRunner:
         clock: Callable[[], float] = time.monotonic,
         verification_gate: VerificationGate | None = None,
         event_sink: EventSink | None = None,
+        instructions: str | None = None,
+        stream_handler: ModelStreamHandler | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable")
+        if instructions is not None and (
+            not isinstance(instructions, str) or not instructions.strip()
+        ):
+            raise ValueError("instructions must be a non-empty string or null")
+        if stream_handler is not None and not callable(stream_handler):
+            raise TypeError("stream_handler must be callable or null")
         self._model_client = model_client
         self._tool_registry = tool_registry
         self._execution_context = execution_context
@@ -88,6 +97,8 @@ class AgentRunner:
         self._clock = clock
         self._verification_gate = verification_gate
         self._event_sink = event_sink
+        self._instructions = instructions
+        self._stream_handler = stream_handler
 
     def _emit(self, event_type: EventType, data: dict[str, object]) -> None:
         if self._event_sink is not None:
@@ -368,10 +379,19 @@ class AgentRunner:
                 messages=state.messages,
                 tool_schemas=self._tool_registry.schemas,
                 continuation_items=state.continuation_items,
+                instructions=self._instructions,
             )
             try:
                 try:
-                    response = invoke_model(self._model_client, request, budget)
+                    if self._stream_handler is None:
+                        response = invoke_model(self._model_client, request, budget)
+                    else:
+                        response = invoke_model_stream(
+                            self._model_client,
+                            request,
+                            budget,
+                            self._stream_handler,
+                        )
                 finally:
                     self._sync_budget(state, budget)
             except ModelBudgetExceeded as exc:

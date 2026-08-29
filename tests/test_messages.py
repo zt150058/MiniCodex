@@ -179,6 +179,32 @@ def test_model_request_accepts_paired_tool_result() -> None:
     assert "continuation_items" not in json.loads(request.to_json())
 
 
+def test_model_request_instructions_are_explicit_roundtrip_and_repr_private() -> None:
+    secret = "workspace instruction sentinel"
+    request = ModelRequest(
+        messages=(UserMessage("task"),),
+        instructions=secret,
+    )
+
+    assert request.instructions == secret
+    assert request.to_dict()["instructions"] == secret
+    assert ModelRequest.from_json(request.to_json()) == request
+    assert secret not in repr(request)
+
+    without = ModelRequest(messages=(UserMessage("task"),))
+    assert without.instructions is None
+    assert without.to_dict()["instructions"] is None
+
+
+@pytest.mark.parametrize("value", ["", "   ", 7, False])
+def test_model_request_rejects_invalid_instructions(value: object) -> None:
+    with pytest.raises(ValueError, match="instructions"):
+        ModelRequest(
+            messages=(UserMessage("task"),),
+            instructions=value,  # type: ignore[arg-type]
+        )
+
+
 def test_model_request_rejects_unmatched_result() -> None:
     with pytest.raises(ValueError, match="unmatched call_id: call_1"):
         ModelRequest(

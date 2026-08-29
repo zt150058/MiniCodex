@@ -238,6 +238,26 @@ def test_request_maps_complete_local_history_without_server_state() -> None:
     assert "previous_response_id" not in sent
 
 
+def test_responses_maps_instructions_conditionally() -> None:
+    sdk = FakeSDKClient(text_response("ok"), text_response("ok"))
+    client = OpenAIResponsesClient(
+        model="gpt-test",
+        api_key=FAKE_KEY,
+        sdk_client=sdk,
+    )
+
+    client.complete(ModelRequest(messages=(UserMessage("one"),)))
+    client.complete(
+        ModelRequest(
+            messages=(UserMessage("two"),),
+            instructions="system sentinel",
+        )
+    )
+
+    assert "instructions" not in sdk.responses.calls[0]
+    assert sdk.responses.calls[1]["instructions"] == "system sentinel"
+
+
 def test_existing_run_config_constructs_adapter_without_config_change(
     tmp_path: Path,
 ) -> None:

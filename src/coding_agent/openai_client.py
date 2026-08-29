@@ -8,6 +8,7 @@ import time
 
 from openai import (
     APIConnectionError,
+    APIResponseValidationError,
     APIStatusError,
     APITimeoutError,
     AuthenticationError,
@@ -38,7 +39,17 @@ from coding_agent.model import (
     ModelCallBudget,
     ModelError,
     TransientModelError,
+    _model_error_code,
     invoke_model,
+)
+from coding_agent.streaming import (
+    ModelStreamEvent,
+    ModelStreamEventKind,
+    ModelStreamHandler,
+    StreamInterruptedError,
+    StreamingUnsupportedError,
+    _StreamCallbackError,
+    invoke_model_stream,
 )
 
 
@@ -348,6 +359,330 @@ def _parse_response(
     )
 
 
+def _request_kwargs(
+    model: str,
+    request: ModelRequest,
+    *,
+    stream: bool,
+) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "model": model,
+        "input": _map_messages(request),
+        "tools": _map_tools(request.tool_schemas),
+        "max_output_tokens": request.max_output_tokens,
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+    }
+    if request.instructions is not None:
+        kwargs["instructions"] = request.instructions
+    if stream:
+        kwargs["stream"] = True
+    return kwargs
+
+
+def _build_model_response(
+    request: ModelRequest,
+    response: object,
+) -> ModelResponse:
+    text, tool_calls, usage, response_id, output_items = _parse_response(response)
+    continuation = _OpenAIContinuationSegment(
+        message_index=len(request.messages),
+        serialized_items=tuple(_snapshot_output_item(item) for item in output_items),
+    )
+    try:
+        return ModelResponse(
+            text=text,
+            tool_calls=tool_calls,
+            usage=usage,
+            provider_response_id=response_id,
+            continuation_items=request.continuation_items + (continuation,),
+        )
+    except (TypeError, ValueError) as exc:
+        raise _invalid_response("invalid model response") from exc
+
+
+@dataclass(slots=True)
+class _FunctionArgumentAccumulator:
+    item_id: str
+    fragments: list[str]
+    done_name: str | None = None
+    done_arguments: str | None = None
+
+
+_RESPONSE_PHASE_EVENTS = {
+    "response.created",
+    "response.in_progress",
+    "response.queued",
+}
+_OUTPUT_ITEM_EVENTS = {
+    "response.output_item.added",
+    "response.output_item.done",
+}
+_ALLOWED_OUTPUT_ITEM_TYPES = {"message", "function_call", "reasoning"}
+_CONTENT_PART_EVENTS = {
+    "response.content_part.added",
+    "response.content_part.done",
+}
+_ALLOWED_CONTENT_PART_TYPES = {"output_text", "reasoning_text"}
+_REASONING_PART_EVENTS = {
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_part.done",
+}
+_REASONING_TEXT_EVENTS = {
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+}
+_REASONING_CONTENT_EVENTS = {
+    "response.reasoning_text.delta",
+    "response.reasoning_text.done",
+}
+
+
+def _stream_index(event: object, name: str) -> int:
+    value = _field(event, name, "stream event index is invalid")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise _invalid_response("stream event index is invalid")
+    return value
+
+
+def _stream_identifier(event: object, name: str) -> str:
+    value = _field(event, name, "stream event identifier is invalid")
+    if not isinstance(value, str) or not value.strip():
+        raise _invalid_response("stream event identifier is invalid")
+    return value
+
+
+def _validate_nonterminal_event(event: object, event_type: str) -> None:
+    if event_type in _RESPONSE_PHASE_EVENTS:
+        if _field(event, "response", "stream response is missing") is None:
+            raise _invalid_response("stream response is missing")
+        return
+    if event_type in _OUTPUT_ITEM_EVENTS:
+        _stream_index(event, "output_index")
+        item = _field(event, "item", "stream output item is missing")
+        if item is None:
+            raise _invalid_response("stream output item is missing")
+        if (
+            _field(item, "type", "stream output item type is invalid")
+            not in _ALLOWED_OUTPUT_ITEM_TYPES
+        ):
+            raise _invalid_response("unsupported stream output item type")
+        return
+    if event_type in _CONTENT_PART_EVENTS:
+        _stream_index(event, "output_index")
+        _stream_index(event, "content_index")
+        _stream_identifier(event, "item_id")
+        part = _field(event, "part", "stream content part is missing")
+        if part is None:
+            raise _invalid_response("stream content part is missing")
+        if (
+            _field(part, "type", "stream content part type is invalid")
+            not in _ALLOWED_CONTENT_PART_TYPES
+        ):
+            raise _invalid_response("unsupported stream content part type")
+        return
+    if event_type == "response.output_text.done":
+        _stream_index(event, "output_index")
+        _stream_index(event, "content_index")
+        _stream_identifier(event, "item_id")
+        if not isinstance(_field(event, "text", "output text is invalid"), str):
+            raise _invalid_response("output text is invalid")
+        return
+    if event_type in _REASONING_PART_EVENTS:
+        _stream_index(event, "output_index")
+        _stream_index(event, "summary_index")
+        _stream_identifier(event, "item_id")
+        if _field(event, "part", "reasoning summary part is missing") is None:
+            raise _invalid_response("reasoning summary part is missing")
+        return
+    if event_type in _REASONING_TEXT_EVENTS:
+        _stream_index(event, "output_index")
+        _stream_index(event, "summary_index")
+        _stream_identifier(event, "item_id")
+        field_name = "delta" if event_type.endswith(".delta") else "text"
+        if not isinstance(
+            _field(event, field_name, "reasoning summary text is invalid"),
+            str,
+        ):
+            raise _invalid_response("reasoning summary text is invalid")
+        return
+    if event_type in _REASONING_CONTENT_EVENTS:
+        _stream_index(event, "output_index")
+        _stream_index(event, "content_index")
+        _stream_identifier(event, "item_id")
+        field_name = "delta" if event_type.endswith(".delta") else "text"
+        if not isinstance(
+            _field(event, field_name, "reasoning text is invalid"),
+            str,
+        ):
+            raise _invalid_response("reasoning text is invalid")
+        return
+    raise _invalid_response("unsupported stream event type")
+
+
+def _validate_function_argument_streams(
+    terminal: object,
+    accumulators: dict[int, _FunctionArgumentAccumulator],
+) -> None:
+    output = _field(terminal, "output", "response output is missing")
+    if not isinstance(output, (list, tuple)):
+        raise _invalid_response("response output is missing")
+    for output_index, accumulator in accumulators.items():
+        if accumulator.done_name is None or accumulator.done_arguments is None:
+            raise _invalid_response("function arguments are incomplete")
+        if accumulator.done_arguments != "".join(accumulator.fragments):
+            raise _invalid_response("function arguments do not match deltas")
+        if output_index >= len(output):
+            raise _invalid_response("function output index is invalid")
+        item = output[output_index]
+        if _field(item, "type", "function output is invalid") != "function_call":
+            raise _invalid_response("function output is invalid")
+        if _stream_identifier(item, "id") != accumulator.item_id:
+            raise _invalid_response("function output identifier does not match")
+        if _stream_identifier(item, "name") != accumulator.done_name:
+            raise _invalid_response("function output name does not match")
+        if (
+            _field(item, "arguments", "function output arguments are invalid")
+            != accumulator.done_arguments
+        ):
+            raise _invalid_response("function output arguments do not match")
+
+
+@dataclass(slots=True)
+class _ResponsesStreamProgress:
+    provider_delta: bool = False
+
+
+def _consume_responses_stream(
+    stream: object,
+    request: ModelRequest,
+    emit: ModelStreamHandler,
+    progress: _ResponsesStreamProgress,
+) -> ModelResponse:
+    terminal: object | None = None
+    text_parts: list[str] = []
+    function_arguments: dict[int, _FunctionArgumentAccumulator] = {}
+    for event in stream:  # type: ignore[union-attr]
+        event_type = _field(event, "type", "missing stream event type")
+        if terminal is not None:
+            raise _invalid_response("event follows completed response")
+        if event_type == "response.output_text.delta":
+            delta = _field(event, "delta", "output text delta is invalid")
+            if not isinstance(delta, str) or not delta:
+                raise _invalid_response("output text delta is invalid")
+            progress.provider_delta = True
+            text_parts.append(delta)
+            emit(ModelStreamEvent(ModelStreamEventKind.TEXT_DELTA, delta))
+        elif event_type == "response.function_call_arguments.delta":
+            output_index = _stream_index(event, "output_index")
+            item_id = _stream_identifier(event, "item_id")
+            delta = _field(
+                event,
+                "delta",
+                "function argument delta is invalid",
+            )
+            if not isinstance(delta, str) or not delta:
+                raise _invalid_response("function argument delta is invalid")
+            progress.provider_delta = True
+            accumulator = function_arguments.get(output_index)
+            if accumulator is None:
+                accumulator = _FunctionArgumentAccumulator(
+                    item_id=item_id,
+                    fragments=[],
+                )
+                function_arguments[output_index] = accumulator
+            elif accumulator.item_id != item_id:
+                raise _invalid_response("function argument identifier changed")
+            if accumulator.done_arguments is not None:
+                raise _invalid_response("function argument delta follows done")
+            accumulator.fragments.append(delta)
+        elif event_type == "response.function_call_arguments.done":
+            output_index = _stream_index(event, "output_index")
+            item_id = _stream_identifier(event, "item_id")
+            name = _stream_identifier(event, "name")
+            arguments = _field(
+                event,
+                "arguments",
+                "function arguments are invalid",
+            )
+            if not isinstance(arguments, str):
+                raise _invalid_response("function arguments are invalid")
+            accumulator = function_arguments.get(output_index)
+            if accumulator is None or accumulator.item_id != item_id:
+                raise _invalid_response(
+                    "function argument done has no matching deltas"
+                )
+            if accumulator.done_arguments is not None:
+                raise _invalid_response("duplicate function argument done")
+            accumulator.done_name = name
+            accumulator.done_arguments = arguments
+        elif event_type == "response.completed":
+            terminal = _field(
+                event,
+                "response",
+                "completed response is missing",
+            )
+        else:
+            if not isinstance(event_type, str):
+                raise _invalid_response("missing stream event type")
+            _validate_nonterminal_event(event, event_type)
+
+    if terminal is None:
+        raise _invalid_response("completed response is missing")
+    _validate_function_argument_streams(terminal, function_arguments)
+    response = _build_model_response(request, terminal)
+    if text_parts and response.text != "".join(text_parts):
+        raise _invalid_response("streamed text does not match response")
+    return response
+
+
+def _classify_responses_error(
+    error: OpenAIError,
+) -> tuple[str, str, bool]:
+    if isinstance(error, AuthenticationError):
+        return (
+            "authentication_rejected",
+            "OpenAI Responses request failed: authentication rejected",
+            False,
+        )
+    if isinstance(error, PermissionDeniedError):
+        return (
+            "permission_rejected",
+            "OpenAI Responses request failed: authentication rejected",
+            False,
+        )
+    if isinstance(error, NotFoundError):
+        return (
+            "not_found",
+            "OpenAI Responses request failed: model or endpoint not found",
+            False,
+        )
+    if isinstance(error, (BadRequestError, UnprocessableEntityError)):
+        return (
+            "request_rejected",
+            "OpenAI Responses request failed: request rejected",
+            False,
+        )
+    if isinstance(error, RateLimitError):
+        return ("rate_limit", "", True)
+    if isinstance(error, APITimeoutError):
+        return ("timeout", "", True)
+    if isinstance(error, APIConnectionError):
+        return ("connection_error", "", True)
+    status_code = getattr(error, "status_code", None)
+    if isinstance(error, InternalServerError) or (
+        isinstance(error, APIStatusError)
+        and isinstance(status_code, int)
+        and 500 <= status_code <= 599
+    ):
+        return ("server_error", "", True)
+    return (
+        "provider_error",
+        "OpenAI Responses request failed: provider error",
+        False,
+    )
+
+
 class OpenAIResponsesClient:
     __slots__ = ("_client", "_model", "_sleeper")
 
@@ -386,22 +721,14 @@ class OpenAIResponsesClient:
         request: ModelRequest,
         budget: ModelCallBudget,
     ) -> ModelResponse:
-        mapped_input = _map_messages(request)
-        mapped_tools = _map_tools(request.tool_schemas)
+        request_kwargs = _request_kwargs(self._model, request, stream=False)
         purpose = budget.active_purpose
 
         response = None
         for attempt in range(3):
             provider_attempt_index = budget.begin_provider_attempt(purpose)
             try:
-                response = self._client.responses.create(
-                    model=self._model,
-                    input=mapped_input,
-                    tools=mapped_tools,
-                    max_output_tokens=request.max_output_tokens,
-                    store=False,
-                    include=["reasoning.encrypted_content"],
-                )
+                response = self._client.responses.create(**request_kwargs)
                 budget.finish_provider_attempt(
                     purpose,
                     provider_attempt_index,
@@ -518,20 +845,177 @@ class OpenAIResponsesClient:
 
         assert response is not None
 
-        text, tool_calls, usage, response_id, output_items = _parse_response(response)
-        continuation = _OpenAIContinuationSegment(
-            message_index=len(request.messages),
-            serialized_items=tuple(
-                _snapshot_output_item(item) for item in output_items
-            ),
-        )
-        try:
-            return ModelResponse(
-                text=text,
-                tool_calls=tool_calls,
-                usage=usage,
-                provider_response_id=response_id,
-                continuation_items=request.continuation_items + (continuation,),
+        return _build_model_response(request, response)
+
+    def stream(
+        self,
+        request: ModelRequest,
+        emit: ModelStreamHandler,
+    ) -> ModelResponse:
+        budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=3)
+        return invoke_model_stream(self, request, budget, emit)
+
+    def stream_with_budget(
+        self,
+        request: ModelRequest,
+        budget: ModelCallBudget,
+        emit: ModelStreamHandler,
+    ) -> ModelResponse:
+        request_kwargs = _request_kwargs(self._model, request, stream=True)
+        purpose = budget.active_purpose
+        for attempt in range(3):
+            provider_attempt_index = budget.begin_provider_attempt(purpose)
+            progress = _ResponsesStreamProgress()
+            try:
+                stream = self._client.responses.create(**request_kwargs)
+                close = getattr(stream, "close", None)
+                try:
+                    response = _consume_responses_stream(
+                        stream,
+                        request,
+                        emit,
+                        progress,
+                    )
+                except BaseException as primary:
+                    if callable(close):
+                        try:
+                            close()
+                        except BaseException:
+                            pass
+                    if progress.provider_delta and isinstance(
+                        primary,
+                        StreamingUnsupportedError,
+                    ):
+                        raise StreamInterruptedError(
+                            "model stream interrupted"
+                        ) from None
+                    if progress.provider_delta and isinstance(primary, OpenAIError):
+                        _, _, transient = _classify_responses_error(primary)
+                        if transient:
+                            raise StreamInterruptedError(
+                                "model stream interrupted"
+                            ) from None
+                    raise
+                else:
+                    if callable(close):
+                        try:
+                            close()
+                        except (KeyboardInterrupt, SystemExit):
+                            raise
+                        except Exception:
+                            raise StreamInterruptedError(
+                                "model stream cleanup failed"
+                            ) from None
+            except _StreamCallbackError as callback_error:
+                if isinstance(callback_error.error, Exception):
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=_model_error_code(callback_error.error),
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                raise
+            except StreamingUnsupportedError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="streaming_unsupported",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except StreamInterruptedError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="stream_interrupted",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except (APIResponseValidationError, json.JSONDecodeError):
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="invalid_model_response",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise _invalid_response(
+                    "provider stream could not be decoded"
+                ) from None
+            except InvalidOpenAIResponseError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="invalid_model_response",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except OpenAIError as exc:
+                error_code, public_message, transient = _classify_responses_error(
+                    exc
+                )
+                if not transient:
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=error_code,
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                    raise FatalModelError(public_message) from None
+                if attempt == 2:
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=error_code,
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                    raise TransientModelError(
+                        "OpenAI Responses stream failed after 3 attempts: "
+                        "transient provider error"
+                    ) from None
+                if budget.remaining_provider_attempts == 0:
+                    budget.finish_provider_attempt(
+                        purpose,
+                        provider_attempt_index,
+                        error_code=error_code,
+                        retry_scheduled=False,
+                        retry_delay_ms=None,
+                    )
+                    budget.begin_provider_attempt(purpose)
+                    raise AssertionError("unreachable provider budget branch")
+                delay = (0.25, 0.50)[attempt]
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code=error_code,
+                    retry_scheduled=True,
+                    retry_delay_ms=int(delay * 1000),
+                )
+                self._sleeper(delay)
+                continue
+            except Exception as exc:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code=_model_error_code(exc),
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+
+            budget.finish_provider_attempt(
+                purpose,
+                provider_attempt_index,
+                error_code=None,
+                retry_scheduled=False,
+                retry_delay_ms=None,
             )
-        except (TypeError, ValueError) as exc:
-            raise _invalid_response("invalid model response") from exc
+            return response
+
+        raise AssertionError("unreachable OpenAI Responses stream retry loop")

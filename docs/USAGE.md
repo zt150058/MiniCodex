@@ -78,11 +78,13 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 
 1. CLI 在联网前校验任务、工作区、API mode、base URL、模式专用凭据、模型和可选验证命令。
 2. composition root 只构造所选模型适配器，以及共享工作区、命令执行器、工具注册表、上下文管理器、终止策略、验证门和事件日志器。
-3. Agent 根据本地历史请求模型；超过字符或历史项阈值时生成结构化摘要，失败则使用确定性 fallback。
+3. 启动时只读取一次根 `AGENTS.md`，与内置基础规则组合成不可变运行指令；Agent 根据该指令和本地历史请求模型。超过字符或历史项阈值时生成结构化摘要，失败则使用确定性 fallback，摘要不会继承运行指令。
 4. 工具调用按响应顺序进行本地校验、授权、执行和观察，结果通过 `call_id` 配对写回历史。
 5. 文件修改增加 mutation index，并使旧验证状态失效。
 6. 完成候选只有在本地验证门接受新鲜证据后才能成为 SUCCESS。
 7. 预算耗尽、重复无进展、安全拒绝或不可恢复错误产生稳定失败原因。
+
+两个模型适配器内部都支持可选的 provider-neutral 文本流事件，以及首个 delta 前的结构化同步回退。**CLI 仍使用同步最终报告**：当前命令行不会逐 token 显示内容，也没有 SSE、WebSocket 或 GUI 事件传输层。部分输出仅驻留内存；中断后不会写入消息历史、JSONL 或 FinalReport。
 
 ## 五个本地工具
 
@@ -160,3 +162,5 @@ Chat 连续 Agent 循环合同位于 `tests/integration/test_chat_completions_ag
 `--base-url` 可配置不代表兼容所有服务。compatible endpoint 必须支持标准 Chat Completions assistant `tool_calls`、非空函数 call ID、strict function schema，以及用 `tool_call_id` 配对的 `role=tool` 结果；本项目不会根据 URL 猜测、探测或自动切换 API mode。
 
 这不是操作系统级沙箱。被允许执行的工作区脚本、pytest 配置和测试会作为可信代码运行，仍可能访问操作系统资源；策略也不能消除所有检查与使用之间的 TOCTOU 风险。请只处理可信项目，并使用可丢弃、已备份的工作区副本。
+
+当前没有会话持久化、SSE/GUI、异步模型客户端、可执行 Skill 管理或 MCP。`RunInstructionBuilder` 只提供受限的纯文本 Skill 指令输入边界；生命周期控制器、会话管理和动态 Skill/MCP 集成属于后续任务。

@@ -9,6 +9,7 @@ from coding_agent.agent import AgentInterrupted, AgentRunner
 from coding_agent.chat_completions_client import ChatCompletionsModelClient
 from coding_agent.config import ApiMode, RunConfig
 from coding_agent.context import ContextManager
+from coding_agent.instructions import RunInstructionBuilder
 from coding_agent.logging import RunEventLogger, RunLogError
 from coding_agent.model import ModelClient
 from coding_agent.openai_client import OpenAIResponsesClient
@@ -126,6 +127,7 @@ def run_application(
             execution_context=execution_context,
             executor=executor,
         )
+        instruction_snapshot = RunInstructionBuilder().build(config.workspace)
         runner = AgentRunner(
             model_client=model_client,
             tool_registry=registry,
@@ -135,6 +137,7 @@ def run_application(
             clock=selected.clock,
             verification_gate=verification_gate,
             event_sink=logger,
+            instructions=instruction_snapshot.text,
         )
     except KeyboardInterrupt:
         try:

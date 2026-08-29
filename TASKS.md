@@ -618,6 +618,126 @@
 
 `已完成`
 
+## 16. Run instructions 与根工作区 AGENTS.md
+
+**任务目标**
+
+为每次 Agent 运行构建一次确定、不可变且供应商中立的指令快照，组合固定基础指令、工作区根 `AGENTS.md` 与可选的已选择 Skill 指令，并只注入主模型调用。
+
+**涉及模块**
+
+- `src/coding_agent/messages.py`
+- `src/coding_agent/instructions.py`
+- `src/coding_agent/agent.py`
+- `src/coding_agent/app.py`
+- 两个模型适配器及对应离线测试
+
+**验收标准**
+
+- `ModelRequest.instructions` 是可空、显式序列化且 repr 隐藏的字符串字段。
+- 根 `AGENTS.md` 通过现有 `PathGuard` 读取，拒绝链接、junction 和 reparse point 逃逸。
+- 文件和 Skill 指令分别执行 65,536 UTF-8 字节上限、严格 UTF-8 和稳定脱敏错误处理。
+- 指令按基础、工作区、Skill 的固定顺序组合，同一输入产生相同文本和 SHA-256。
+- 每次运行只构建一次快照；主调用保持该快照，摘要调用始终使用 `instructions=None`。
+- Responses 和 Chat Completions 仅在非空时映射指令，空值保持既有请求形状。
+- 指令正文不进入 JSONL、最终报告或异常表示。
+
+**需要编写的测试**
+
+- 消息 JSON 往返、非法值和 repr 隐私测试。
+- 根文件缺失、空文件、BOM、UTF-8、精确字节上限、读取错误及 Windows reparse 安全测试。
+- 确定性组合、根目录唯一加载、Skill 输入和快照散列测试。
+- Agent 压缩前后主调用、摘要隔离、应用单次构建及两个 provider 映射测试。
+
+**建议的 Git 提交说明**
+
+`feat: add immutable run instructions`
+
+**当前状态**
+
+`已完成`
+
+## 17. Provider-neutral streaming 核心
+
+**任务目标**
+
+在不改变既有 `ModelClient.complete` 协议的前提下，新增可选流式协议、安全生命周期事件和同一 logical call 内的共享预算回退。
+
+**涉及模块**
+
+- `src/coding_agent/model.py`
+- `src/coding_agent/streaming.py`
+- `src/coding_agent/agent.py`
+- `tests/test_model.py`
+- `tests/test_streaming.py`
+- `tests/test_agent_loop.py`
+
+**验收标准**
+
+- 流式协议是可选能力，既有同步客户端和公共 `complete` 签名保持兼容。
+- 只暴露文本 delta、完成和丢弃事件，不暴露 SDK 对象、工具参数片段或 continuation。
+- 流式请求、结构化不支持后的同步回退共享一个 logical call 和同一个 provider attempt 预算。
+- 只有首个 provider/text delta 前的结构化不支持可以回退；delta 后失败必须丢弃并稳定终止本次流。
+- 回调异常、`KeyboardInterrupt` 和 `SystemExit` 不被吞掉，部分内容不进入 Agent 历史。
+- `AgentRunner` 只在显式提供 handler 时流式执行主调用；摘要和现有 CLI 仍同步。
+
+**需要编写的测试**
+
+- 事件不变量、协议兼容和同步客户端回退测试。
+- logical/provider 精确计数、预算边界和结构化不支持测试。
+- 完成、丢弃、回调异常及 `BaseException` 传播测试。
+- Agent 主调用流式、部分内容隔离、摘要同步和无 handler 回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: add provider-neutral model streaming core`
+
+**当前状态**
+
+`已完成`
+
+## 18. Responses 与 Chat Completions 流式适配
+
+**任务目标**
+
+在两个既有模型适配器内部解析真实 SDK 流，保留所有同步请求、重试、上下文和隐私合同，并返回既有完整 `ModelResponse`。
+
+**涉及模块**
+
+- `src/coding_agent/openai_client.py`
+- `src/coding_agent/chat_completions_client.py`
+- 两个 provider 的流式离线测试
+- `DESIGN.md`
+- `docs/OPENAI_API.md`
+- `docs/USAGE.md`
+- `tests/test_docs.py`
+
+**验收标准**
+
+- Responses 使用 `stream=True`、`store=False` 和本地历史，不发送 conversation 或 `previous_response_id`。
+- Responses 严格解析允许的 SDK 事件、文本、函数参数片段、最终 usage/ID/工具调用和累计 SDK-free continuation。
+- Chat Completions 使用完整本地历史，按连续 index 聚合文本和 function tool-call 片段，continuation 始终为空。
+- 两个适配器只在首个 provider delta 前重试瞬时错误；delta 后不重试、不回退并丢弃临时文本。
+- 每个真实请求领取 provider attempt，资源始终关闭，cleanup 错误不覆盖已有异常或 `BaseException`。
+- 所有测试完全离线，不读取真实密钥，不泄漏请求正文、认证头、推理或 continuation。
+- CLI 继续输出同步最终报告；SSE、GUI、会话控制器和 Skill 管理仍延期。
+
+**需要编写的测试**
+
+- 两个 provider 的精确请求映射、文本、单/多工具调用、混合响应、usage 和 ID 测试。
+- Responses 完整事件序列、参数片段一致性、累计 continuation 和未知事件测试。
+- Chat 工具 index、字段稳定性、完成原因、usage 和非法 chunk 测试。
+- 瞬时/致命错误、重试次数、共享预算、关闭优先级、隐私和同步回归测试。
+- 文档合同、全量离线回归、SDK 隔离、依赖、凭据和延期范围审计。
+
+**建议的 Git 提交说明**
+
+`feat: stream responses and chat completions models`
+
+**当前状态**
+
+`进行中`
+
 ## 任务完成规则
 
 每项任务只有在以下条件同时满足时才能标记为 `已完成`：
