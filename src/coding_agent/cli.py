@@ -35,7 +35,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default=None,
-        help="OpenAI model; overrides OPENAI_MODEL",
+        help="Model identifier; overrides OPENAI_MODEL",
+    )
+    parser.add_argument(
+        "--api-mode",
+        choices=("responses", "chat-completions"),
+        default="responses",
+        help="Model API mode; defaults to responses",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="HTTPS API base URL; required only for chat-completions",
     )
     return parser
 
@@ -57,6 +68,8 @@ def main(
             workspace=args.workspace,
             model=args.model,
             verify_command=args.verify,
+            api_mode=args.api_mode,
+            base_url=args.base_url,
             environ=environ,
         )
     except ConfigError as exc:

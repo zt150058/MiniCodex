@@ -552,7 +552,71 @@
 
 **当前状态**
 
-`进行中`
+`已完成`
+
+## 15. OpenAI-compatible Chat Completions provider 适配
+
+**任务目标**
+
+在保持 `ModelClient.complete(ModelRequest) -> ModelResponse`、现有 `OpenAIResponsesClient` 和本地 Agent 生命周期不变的前提下，新增供应商中立的 Chat Completions 适配器。通过显式 `api-mode + base-url` 选择第三方兼容 endpoint，首个兼容目标是 BayesDL GLM；不硬编码供应商，不使用服务端会话状态。
+
+**涉及模块**
+
+- `src/coding_agent/chat_completions_client.py`
+- `src/coding_agent/config.py`
+- `src/coding_agent/cli.py`
+- `src/coding_agent/app.py`
+- `src/coding_agent/tools/shell.py`
+- `tests/test_chat_completions_client.py`
+- `tests/integration/test_chat_completions_agent.py`
+- `tests/tools/test_shell_tool.py`
+- 配置、CLI、应用和文档合同测试
+- `DESIGN.md`
+- `README.md`
+- `README.txt`
+- `docs/USAGE.md`
+- `docs/OPENAI_API.md`
+
+**验收标准**
+
+- `--api-mode` 只接受 `responses` 和 `chat-completions`，默认 `responses`。
+- `responses` 继续使用 OpenAI 官方默认 endpoint；`responses + --base-url` 在任何 SDK 构造或网络请求前以稳定、脱敏的配置错误失败，不得忽略。
+- `chat-completions` 必须显式提供合法的绝对 HTTPS `--base-url`；原始 URL 中的 C0/DEL 控制字符、内部空白和反斜杠必须在解析前被拒绝；项目不硬编码、探测或猜测供应商。
+- Responses 只读取 `OPENAI_API_KEY`，Chat Completions 只读取 `CHAT_COMPLETIONS_API_KEY`；两者不回退，不提供 API Key CLI 参数，也不在日志、错误或报告中泄漏凭据和认证头；两个变量都不得进入 `run_command` 子进程环境。
+- 新 `ChatCompletionsModelClient` 位于独立模块，SDK 类型不越过适配层，现有 ModelClient 公共接口和 Responses 实现行为不变。
+- 每次 provider 调用接收 `ContextManager` 准备后的完整内部历史，并正确映射 user、assistant、assistant tool calls 和通过 `tool_call_id` 配对的 tool results。
+- assistant 工具调用消息保留在后续上下文；工具结果后模型可继续产生新的工具调用或最终文本；单轮多个工具调用保持顺序。
+- Chat 响应解析直接检查 `message.tool_calls`，不依赖 `finish_reason` 判断工具调用，并支持工具调用与文本共存。
+- continuation 始终为空；不使用 conversation、`previous_response_id` 或其他服务端持久状态。
+- 压缩后的历史仍满足 Chat Completions assistant/tool 顺序和配对约束，并可继续调用模型。
+- strict function schema、`max_tokens`、单 choice、标准 function tool call、唯一 call ID、JSON object arguments、usage 和 response ID 按批准设计映射。
+- SDK 内建重试关闭；瞬时错误最多按 0.25/0.50 秒退避重试两次，每次真实尝试领取共享模型预算；致命配置/请求错误和无效响应不重试。
+- 外部异常和无效 payload 转换为稳定、脱敏的本地错误；SDK 在返回对象前抛出的 `APIResponseValidationError` 和 `json.JSONDecodeError` 也归为不重试的 `invalid_model_response`，且不输出原始响应体、JSON doc、SDK exception repr、API Key、Authorization header 或环境内容。
+- 默认自动测试完全离线；现有 Responses 测试保持通过，且不调用真实 API。
+- 文档明确说明可配置 base URL 不代表兼容所有服务，目标 endpoint 必须支持标准 Chat Completions 工具调用语义。
+- 不新增依赖、Agent 框架、工具或无关重构。
+
+**需要编写的测试**
+
+- Chat 客户端构造、URL 校验（含控制字符、内部空白和反斜杠）、请求映射、strict schema、输出限制、文本、单/多工具调用、完成原因、usage、response ID 和无效 payload 单元测试。
+- 瞬时/致命错误、SDK 解码/响应校验异常、重试次数与退避、共享调用预算、脱敏、非空 continuation 和 SDK 调用前历史配对拒绝测试。
+- 真实允许的 Python 子进程与 process-factory 环境捕获测试，证明 `OPENAI_API_KEY` 和 `CHAT_COMPLETIONS_API_KEY` 均按大小写无关方式被剥离，普通安全环境变量仍被保留。
+- 合法与非法 API mode、base URL、模式专用凭据组合的离线配置、CLI 和应用装配测试。
+- 真实 `AgentRunner` + `ChatCompletionsModelClient` + fake SDK 的“文本—工具调用—工具结果—最终文本”测试。
+- 连续两轮工具调用后最终文本测试。
+- 单轮多个 tool calls 与多个 tool results 测试。
+- 上下文压缩后继续调用模型测试。
+- 逐请求验证 assistant/tool 合法顺序和精确 call ID 配对测试。
+- 现有 `OpenAIResponsesClient` 和默认 Responses 模式回归测试。
+- 文档模式、endpoint、兼容性和凭据隐私合同测试。
+
+**建议的 Git 提交说明**
+
+`feat: add compatible chat completions model client`
+
+**当前状态**
+
+`已完成`
 
 ## 任务完成规则
 

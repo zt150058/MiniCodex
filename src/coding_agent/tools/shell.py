@@ -42,7 +42,9 @@ def _validated_arguments(arguments: object) -> tuple[str, str]:
 
 
 _REMOVED_ENVIRONMENT_KEYS = {
-    "openai_api_key", "pythonpath", "pythonhome", "pytest_addopts",
+    "openai_api_key",
+    "chat_completions_api_key",
+    "pythonpath", "pythonhome", "pytest_addopts",
     "pytest_plugins", "mypypath", "mypy_config_file", "git_dir",
     "git_work_tree", "git_object_directory",
     "git_alternate_object_directories", "git_external_diff", "git_ssh",

@@ -86,6 +86,12 @@ def test_readme_txt_meets_submission_contract() -> None:
         "coding-agent",
         "--workspace",
         "--verify",
+        "--api-mode",
+        "--base-url",
+        "responses",
+        "chat-completions",
+        "OPENAI_API_KEY",
+        "CHAT_COMPLETIONS_API_KEY",
         "pytest -q",
         ".coding-agent/logs/",
         "docs/USAGE.md",
@@ -136,7 +142,16 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
     _assert_headings_in_order(text, headings)
 
     help_text = build_parser().format_help()
-    expected_cli_names = ("task", "--workspace", "--verify", "--model", "-h", "--help")
+    expected_cli_names = (
+        "task",
+        "--workspace",
+        "--verify",
+        "--model",
+        "--api-mode",
+        "--base-url",
+        "-h",
+        "--help",
+    )
     for name in expected_cli_names:
         assert name in help_text
         assert f"`{name}`" in text
@@ -163,7 +178,17 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         "`interrupted`",
         ".coding-agent/logs/<run_id>.jsonl",
         "OPENAI_API_KEY",
+        "CHAT_COMPLETIONS_API_KEY",
         "OPENAI_MODEL",
+        "`responses`",
+        "`chat-completions`",
+        "`responses + --base-url`",
+        "`chat-completions` 必须提供 `--base-url`",
+        (
+            "`OPENAI_API_KEY` 和 `CHAT_COMPLETIONS_API_KEY` 都会从 "
+            "`run_command` 子进程环境中移除"
+        ),
+        "`--base-url` 可配置不代表兼容所有服务",
         "validation_index == mutation_index",
         "Ctrl+C",
         "tests/integration/test_agent_repair.py",
@@ -171,20 +196,21 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         assert required in text
 
 
-def test_openai_guide_matches_adapter_and_declares_unsupported_features() -> None:
+def test_api_guide_matches_both_adapters_and_declares_unsupported_features() -> None:
     text = _read_utf8(ROOT / "docs" / "OPENAI_API.md")
     headings = (
-        "# OpenAI Responses API 接入说明",
+        "# OpenAI Responses 与 compatible Chat Completions 接入说明",
+        "## Provider 与 API mode 选择",
         "## 凭据与模型配置",
         "## PowerShell 当前会话设置",
         "## 不显示密钥的配置检查",
         "## 启动 MiniCodex",
         "## ModelClient 与适配器边界",
         "## Responses API 请求映射",
-        "## 工具调用和 call_id 配对",
-        "## 本地历史与 continuation",
-        "## logical call 与 provider attempt",
-        "## 重试和永久错误",
+        "## Responses continuation 与本地历史",
+        "## Chat Completions 完整历史映射",
+        "## assistant tool_calls 与 tool result 配对",
+        "## 共享 logical call、provider attempt 与重试",
         "## 隐私与日志边界",
         "## 完全离线的自动测试",
         "## 手工联网冒烟（自动测试不会执行）",
@@ -193,42 +219,66 @@ def test_openai_guide_matches_adapter_and_declares_unsupported_features() -> Non
     )
     _assert_headings_in_order(text, headings)
 
-    source = _read_utf8(ROOT / "src" / "coding_agent" / "openai_client.py")
-    assert ".responses.create(" in source
-    assert "store=False" in source
-    assert "max_retries=0" in source
-    assert '"strict": True' in source
-    assert "chat.completions" not in source
+    responses_source = _read_utf8(
+        ROOT / "src" / "coding_agent" / "openai_client.py"
+    )
+    chat_source = _read_utf8(
+        ROOT / "src" / "coding_agent" / "chat_completions_client.py"
+    )
+    assert ".responses.create(" in responses_source
+    assert "store=False" in responses_source
+    assert "max_retries=0" in responses_source
+    assert '"strict": True' in responses_source
+    assert "chat.completions" not in responses_source
+    assert ".chat.completions.create(" in chat_source
+    assert "max_retries=0" in chat_source
+    assert '"max_tokens"' in chat_source
+    assert "previous_response_id" not in chat_source
+    assert "conversation" not in chat_source
 
     for required in (
         "OpenAIResponsesClient",
+        "ChatCompletionsModelClient",
         "ModelClient",
         "ModelResponse",
         "Responses API",
+        "Chat Completions",
+        "`responses`",
+        "`chat-completions`",
+        "--base-url",
         "store=False",
+        "max_tokens",
         "max_retries=0",
         "function_call_output",
+        "assistant tool_calls",
+        "role=tool",
+        "tool_call_id",
+        'finish_reason="stop"',
         "call_id",
         "previous_response_id",
         "conversation",
         "0.25",
         "0.50",
         "OPENAI_API_KEY",
+        "CHAT_COMPLETIONS_API_KEY",
         "OPENAI_MODEL",
+        "tests/integration/test_chat_completions_agent.py",
+        "可配置 base URL 不代表兼容所有服务",
         "手工联网冒烟（自动测试不会执行）",
         "可能产生费用",
     ):
         assert required in text
 
     unsupported = (
-        "custom base_url",
-        "Azure OpenAI",
-        "第三方 compatible endpoint",
+        "custom Responses endpoint",
+        "Azure-specific API",
         "proxy 配置",
         "server conversation",
         "streaming",
         "async API",
-        "其他 provider adapter",
+        "automatic endpoint detection",
+        "legacy function_call",
+        "non-function Chat tools",
     )
     unsupported_section = _section(text, "## 当前未实现的扩展")
     for feature in unsupported:
@@ -250,4 +300,3 @@ def test_public_docs_contain_no_secret_or_personal_absolute_path() -> None:
     )
     for pattern in forbidden_patterns:
         assert re.search(pattern, combined, flags=re.IGNORECASE) is None
-

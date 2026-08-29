@@ -2,7 +2,7 @@
 
 ## 1. 项目目标与范围
 
-本项目从零实现一个 Windows 优先、Python 编写的本地 Coding Agent。用户通过一次性 CLI 命令提交编程任务，Agent 调用 OpenAI 官方 Responses API，自主检查工作区、读取和修改文本文件、执行受控命令、验证修改，并以明确的终止状态结束。
+本项目从零实现一个 Windows 优先、Python 编写的本地 Coding Agent。用户通过一次性 CLI 命令提交编程任务，Agent 默认调用 OpenAI 官方 Responses API，也可显式选择 OpenAI-compatible Chat Completions endpoint；Agent 自主检查工作区、读取和修改文本文件、执行受控命令、验证修改，并以明确的终止状态结束。
 
 概念命令如下：
 
@@ -20,7 +20,7 @@ coding-agent "修复当前项目中的失败测试" --workspace <path> --verify 
 
 ## 2. 考核边界与核心自研逻辑
 
-项目不得使用任何 Agent 框架或 Agent SDK，不得封装现成 Agent 产品，也不得使用 API 服务端托管的文件或代码执行工具。只允许使用 OpenAI 官方模型客户端和原生函数调用接口。
+项目不得使用任何 Agent 框架或 Agent SDK，不得封装现成 Agent 产品，也不得使用 API 服务端托管的文件或代码执行工具。只允许使用官方 OpenAI Python 模型客户端和模型 endpoint 的原生函数调用接口。
 
 以下逻辑必须由本项目在本地自行实现：
 
@@ -29,7 +29,7 @@ coding-agent "修复当前项目中的失败测试" --workspace <path> --verify 
 - 上下文压缩范围选择、摘要校验和降级策略。
 - 内部消息、工具调用和工具结果格式。
 - 工具定义、注册、参数校验、安全授权与本地执行。
-- OpenAI 模型输出解析和内部格式转换。
+- Responses 与 Chat Completions 模型输出解析和内部格式转换。
 - 文件修改账本和验证证据时效管理。
 - 重试、错误分类、重复调用检测和终止条件。
 - JSONL 事件日志、脱敏和最终报告。
@@ -39,9 +39,11 @@ coding-agent "修复当前项目中的失败测试" --workspace <path> --verify 
 - 语言：Python。
 - 运行平台：Windows 优先，不承诺首版跨平台支持。
 - 交互方式：一次性任务输入，Agent 自主运行至终止；不提供聊天式 REPL。
-- 模型接口：OpenAI 官方 Responses API。
+- 模型接口：默认使用 OpenAI 官方 Responses API；可显式选择标准 OpenAI-compatible Chat Completions endpoint。
+- API 模式：`--api-mode` 只接受 `responses` 和 `chat-completions`，默认 `responses`。
+- Endpoint 配置：`responses` 禁止 `--base-url` 并继续使用官方默认地址；`chat-completions` 必须显式提供合法的 HTTPS `--base-url`，项目不硬编码或自动探测供应商。
 - 模型配置：通过 `--model` 或 `OPENAI_MODEL` 指定；两者都不存在时以配置错误退出。
-- 凭据：只读取 `OPENAI_API_KEY`。
+- 凭据：Responses 只读取 `OPENAI_API_KEY`，Chat Completions 只读取 `CHAT_COMPLETIONS_API_KEY`；两者不互相回退，也不提供 API Key CLI 参数。
 - 运行依赖：生产环境只引入官方 `openai` Python 包，其余功能优先使用标准库。
 - 测试依赖：使用 `pytest`。
 - 包布局：生产代码放在 `src/coding_agent/`，测试放在 `tests/`。
@@ -52,7 +54,10 @@ coding-agent "修复当前项目中的失败测试" --workspace <path> --verify 
 CLI / Config
     |
     v
-AgentRunner <------> ModelClient <------> OpenAI Responses API
+AgentRunner <------> ModelClient
+    |                    |
+    |                    +------> OpenAIResponsesClient ------> OpenAI Responses API
+    |                    +------> ChatCompletionsModelClient -> compatible Chat Completions API
     |
     +------> ContextManager
     +------> TerminationPolicy
@@ -72,7 +77,7 @@ AgentState -> JSONL EventLogger -> FinalReport
 - `ToolRegistry` 是所有本地能力的唯一入口。
 - `SafetyPolicy` 使用确定性代码裁决，不接受模型覆盖。
 - `VerificationGate` 独立于模型文本决定是否允许成功。
-- `ModelClient` 将 Agent 核心与 OpenAI SDK 隔离。
+- `ModelClient` 将 Agent 核心与 OpenAI SDK 及 endpoint 形状隔离；SDK 类型不得进入 Agent、消息或工具层。
 - `EventLogger` 只记录经过脱敏的执行事实，不记录隐藏推理内容。
 
 ## 5. 模块职责与接口
@@ -81,12 +86,13 @@ AgentState -> JSONL EventLogger -> FinalReport
 
 | 模块 | 职责 | 主要依赖 |
 | --- | --- | --- |
-| `cli.py` | 解析一次性任务、工作区、模型和验证参数；映射退出码 | `config.py`, `agent.py` |
-| `config.py` | 读取环境变量、归一化配置并验证限制 | 标准库 |
+| `cli.py` | 解析一次性任务、工作区、模型、API 模式、base URL 和验证参数；映射退出码 | `config.py`, `agent.py` |
+| `config.py` | 读取模式专用凭据、归一化配置并在联网前验证 mode/URL 组合 | 标准库 |
 | `messages.py` | 定义供应商无关的消息、工具调用和结果类型 | 标准库 |
 | `state.py` | 定义 `AgentState` 和验证、终止枚举 | `messages.py` |
 | `model.py` | 定义 `ModelClient` 协议、请求响应类型和 `FakeModelClient` | `messages.py` |
 | `openai_client.py` | 在内部类型和 OpenAI Responses API 之间转换 | `model.py`, `openai` |
+| `chat_completions_client.py` | 在内部类型和 OpenAI-compatible Chat Completions API 之间转换 | `model.py`, `openai` |
 | `agent.py` | 执行显式 Agent 主循环 | 上述核心接口 |
 | `context.py` | 判断压缩、选择完整历史前缀、生成并校验摘要、执行降级 | `model.py`, `state.py` |
 | `verification.py` | 维护验证时效并判定成功资格 | `state.py`, `tools` |
@@ -173,13 +179,15 @@ Agent 使用同步、显式的 `while` 循环。每轮按以下顺序执行：
 - 有序 `ToolCall` 列表。
 - 可空用量信息。
 - 可空供应商响应 ID。
-- 当前 API 上下文段需要的 opaque continuation items。
+- 当前适配器需要的 opaque continuation items。
 
-Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；不写日志、不暴露给工具、不作为项目自己的语义状态。压缩后这些旧项会被丢弃。
+Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Responses 输出；不写日志、不暴露给工具、不作为项目自己的语义状态，压缩后会被丢弃。Chat Completions 不使用 continuation，始终返回空值，并在每次请求中发送 `ContextManager` 准备的完整内部历史。
 
 ## 8. 模型调用层
 
-`OpenAIResponsesClient` 使用官方 SDK，但不让 SDK 类型越过适配层：
+两个生产适配器都实现既有 `ModelClient.complete(ModelRequest) -> ModelResponse` 边界，使用官方 SDK 作为 HTTP 客户端，但不让 SDK 类型越过各自适配层。Agent、消息、工具、上下文、验证和报告层不感知 API 模式。
+
+`OpenAIResponsesClient` 的既有行为保持不变：
 
 - 请求设置 `store=False`。
 - 不使用 `conversation` 或 `previous_response_id` 代替本地历史。
@@ -190,11 +198,27 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 - 默认最大输出为 4096 tokens，并计入真实用量日志。
 - 不记录认证头、隐藏推理或加密推理载荷。
 
+`ChatCompletionsModelClient` 是独立、加法式适配器：
+
+- 只在显式 `chat-completions` 模式下构造，要求用户提供绝对 HTTPS base URL；URL 解析前拒绝 C0/DEL 控制字符、内部空白和反斜杠；不根据 URL 或响应自动猜测模式。
+- 将每次 `ModelRequest` 中的完整内部历史映射为 user、assistant、assistant `tool_calls` 和带 `tool_call_id` 的 tool 消息。
+- assistant 工具调用消息必须紧邻并按顺序匹配其全部工具结果；适配器在 SDK 调用前重新验证该不变量，包括压缩后的历史。
+- 将 strict function schemas 映射为 Chat Completions function tools，使用 `max_tokens` 传递输出上限。
+- 直接检查 `choice.message.tool_calls`，不依赖 `finish_reason` 判断工具调用；允许文本与工具调用共存，也允许供应商在有工具调用时返回 `finish_reason="stop"`。
+- 只接受恰好一个 choice、标准 function tool calls、唯一非空 call ID 和 JSON object arguments；`finish_reason` 只允许 `stop` 或 `tool_calls`，截断、内容过滤、空或未知完成原因及空响应均作为稳定的无效响应错误。
+- `usage` 若存在，必须完整提供非负的 prompt、completion 和 total token；非空响应 ID 只以哈希形式进入观察日志。
+- SDK 在返回对象前抛出的 `APIResponseValidationError` 或 `json.JSONDecodeError` 与解析器拒绝一样归为非致命 `invalid_model_response`，不重试，并丢弃异常文本、响应体和 JSON doc。
+- 不使用服务端 conversation、`previous_response_id` 或其他持久状态；`ModelResponse.continuation` 始终为空。
+
+配置组合在任何 SDK 构造或网络请求前验证：Responses 使用官方默认 endpoint 且拒绝 `--base-url`；Chat Completions 要求合法 HTTPS `--base-url`。两种模式使用互不回退的环境变量凭据。可配置 base URL 不代表任意服务兼容，目标 endpoint 还必须正确实现标准 Chat Completions 函数工具调用、call ID 和 tool result 语义。
+
 模型错误分为：
 
 - 瞬时错误：网络超时、429、5xx。使用短指数退避，最多重试两次。
 - 致命错误：密钥缺失、认证失败、模型不存在或请求配置非法。立即失败，不重试。
 - 不完整或不可解析响应：记录错误并进入连续失败计数，必要时把简洁错误反馈给下一轮。
+
+两个生产适配器都关闭 SDK 内建重试，由本地适配器执行 0.25 秒和 0.50 秒的最多两次重试。每次真实 provider 尝试都领取共享 `ModelCallBudget`；预算不足时不发请求。外部异常统一转换为稳定、脱敏的本地错误，不输出密钥、Authorization header、原始响应体或 SDK exception repr。
 
 `FakeModelClient` 接收预设的响应序列，记录收到的请求，并在序列耗尽时明确报错，以支持完全离线、确定性的主循环测试。
 
@@ -327,7 +351,8 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 
 ### 凭据和日志
 
-- 只从 `OPENAI_API_KEY` 读取密钥，不读取或打印环境变量全集。
+- Responses 只从 `OPENAI_API_KEY` 读取密钥，Chat Completions 只从 `CHAT_COMPLETIONS_API_KEY` 读取密钥；两者不互相回退，也不读取或打印环境变量全集。
+- `run_command` 启动工作区 Python、pytest 或验证子进程前，按大小写无关方式从子进程环境剥离上述两个模型凭据变量。
 - 已知密钥值、Bearer 认证模式和常见 API Key 模式在日志前统一脱敏。
 - 日志不记录 HTTP 认证头、隐藏推理或 opaque continuation payload。
 - 源码、测试、文档、提交、截图和视频不得包含真实凭据。
@@ -379,13 +404,15 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 ### 单元测试
 
 - 消息和工具结果数据结构及 JSON 序列化。
-- OpenAI 类型与内部类型转换。
+- Responses 和 Chat Completions SDK 类型与内部类型转换。
+- API mode、base URL（含控制字符、内部空白与反斜杠）、模式专用凭据及全部合法/非法配置组合。
+- Chat Completions 消息顺序、assistant/tool 配对、单/多工具调用、完成原因、usage、SDK 畸形响应异常、重试、预算与脱敏。
 - 工具 strict schema。
 - 路径规范化、工作区包含关系和保留目录。
 - 符号链接、junction/reparse point 逃逸；系统不允许创建链接时使用明确条件跳过，并保留纯策略测试。
 - 精确替换计数和失败零修改。
 - 命令解析、白名单、Git 子命令和危险输入拒绝。
-- 子进程退出码、超时、进程树终止和输出截断。
+- 子进程退出码、超时、进程树终止、输出截断，以及两个模型凭据变量的大小写无关环境剥离。
 - 压缩触发、完整 turn 边界、摘要字段校验和确定性降级。
 - 修改后验证失效、验证时效和强制门槛。
 - 模型重试、连续错误、重复调用和所有终止预算。
@@ -395,6 +422,7 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 
 - 使用 `FakeModelClient` 脚本化工具调用和模型完成候选。
 - 使用伪 SDK 响应测试 `OpenAIResponsesClient`，默认测试不联网。
+- 使用伪 SDK 响应测试 `ChatCompletionsModelClient`，并把现有 Responses 测试作为不变的回归保护。
 - 在 pytest 临时工作区执行真实目录、文件和子进程操作。
 - 检查 `ToolResult`、`AgentState` 和 JSONL 事件对同一事实保持一致。
 
@@ -409,12 +437,14 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 
 另有失败路径集成测试证明：强制验证非零时绝不成功、最后修改会使旧验证失效、模型重复调用会终止、路径和命令违规不会执行。
 
-真实 OpenAI API 只用于显式人工冒烟测试。它不属于默认测试命令，测试报告必须明确区分是否真实运行。
+Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fake SDK，覆盖“文本—工具调用—工具结果—最终文本”、连续两轮工具调用、单轮多个工具调用、压缩后继续，以及每次请求的合法 assistant/tool 配对顺序。
+
+真实模型 API 只用于用户另行明确授权的人工冒烟测试。它不属于默认测试命令，测试报告必须明确区分是否真实运行；Task15 不调用真实 API。
 
 ## 17. 重要设计决策及其理由
 
 1. **显式状态机单循环，而非 Planner 或框架**：代码量适合 10 至 25 小时，核心机制清晰，便于测试和面试辩护。
-2. **`ModelClient` 抽象**：让主循环离线可测，同时不为首版增加多供应商实现。
+2. **`ModelClient` 抽象和独立适配器**：让主循环离线可测，并以加法方式支持 Responses 与标准 Chat Completions，不把 SDK 类型或 endpoint 差异泄漏到核心层。
 3. **本地无状态上下文管理**：`store=False` 并自行保存必要输入，满足核心逻辑自研要求。
 4. **精确替换优先于补丁解析**：行为确定、失败原子、测试成本低；新文件由独立工具创建。
 5. **`shell=False` 与有限命令集**：牺牲部分通用性，换取确定性安全规则和可解释边界。
@@ -422,6 +452,9 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 7. **模型语义摘要加本地降级**：展示上下文特色，同时避免摘要故障阻断任务。
 8. **字符预算而非 tokenizer**：减少依赖和模型耦合，并以保守阈值控制首版范围。
 9. **事件日志与最终报告共用执行事实**：便于复现、答辩，并避免报告与真实结果不一致。
+10. **显式 API mode 和严格 endpoint 组合**：默认保持 Responses；Chat Completions 必须显式配置 HTTPS base URL，Responses 则拒绝自定义 URL，避免猜测和误发凭据。
+11. **模式专用凭据**：`OPENAI_API_KEY` 与 `CHAT_COMPLETIONS_API_KEY` 不互相回退，降低把密钥发送到错误 endpoint 的风险。
+12. **Chat Completions 完全依赖本地历史**：continuation 始终为空，工具调用和结果作为完整消息留在上下文中；压缩仍由现有 `ContextManager` 管理。
 
 ## 18. 首版不实现的功能
 
@@ -432,7 +465,9 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 - 并行工具执行。
 - 跨进程会话恢复。
 - macOS、Linux 正式支持。
-- OpenAI 以外的模型供应商实现。
+- 自定义 Responses endpoint、Azure 专用协议或供应商专用非标准 API。
+- 自动 endpoint 探测、按 URL 猜测 API 模式或凭据回退。
+- Chat Completions streaming、异步、多个 choices、旧式 `function_call` 或非函数工具。
 - 任意 Shell、网络访问、包安装或服务端托管工具。
 - 文件删除、移动、权限修改和二进制文件编辑。
 - Git 写操作、自动提交、自动推送或远程仓库操作。
@@ -447,4 +482,6 @@ Opaque continuation items 仅驻留内存，用于正确续接 OpenAI 响应；�
 - 无 OS 沙箱，运行可信项目的测试仍可能产生工作区外副作用。
 - Windows 优先实现会减少跨平台展示价值。
 - 一次性会话和有限轮次不适合超长开发任务。
+- OpenAI-compatible 只是协议目标而非兼容性保证；第三方 endpoint 必须实现标准 Chat Completions 工具调用、call ID 和 tool result 配对语义。
+- Chat Completions 使用 `max_tokens` 以覆盖目标兼容服务；只接受 `max_completion_tokens` 的 endpoint 不在 Task15 范围内。
 - 真实模型行为具有非确定性，自动测试主要依赖 FakeModelClient；真实 API 测试只能作为单独记录的人工证据。

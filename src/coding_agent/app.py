@@ -6,7 +6,8 @@ import time
 from typing import Protocol, TextIO
 
 from coding_agent.agent import AgentInterrupted, AgentRunner
-from coding_agent.config import RunConfig
+from coding_agent.chat_completions_client import ChatCompletionsModelClient
+from coding_agent.config import ApiMode, RunConfig
 from coding_agent.context import ContextManager
 from coding_agent.logging import RunEventLogger, RunLogError
 from coding_agent.model import ModelClient
@@ -48,7 +49,15 @@ class ApplicationFactories:
 
 
 def _production_model_client(config: RunConfig) -> ModelClient:
-    return OpenAIResponsesClient(model=config.model, api_key=config.api_key)
+    if config.api_mode is ApiMode.RESPONSES:
+        return OpenAIResponsesClient(model=config.model, api_key=config.api_key)
+    if config.base_url is None:
+        raise ValueError("chat-completions base_url is missing")
+    return ChatCompletionsModelClient(
+        model=config.model,
+        api_key=config.api_key,
+        base_url=config.base_url,
+    )
 
 
 def _production_logger(config: RunConfig, clock: Clock) -> RunEventLogger:

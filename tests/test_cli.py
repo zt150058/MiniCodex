@@ -11,7 +11,7 @@ from typing import TextIO
 import pytest
 
 from coding_agent.cli import build_parser, main
-from coding_agent.config import ConfigError, RunConfig, load_run_config
+from coding_agent.config import ApiMode, ConfigError, RunConfig, load_run_config
 from coding_agent.safety import (
     AuthorizedCommand,
     CommandSource,
@@ -21,6 +21,7 @@ from coding_agent.safety import (
 
 
 SECRET_SENTINEL = "do-not-print-this-test-value"
+CHAT_SECRET_SENTINEL = "chat-key-must-never-be-printed"
 
 
 def valid_environ() -> dict[str, str]:
@@ -30,12 +31,23 @@ def valid_environ() -> dict[str, str]:
     }
 
 
+def valid_chat_environ() -> dict[str, str]:
+    return {
+        "OPENAI_MODEL": "chat-model",
+        "CHAT_COMPLETIONS_API_KEY": CHAT_SECRET_SENTINEL,
+    }
+
+
 def test_help_describes_local_agent_execution_and_verification() -> None:
     help_text = " ".join(build_parser().format_help().split())
 
     assert "Run a one-shot local coding agent" in help_text
     assert "read and modify workspace files and run authorized commands" in help_text
     assert "User-specified required final verification command" in help_text
+    assert "--api-mode" in help_text
+    assert "--base-url" in help_text
+    assert "responses" in help_text
+    assert "chat-completions" in help_text
     for stale_text in (
         "Validate configuration",
         "Task to validate",
@@ -66,6 +78,236 @@ def test_config_normalizes_workspace(tmp_path: Path) -> None:
     assert config.verify_command.purpose == "verification"
     assert config.verify_command.source is CommandSource.USER_VERIFY
     assert config.verify_command.argv[-1] == "-q"
+
+
+def test_responses_mode_is_backward_compatible_default(tmp_path: Path) -> None:
+    config = load_run_config(
+        task="inspect",
+        workspace=tmp_path,
+        model=None,
+        verify_command=None,
+        environ=valid_environ(),
+    )
+
+    assert config.api_mode is ApiMode.RESPONSES
+    assert config.base_url is None
+    assert config.api_key == SECRET_SENTINEL
+
+
+def test_chat_mode_uses_only_chat_credential_and_normalizes_base_url(
+    tmp_path: Path,
+) -> None:
+    environment = valid_chat_environ()
+    environment["OPENAI_API_KEY"] = "wrong-responses-key"
+
+    config = load_run_config(
+        task="inspect",
+        workspace=tmp_path,
+        model=None,
+        verify_command=None,
+        api_mode="chat-completions",
+        base_url="  https://provider.example/api/maas/v1  ",
+        environ=environment,
+    )
+
+    assert config.api_mode is ApiMode.CHAT_COMPLETIONS
+    assert config.base_url == "https://provider.example/api/maas/v1/"
+    assert config.api_key == CHAT_SECRET_SENTINEL
+    assert "wrong-responses-key" not in repr(config)
+    assert CHAT_SECRET_SENTINEL not in repr(config)
+    assert "provider.example" not in repr(config)
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "base_url", "message"),
+    [
+        (
+            "unknown",
+            None,
+            "api mode must be one of: responses, chat-completions",
+        ),
+        (
+            "responses",
+            "https://provider.example/v1",
+            "--base-url is not allowed with responses",
+        ),
+        (
+            "chat-completions",
+            None,
+            "--base-url is required with chat-completions",
+        ),
+        (
+            "chat-completions",
+            "   ",
+            "--base-url is required with chat-completions",
+        ),
+        (
+            "chat-completions",
+            "http://provider.example/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "provider.example/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "https:///api/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "https://user:pass@provider.example/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "https://provider.example/v1?region=x",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "https://provider.example/v1#section",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "\x00https://provider.example/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "\thttps://provider.example/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "https://provider.example/v1\tbad",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "https://provider.example/v1\u00a0bad",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "\x7fhttps://provider.example/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            r"https://provider.example/v1\bad",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            "https://provider.example:invalid/v1",
+            "--base-url must be an absolute HTTPS URL",
+        ),
+        (
+            "chat-completions",
+            42,
+            "--base-url must be an absolute HTTPS URL",
+        ),
+    ],
+)
+def test_config_rejects_invalid_mode_url_combinations_before_credentials(
+    tmp_path: Path,
+    api_mode: str,
+    base_url: object | None,
+    message: str,
+) -> None:
+    with pytest.raises(ConfigError, match=message) as caught:
+        load_run_config(
+            task="inspect",
+            workspace=tmp_path / "missing",
+            model=None,
+            verify_command=None,
+            api_mode=api_mode,
+            base_url=base_url,  # type: ignore[arg-type]
+            environ={},
+        )
+
+    rendered = str(caught.value)
+    assert "provider.example" not in rendered
+    assert SECRET_SENTINEL not in rendered
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "base_url", "environment", "missing_name"),
+    [
+        (
+            "responses",
+            None,
+            {
+                "OPENAI_MODEL": "model",
+                "CHAT_COMPLETIONS_API_KEY": CHAT_SECRET_SENTINEL,
+            },
+            "OPENAI_API_KEY",
+        ),
+        (
+            "chat-completions",
+            "https://provider.example/v1",
+            {
+                "OPENAI_MODEL": "model",
+                "OPENAI_API_KEY": SECRET_SENTINEL,
+            },
+            "CHAT_COMPLETIONS_API_KEY",
+        ),
+    ],
+)
+def test_mode_credentials_never_fall_back(
+    tmp_path: Path,
+    api_mode: str,
+    base_url: str | None,
+    environment: dict[str, str],
+    missing_name: str,
+) -> None:
+    with pytest.raises(ConfigError, match=missing_name):
+        load_run_config(
+            task="inspect",
+            workspace=tmp_path,
+            model=None,
+            verify_command=None,
+            api_mode=api_mode,
+            base_url=base_url,
+            environ=environment,
+        )
+
+
+def test_run_config_rejects_programmatic_responses_base_url(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ConfigError,
+        match="--base-url is not allowed with responses",
+    ):
+        RunConfig(
+            task="inspect",
+            workspace=tmp_path,
+            model="model",
+            api_key=SECRET_SENTINEL,
+            api_mode=ApiMode.RESPONSES,
+            base_url="https://provider.example/v1",
+        )
+
+
+def test_run_config_rejects_programmatic_chat_without_base_url(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ConfigError,
+        match="--base-url is required with chat-completions",
+    ):
+        RunConfig(
+            task="inspect",
+            workspace=tmp_path,
+            model="model",
+            api_key=CHAT_SECRET_SENTINEL,
+            api_mode=ApiMode.CHAT_COMPLETIONS,
+        )
 
 
 def test_config_cli_model_overrides_environment(tmp_path: Path) -> None:
@@ -216,6 +458,95 @@ def test_cli_accepts_valid_arguments(
     assert captured.err == ""
     assert captured.out == ""
     assert SECRET_SENTINEL not in captured.out
+
+
+def test_cli_accepts_explicit_chat_configuration(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    received: list[RunConfig] = []
+
+    def application(
+        config: RunConfig,
+        *,
+        stdout: TextIO,
+        stderr: TextIO,
+    ) -> int:
+        received.append(config)
+        return 0
+
+    code = main(
+        [
+            "inspect",
+            "--workspace",
+            str(tmp_path),
+            "--api-mode",
+            "chat-completions",
+            "--base-url",
+            "https://provider.example/api/v1",
+            "--model",
+            "chat-model",
+        ],
+        environ={"CHAT_COMPLETIONS_API_KEY": CHAT_SECRET_SENTINEL},
+        application=application,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 0
+    assert len(received) == 1
+    assert received[0].api_mode is ApiMode.CHAT_COMPLETIONS
+    assert received[0].base_url == "https://provider.example/api/v1/"
+    assert received[0].api_key == CHAT_SECRET_SENTINEL
+    assert CHAT_SECRET_SENTINEL not in captured.out + captured.err
+
+
+def test_responses_base_url_exits_two_before_application(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def forbidden_application(
+        config: RunConfig,
+        *,
+        stdout: TextIO,
+        stderr: TextIO,
+    ) -> int:
+        raise AssertionError("application must not run")
+
+    code = main(
+        [
+            "inspect",
+            "--workspace",
+            str(tmp_path),
+            "--api-mode",
+            "responses",
+            "--base-url",
+            "https://provider.example/v1",
+        ],
+        environ=valid_environ(),
+        application=forbidden_application,
+    )
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert captured.err == "error: --base-url is not allowed with responses\n"
+    assert SECRET_SENTINEL not in captured.err
+
+
+def test_cli_rejects_unknown_api_mode(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(
+            [
+                "inspect",
+                "--workspace",
+                str(tmp_path),
+                "--api-mode",
+                "unknown",
+            ],
+            environ=valid_environ(),
+        )
+
+    assert caught.value.code == 2
 
 
 def test_cli_missing_task_exits_two(tmp_path: Path) -> None:

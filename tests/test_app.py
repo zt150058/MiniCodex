@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from coding_agent.app import ApplicationFactories, production_factories, run_application
-from coding_agent.config import RunConfig, load_run_config
+from coding_agent.config import ApiMode, RunConfig, load_run_config
 from coding_agent.logging import (
     EventType,
     RunEvent,
@@ -22,6 +22,7 @@ from coding_agent.tools.base import ExecutionContext, ToolExecution
 
 
 FAKE_KEY = "task13-obviously-fake-key"
+CHAT_FAKE_KEY = "task15-chat-obviously-fake-key"
 
 
 class RecordingExecutor:
@@ -114,6 +115,18 @@ def _config(workspace: Path) -> RunConfig:
     )
 
 
+def _chat_config(workspace: Path) -> RunConfig:
+    return load_run_config(
+        task="repair chat demo",
+        workspace=workspace,
+        model="chat-model",
+        verify_command="pytest -q",
+        api_mode="chat-completions",
+        base_url="https://provider.example/api/v1",
+        environ={"CHAT_COMPLETIONS_API_KEY": CHAT_FAKE_KEY},
+    )
+
+
 def _successful_factories() -> ApplicationFactories:
     executor = RecordingExecutor()
 
@@ -135,7 +148,7 @@ def _successful_factories() -> ApplicationFactories:
 
 def test_production_factory_selects_responses_adapter_without_request(
     tmp_path: Path,
-    monkeypatch: object,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _config(tmp_path)
     calls: list[tuple[str, str]] = []
@@ -145,9 +158,18 @@ def test_production_factory_selects_responses_adapter_without_request(
         calls.append((model, api_key))
         return stand_in
 
-    monkeypatch.setattr(  # type: ignore[attr-defined]
+    def forbidden_chat_constructor(
+        *, model: str, api_key: str, base_url: str
+    ) -> ModelClient:
+        raise AssertionError("Chat adapter must not be constructed")
+
+    monkeypatch.setattr(
         "coding_agent.app.OpenAIResponsesClient",
         fake_constructor,
+    )
+    monkeypatch.setattr(
+        "coding_agent.app.ChatCompletionsModelClient",
+        forbidden_chat_constructor,
     )
 
     selected = production_factories().model_client(config)
@@ -155,6 +177,68 @@ def test_production_factory_selects_responses_adapter_without_request(
     assert selected is stand_in
     assert calls == [(config.model, config.api_key)]
     assert stand_in.requests == ()
+
+
+def test_production_factory_selects_chat_adapter_without_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _chat_config(tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    stand_in = FakeModelClient((ModelResponse(text="unused"),))
+
+    def fake_chat_constructor(
+        *, model: str, api_key: str, base_url: str
+    ) -> ModelClient:
+        calls.append((model, api_key, base_url))
+        return stand_in
+
+    def forbidden_responses_constructor(
+        *, model: str, api_key: str
+    ) -> ModelClient:
+        raise AssertionError("Responses adapter must not be constructed")
+
+    monkeypatch.setattr(
+        "coding_agent.app.ChatCompletionsModelClient",
+        fake_chat_constructor,
+    )
+    monkeypatch.setattr(
+        "coding_agent.app.OpenAIResponsesClient",
+        forbidden_responses_constructor,
+    )
+
+    selected = production_factories().model_client(config)
+
+    assert config.api_mode is ApiMode.CHAT_COMPLETIONS
+    assert selected is stand_in
+    assert calls == [(config.model, config.api_key, config.base_url)]
+    assert stand_in.requests == ()
+
+
+def test_chat_key_is_absent_from_config_output_report_and_jsonl(
+    tmp_path: Path,
+) -> None:
+    config = _chat_config(tmp_path)
+    stdout = StringIO()
+    stderr = StringIO()
+
+    code = run_application(
+        config,
+        stdout=stdout,
+        stderr=stderr,
+        factories=_successful_factories(),
+    )
+
+    payload = json.loads(stdout.getvalue())
+    log_path = tmp_path / payload["log_path"]
+    rendered = (
+        repr(config)
+        + stdout.getvalue()
+        + stderr.getvalue()
+        + log_path.read_text(encoding="utf-8")
+    )
+    assert code == 0
+    assert CHAT_FAKE_KEY not in rendered
 
 
 def test_composition_uses_fixed_tools_and_shared_executor(tmp_path: Path) -> None:

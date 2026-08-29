@@ -1,6 +1,6 @@
 # MiniCodex 使用说明
 
-MiniCodex 是一次性运行的本地 Coding Agent。它在用户指定的工作区内读取和修改 UTF-8 文本、执行受控命令，并由本地验证门决定任务是否成功。项目入口见[仓库首页](../README.md)，模型接入细节见 [OpenAI API 说明](OPENAI_API.md)。
+MiniCodex 是一次性运行的本地 Coding Agent。它在用户指定的工作区内读取和修改 UTF-8 文本、执行受控命令，并由本地验证门决定任务是否成功。模型层默认使用 OpenAI Responses，也可显式选择 compatible Chat Completions。项目入口见[仓库首页](../README.md)，模型接入细节见 [API 说明](OPENAI_API.md)。
 
 ## 功能与适用场景
 
@@ -13,7 +13,7 @@ MiniCodex 是一次性运行的本地 Coding Agent。它在用户指定的工作
 - Windows 优先；当前版本不承诺 Linux 或 macOS 支持。
 - Python 3.11+。
 - 生产依赖为官方 `openai` Python 包，测试依赖为 pytest。
-- 默认自动测试完全离线，不需要真实 API key。
+- 默认自动测试完全离线，不需要真实 API key，也不会探测 endpoint。
 
 ## Windows PowerShell 安装
 
@@ -30,14 +30,15 @@ coding-agent --help
 
 ## 工作区与凭据准备
 
-工作区必须是已存在的目录。建议复制原项目并保留备份，再把副本传给 `--workspace`。在当前 PowerShell 会话配置凭据和模型：
+工作区必须是已存在的目录。建议复制原项目并保留备份，再把副本传给 `--workspace`。在当前 PowerShell 会话配置模型和所选 API mode 对应的凭据：
 
 ```powershell
-$env:OPENAI_API_KEY = '<your-api-key>'
-$env:OPENAI_MODEL = '<model-id-available-to-your-account>'
+$env:OPENAI_API_KEY = '<openai-api-key>'
+$env:CHAT_COMPLETIONS_API_KEY = '<chat-completions-provider-key>'
+$env:OPENAI_MODEL = '<model-id>'
 ```
 
-不要把 API key 放进源代码、CLI 参数、Git、日志、截图或视频。模型也可以通过 `--model` 提供，此时它覆盖 `OPENAI_MODEL`。
+只需配置所选 mode 的 key：`responses` 只读取 `OPENAI_API_KEY`，`chat-completions` 只读取 `CHAT_COMPLETIONS_API_KEY`，两者不互相回退。不要把 API key 放进源代码、CLI 参数、Git、日志、截图或视频。模型也可以通过 `--model` 提供，此时它覆盖 `OPENAI_MODEL`。
 
 ## CLI 参数
 
@@ -46,33 +47,37 @@ $env:OPENAI_MODEL = '<model-id-available-to-your-account>'
 | `task` | 是 | 交给本地 Agent 的一次性编程任务。 |
 | `--workspace` | 是 | 目标工作区目录；启动时规范化并执行安全检查。 |
 | `--verify` | 否 | 用户指定的强制最终验证命令；启动前使用同一命令策略授权。 |
-| `--model` | 否 | OpenAI 模型 ID；覆盖 `OPENAI_MODEL`。 |
+| `--model` | 否 | 模型 ID；覆盖 `OPENAI_MODEL`。 |
+| `--api-mode` | 否 | 只接受 `responses` 或 `chat-completions`；默认 `responses`。 |
+| `--base-url` | 仅 Chat | compatible Chat Completions 的绝对 HTTPS API 前缀。 |
 | `-h` / `--help` | 否 | 显示帮助并退出。 |
 
-当前解析器没有交互模式、fake 模式或恢复会话参数。
+`responses + --base-url` 是非法配置，不会静默忽略；`chat-completions` 必须提供 `--base-url`。当前解析器没有交互模式、fake 模式或恢复会话参数。
 
 ## 最小运行示例
 
 ```powershell
-coding-agent "检查项目并修复失败测试" --workspace . --model '<model-id-available-to-your-account>'
+coding-agent "修复失败测试" --workspace . --api-mode responses --model '<openai-model-id>' --verify "pytest -q"
+
+coding-agent "修复失败测试" --workspace . --api-mode chat-completions --base-url '<https-provider-base-url-with-api-prefix>' --model '<compatible-model-id>' --verify "pytest -q"
 ```
 
-未提供 `--verify` 时，模型必须通过 `run_command` 选择经过本地安全策略允许且 `purpose="verification"` 的可信命令。目录查看、echo 和 `git status` 不能成为成功证据。
+`responses` 可省略 `--api-mode`。未提供 `--verify` 时，模型必须通过 `run_command` 选择经过本地安全策略允许且 `purpose="verification"` 的可信命令。目录查看、echo 和 `git status` 不能成为成功证据。
 
 ## 推荐的安全运行示例
 
 在已备份的项目副本中固定验证命令：
 
 ```powershell
-coding-agent "修复当前项目中的失败测试" --workspace . --model '<model-id-available-to-your-account>' --verify "pytest -q"
+coding-agent "修复当前项目中的失败测试" --workspace . --api-mode responses --model '<openai-model-id>' --verify "pytest -q"
 ```
 
 `--verify "pytest -q"` 在启动阶段授权。每个完成候选都会在工具和时间预算允许时执行这条固定命令；非零退出码会回流给模型继续修复，而不会被当作成功。
 
 ## Agent 运行流程
 
-1. CLI 校验任务、工作区、模型、凭据和可选验证命令。
-2. composition root 创建共享工作区、命令执行器、工具注册表、模型客户端、上下文管理器、终止策略、验证门和事件日志器。
+1. CLI 在联网前校验任务、工作区、API mode、base URL、模式专用凭据、模型和可选验证命令。
+2. composition root 只构造所选模型适配器，以及共享工作区、命令执行器、工具注册表、上下文管理器、终止策略、验证门和事件日志器。
 3. Agent 根据本地历史请求模型；超过字符或历史项阈值时生成结构化摘要，失败则使用确定性 fallback。
 4. 工具调用按响应顺序进行本地校验、授权、执行和观察，结果通过 `call_id` 配对写回历史。
 5. 文件修改增加 mutation index，并使旧验证状态失效。
@@ -104,7 +109,7 @@ SUCCESS 不由模型文字决定。最新验证必须在最后一次文件修改
 
 ## JSONL 日志与 FinalReport
 
-每次已启动运行的事件写入 `.coding-agent/logs/<run_id>.jsonl`。事件按连续 sequence 记录模型调用元数据、工具调用/结果、安全拒绝、压缩、验证和终止事实；不记录完整任务文本、工具原始内容、环境全集、API key、认证头、continuation 或隐藏推理。
+每次已启动运行的事件写入 `.coding-agent/logs/<run_id>.jsonl`。事件按连续 sequence 记录模型调用元数据、工具调用/结果、安全拒绝、压缩、验证和终止事实；不记录完整任务文本、工具原始内容、环境全集、API key、认证头、continuation 或隐藏推理。`OPENAI_API_KEY` 和 `CHAT_COMPLETIONS_API_KEY` 都会从 `run_command` 子进程环境中移除。
 
 进程在 stdout 输出一个有界 JSON FinalReport，其中包含状态、退出码、终止原因、修改路径、验证证据、计数、日志相对路径和审计失败代码。报告与 JSONL 使用同一执行状态。
 
@@ -116,17 +121,26 @@ SUCCESS 不由模型文字决定。最新验证必须在最后一次文件修改
 .\.venv\Scripts\python.exe -m pytest tests\integration\test_agent_repair.py -q -p no:cacheprovider
 ```
 
+Chat 连续 Agent 循环合同位于 `tests/integration/test_chat_completions_agent.py`，使用真实 AgentRunner、ContextManager 和 Chat 适配器，只把最外层 SDK 换成 fake：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\integration\test_chat_completions_agent.py -q -p no:cacheprovider
+```
+
 完整离线测试：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
 ```
 
-这些 pytest 命令不会调用真实 OpenAI API。
+这些 pytest 命令不会调用真实模型 API。
 
 ## 常见错误与排查
 
 - `OPENAI_API_KEY is not configured`：只在当前会话配置环境变量，不要打印其值。
+- `CHAT_COMPLETIONS_API_KEY is not configured`：Chat mode 只读取该变量，不回退到 OpenAI key。
+- `--base-url is not allowed with responses`：移除 base URL，Responses 始终使用官方默认 endpoint。
+- `--base-url is required with chat-completions`：提供包含 API 前缀的绝对 HTTPS URL。
 - `model is not configured`：设置 `OPENAI_MODEL` 或传 `--model`。
 - `workspace rejected`：确认目录存在，且路径没有非法设备名、受保护组件或 reparse point。
 - `--verify rejected`：命令不在安全白名单、包含控制符，或不是可信验证命令。
@@ -142,5 +156,7 @@ SUCCESS 不由模型文字决定。最新验证必须在最后一次文件修改
 ## 安全边界和已知限制
 
 路径和命令限制由确定性本地代码执行，包含工作区约束、受保护目录、Windows reparse point 检查、有限命令集、固定 cwd、`shell=False`、超时和输出上限。
+
+`--base-url` 可配置不代表兼容所有服务。compatible endpoint 必须支持标准 Chat Completions assistant `tool_calls`、非空函数 call ID、strict function schema，以及用 `tool_call_id` 配对的 `role=tool` 结果；本项目不会根据 URL 猜测、探测或自动切换 API mode。
 
 这不是操作系统级沙箱。被允许执行的工作区脚本、pytest 配置和测试会作为可信代码运行，仍可能访问操作系统资源；策略也不能消除所有检查与使用之间的 TOCTOU 风险。请只处理可信项目，并使用可丢弃、已备份的工作区副本。

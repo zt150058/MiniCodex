@@ -301,6 +301,25 @@ def test_run_command_does_not_pass_openai_api_key(
     assert "must-not-reach-child" not in (execution.output or "")
 
 
+def test_run_command_does_not_pass_chat_completions_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "CHAT_COMPLETIONS_API_KEY",
+        "chat-key-must-not-reach-child",
+    )
+    execution = _execute_script(
+        tmp_path,
+        "import os\n"
+        "print(os.environ.get('CHAT_COMPLETIONS_API_KEY', '<absent>'))\n",
+    )
+    payload = json.loads(execution.output or "")
+    if payload["stdout"] != "<absent>\r\n":
+        pytest.fail("Chat Completions credential reached child process")
+    assert "chat-key-must-not-reach-child" not in (execution.output or "")
+
+
 @pytest.mark.parametrize(
     ("argv", "code"),
     [
@@ -711,6 +730,8 @@ def test_process_launch_uses_shell_false_fixed_cwd_and_sanitized_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "not-for-child")
+    monkeypatch.setenv("ChAt_Completions_Api_Key", "also-not-for-child")
+    monkeypatch.setenv("MINICODEX_SAFE_TEST_VALUE", "preserved")
     script = tmp_path / "observed.py"
     script.write_text("print('ok')\n", encoding="utf-8")
     observed: dict[str, object] = {}
@@ -734,7 +755,13 @@ def test_process_launch_uses_shell_false_fixed_cwd_and_sanitized_environment(
     assert observed["stdin"] is subprocess.DEVNULL
     environment = observed["env"]
     assert isinstance(environment, dict)
-    assert "OPENAI_API_KEY" not in environment
+    folded_environment = {
+        key.casefold(): value for key, value in environment.items()
+    }
+    assert "openai_api_key" not in folded_environment
+    if "chat_completions_api_key" in folded_environment:
+        pytest.fail("Chat Completions credential reached captured child environment")
+    assert folded_environment["minicodex_safe_test_value"] == "preserved"
     assert environment["PYTHONUTF8"] == "1"
     assert environment["PYTHONIOENCODING"] == "utf-8"
     assert environment["PYTHONUNBUFFERED"] == "1"
@@ -904,6 +931,7 @@ def test_child_environment_removes_policy_widening_values(
 ) -> None:
     for key, value in {
         "OPENAI_API_KEY": "secret",
+        "ChAt_Completions_Api_Key": "chat-secret",
         "PYTHONPATH": "outside",
         "PYTHONHOME": "outside",
         "PYTEST_ADDOPTS": "-p dangerous",
@@ -945,7 +973,7 @@ def test_child_environment_removes_policy_widening_values(
     assert isinstance(environment, dict)
     folded = {key.casefold() for key in environment}
     for denied in {
-        "openai_api_key", "pythonpath", "pythonhome", "pytest_addopts",
+        "openai_api_key", "chat_completions_api_key", "pythonpath", "pythonhome", "pytest_addopts",
         "pytest_plugins", "mypypath", "mypy_config_file", "git_dir", "git_work_tree", "git_object_directory",
         "git_alternate_object_directories", "git_external_diff",
         "git_ssh", "git_ssh_command", "git_askpass", "ssh_askpass",
