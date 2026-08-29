@@ -81,6 +81,9 @@ class RunEvent:
         )
 
 
+RunEventObserver = Callable[[RunEvent], None]
+
+
 @dataclass(slots=True)
 class TokenUsageTotals:
     input_tokens: int = 0
@@ -469,6 +472,7 @@ class RunEventLogger(ModelObservationSink):
         self._provider_attempts_observed = 0
         self._poisoned = False
         self._closed = False
+        self._event_observer: RunEventObserver | None = None
 
     @classmethod
     def create(
@@ -558,6 +562,13 @@ class RunEventLogger(ModelObservationSink):
     def metadata(self) -> RunMetadata:
         return self._metadata
 
+    def set_event_observer(self, observer: RunEventObserver | None) -> None:
+        if self._closed or self._sequence != 0:
+            raise RunLogError("event_observer_unavailable")
+        if observer is not None and not callable(observer):
+            raise TypeError("observer must be callable or null")
+        self._event_observer = observer
+
     def emit(self, event_type: EventType, data: JSONObject) -> RunEvent:
         if self._poisoned or self._closed:
             raise RunLogError("log_unavailable")
@@ -598,6 +609,11 @@ class RunEventLogger(ModelObservationSink):
             self._metadata.log_failure_code = "log_flush_failed"
             raise RunLogError("log_flush_failed") from None
         self._sequence = event.sequence
+        if self._event_observer is not None:
+            try:
+                self._event_observer(event)
+            except Exception:
+                pass
         return event
 
     def observe_model(self, observation: ModelObservation) -> None:

@@ -87,6 +87,8 @@ class AgentState:
         task: str,
         workspace: Path,
         started_at_monotonic: float,
+        *,
+        initial_user_message: str | None = None,
     ) -> AgentState:
         if (
             isinstance(started_at_monotonic, bool)
@@ -97,10 +99,15 @@ class AgentState:
             raise ValueError(
                 "started_at_monotonic must be a non-negative finite number"
             )
-        user_message = UserMessage(task)
+        task_message = UserMessage(task)
+        user_message = (
+            task_message
+            if initial_user_message is None
+            else UserMessage(initial_user_message)
+        )
         return cls(
-            task=user_message.content,
-            current_goal=user_message.content,
+            task=task_message.content,
+            current_goal=task_message.content,
             messages=(user_message,),
             workspace=Path(workspace),
             started_at_monotonic=float(started_at_monotonic),

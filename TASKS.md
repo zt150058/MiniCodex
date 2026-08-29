@@ -736,7 +736,130 @@
 
 **当前状态**
 
+`已完成`
+
+## 19. 会话领域与 SQLite 持久化
+
+**任务目标**
+
+建立工作区本地的会话领域模型、SQLite 历史仓库和独占进程租约，使多个顺序 Agent run 能够持久保存安全叙事，同时不恢复或重放中断的执行状态。
+
+**涉及模块**
+
+- `src/coding_agent/session.py`
+- `src/coding_agent/session_store.py`
+- `tests/test_session.py`
+- `tests/test_session_store.py`
+
+**验收标准**
+
+- 会话、运行、事件和终止结果使用严格、不可变、供应商中立的数据类型。
+- 标题由第一条用户消息确定性生成，已知敏感值在持久化前脱敏。
+- 数据库固定为工作区内 `.coding-agent/sessions.sqlite3`，schema 通过 `PRAGMA user_version` 管理。
+- `.coding-agent`、数据库和锁路径拒绝 symlink、junction 和 reparse point。
+- Windows 上使用真实非阻塞进程锁；同一工作区同时只能有一个控制器租约。
+- 创建、顺序 follow-up、启动、取消、完成和恢复均使用原子事务。
+- 数据库层和部分唯一索引共同保证整个工作区最多一个 queued、running 或 cancelling run。
+- 进程重启只把未完成 run 稳定映射为 interrupted，不重新调用 Agent、模型、工具或验证。
+- SQLite 只保存严格安全的报告投影，不保存完整 FinalReport 的 completion、failure、命令、stdout 或 stderr 证据。
+- 默认测试完全离线，不新增依赖。
+
+**需要编写的测试**
+
+- 标题、ID、时间、枚举、记录不变量和 repr 隐私测试。
+- 安全 run summary 与持久化报告投影 allowlist 测试。
+- schema、WAL、外键、版本、损坏数据和事务回滚测试。
+- 会话列表、run ordinal、event sequence 和 narrative 投影顺序测试。
+- active-run 唯一约束和非法状态转换零副作用测试。
+- Windows reparse point 和真实进程锁测试。
+- 重启恢复不执行 Agent 的测试。
+
+**建议的 Git 提交说明**
+
+`feat: add durable workspace sessions`
+
+**当前状态**
+
+`已完成`
+
+## 20. 单活动运行控制器与 GUI 安全事件桥
+
+**任务目标**
+
+在既有 AgentRunner 外增加框架无关的单活动运行控制器、顺序多轮会话、协作式取消和有界 UI 安全事件桥，为后续本地 GUI 提供稳定后端边界。
+
+**涉及模块**
+
+- `src/coding_agent/session_events.py`
+- `src/coding_agent/session_runtime.py`
+- `src/coding_agent/session_controller.py`
+- `src/coding_agent/state.py`
+- `src/coding_agent/agent.py`
+- `src/coding_agent/logging.py`
+- `src/coding_agent/app.py`
+- 对应离线测试
+
+**验收标准**
+
+- 每个会话允许顺序提交消息，但每条消息创建全新的 Agent 状态、预算、验证和 continuation 生命周期。
+- 旧会话只以一个确定性初始 UserMessage 进入新 run，不注入旧 tool call、ToolResult、call_id、provider payload 或 continuation。
+- 同一控制器只有一个非 daemon worker，运行期间拒绝第二个任务且不建立任务队列。
+- 取消使用令牌线性化和操作边界检查，不强杀线程；已准入操作可完成，后续操作不得准入。
+- 取消后的未执行工具调用仍生成稳定配对的 rejected ToolResult。
+- confirmed assistant text 可持久化；stream delta 只在内存中暂存，discard 后不得写入 SQLite。
+- UI 更新使用严格供应商中立 schema、确定序号、有界条目和字节容量，并支持 replay、wait 和 reset-required。
+- RunEventLogger 只在成功 flush 后通知观察器；持久化观察失败使控制器降级但不冒泡为模型错误。
+- store、lease 和 executor 必须指向同一规范化工作区。
+- CLI、模型 provider、安全策略、验证成功路径和 FinalReport 行为保持兼容。
+- 不实现 HTTP/SSE、GUI、Skill、MCP、并行 Agent 或恢复执行。
+
+**需要编写的测试**
+
+- 初始历史渲染、上下文预算和 fresh-run 隔离测试。
+- 事件 schema、隐私、序号、容量、replay 和 wait 测试。
+- 模型、摘要、工具和验证边界的取消测试。
+- 取消线性化、幂等取消、有限 shutdown 和线程启动失败测试。
+- provisional/confirmed/discarded streaming 生命周期测试。
+- observer、存储、finalization、重启恢复和 degraded 状态测试。
+- CLI、provider、上下文、安全、验证、日志和报告全量回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: add session run controller and event bridge`
+
+**当前状态**
+
 `进行中`
+
+## 21. 声明式 Skill 目录与选择
+
+**任务目标**
+
+在后续独立设计和审批后，增加只读声明式 Skill 发现、显式选择、会话持久化和运行时不可变指令快照；本任务不属于当前 Task 19–20 实施范围。
+
+**涉及模块**
+
+- 待后续 brainstorming 和 writing-plans 锁定
+
+**验收标准**
+
+- 只加载受信本地目录中的声明式 Skill 文档。
+- Skill 选择显式、确定并可持久化到会话。
+- 每个 run 使用不可变 Skill 指令快照。
+- Skill 不能绕过工具注册、安全策略、验证门或终止预算。
+- 不在本任务内加入可执行插件、MCP、市场或远程下载。
+
+**需要编写的测试**
+
+- 后续批准计划将锁定发现、解析、选择、快照、隐私和安全回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: add declarative skill catalog`
+
+**当前状态**
+
+`未开始`
 
 ## 任务完成规则
 

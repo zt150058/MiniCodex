@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import hashlib
 import time
+from typing import TypeAlias
 
 from coding_agent.context import ContextManager, ContextPreparationError
 from coding_agent.logging import EventSink, EventType, RunLogError
@@ -11,6 +12,7 @@ from coding_agent.messages import (
     ModelRequest,
     ToolCall,
     ToolResult,
+    UserMessage,
 )
 from coding_agent.model import (
     FatalModelError,
@@ -41,6 +43,10 @@ from coding_agent.verification import (
     VerificationOutcome,
     VerificationResult,
 )
+
+
+ConfirmedTextHandler: TypeAlias = Callable[[str], None]
+CancellationCheck: TypeAlias = Callable[[], bool]
 
 
 def _record_successful_mutation(
@@ -78,6 +84,9 @@ class AgentRunner:
         event_sink: EventSink | None = None,
         instructions: str | None = None,
         stream_handler: ModelStreamHandler | None = None,
+        initial_user_message: str | None = None,
+        confirmed_text_handler: ConfirmedTextHandler | None = None,
+        cancellation_requested: CancellationCheck | None = None,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable")
@@ -87,6 +96,16 @@ class AgentRunner:
             raise ValueError("instructions must be a non-empty string or null")
         if stream_handler is not None and not callable(stream_handler):
             raise TypeError("stream_handler must be callable or null")
+        if initial_user_message is not None:
+            UserMessage(initial_user_message)
+        if confirmed_text_handler is not None and not callable(
+            confirmed_text_handler
+        ):
+            raise TypeError("confirmed_text_handler must be callable or null")
+        if cancellation_requested is not None and not callable(
+            cancellation_requested
+        ):
+            raise TypeError("cancellation_requested must be callable or null")
         self._model_client = model_client
         self._tool_registry = tool_registry
         self._execution_context = execution_context
@@ -99,6 +118,9 @@ class AgentRunner:
         self._event_sink = event_sink
         self._instructions = instructions
         self._stream_handler = stream_handler
+        self._initial_user_message = initial_user_message
+        self._confirmed_text_handler = confirmed_text_handler
+        self._cancellation_requested = cancellation_requested
 
     def _emit(self, event_type: EventType, data: dict[str, object]) -> None:
         if self._event_sink is not None:
@@ -185,6 +207,30 @@ class AgentRunner:
                 ),
             )
 
+    def _is_cancellation_requested(self) -> bool:
+        if self._cancellation_requested is None:
+            return False
+        requested = self._cancellation_requested()
+        if not isinstance(requested, bool):
+            raise TypeError("cancellation_requested must return bool")
+        return requested
+
+    def _interrupt(
+        self,
+        state: AgentState,
+        pending_calls: tuple[ToolCall, ...] = (),
+    ) -> AgentState:
+        if pending_calls:
+            self._append_unexecuted_results(
+                state,
+                pending_calls,
+                TerminationReason.USER_INTERRUPTED,
+            )
+        state.status = AgentStatus.INTERRUPTED
+        state.termination_reason = TerminationReason.USER_INTERRUPTED
+        state.failure_reason = TerminationReason.USER_INTERRUPTED.value
+        return state
+
     @staticmethod
     def _record_tool_observation(
         state: AgentState,
@@ -228,6 +274,7 @@ class AgentRunner:
             task,
             self._execution_context.workspace,
             self._clock(),
+            initial_user_message=self._initial_user_message,
         )
         limits = self._termination_policy.limits
         budget = ModelCallBudget(
@@ -292,6 +339,8 @@ class AgentRunner:
     ) -> AgentState:
 
         while state.status is AgentStatus.RUNNING:
+            if self._is_cancellation_requested():
+                return self._interrupt(state)
             reason = self._policy_reason(state, NextOperation.MODEL)
             if reason is not None:
                 return self._terminate(state, reason)
@@ -371,9 +420,14 @@ class AgentRunner:
                 )
                 if self._event_sink is not None:
                     self._event_sink.metadata.context_compression_count += 1
+                if self._is_cancellation_requested():
+                    return self._interrupt(state)
                 reason = self._policy_reason(state, NextOperation.MODEL)
                 if reason is not None:
                     return self._terminate(state, reason)
+
+            if self._is_cancellation_requested():
+                return self._interrupt(state)
 
             request = ModelRequest(
                 messages=state.messages,
@@ -415,6 +469,8 @@ class AgentRunner:
                 if response.text is not None and response.text.strip()
                 else None
             )
+            if assistant_text is not None and self._confirmed_text_handler is not None:
+                self._confirmed_text_handler(assistant_text)
             if response.tool_calls:
                 state.messages += (
                     AssistantMessage(
@@ -422,7 +478,11 @@ class AgentRunner:
                         tool_calls=response.tool_calls,
                     ),
                 )
+                if self._is_cancellation_requested():
+                    return self._interrupt(state, response.tool_calls)
                 for index, call in enumerate(response.tool_calls):
+                    if self._is_cancellation_requested():
+                        return self._interrupt(state, response.tool_calls[index:])
                     reason = self._policy_reason(state, NextOperation.TOOL)
                     if reason is not None:
                         self._append_unexecuted_results(
@@ -511,8 +571,15 @@ class AgentRunner:
                                     "command_hash": self._hash_text(evidence.command),
                                 },
                             )
+                    if self._is_cancellation_requested():
+                        return self._interrupt(
+                            state,
+                            response.tool_calls[index + 1 :],
+                        )
                 continue
 
+            if self._is_cancellation_requested():
+                return self._interrupt(state)
             if assistant_text is not None:
                 state.messages += (AssistantMessage(content=assistant_text),)
                 state.status = AgentStatus.COMPLETION_CANDIDATE
@@ -529,6 +596,8 @@ class AgentRunner:
                 gate = self._verification_gate
                 if gate is None:
                     return state
+                if self._is_cancellation_requested():
+                    return self._interrupt(state)
                 if gate.requires_execution:
                     reason = self._policy_reason(state, NextOperation.TOOL)
                     if reason is not None:
@@ -563,6 +632,8 @@ class AgentRunner:
                         state,
                         TerminationReason.INTERNAL_INVARIANT,
                     )
+                if self._is_cancellation_requested():
+                    return self._interrupt(state)
                 if gate.requires_execution and decision.result is not None:
                     self._emit(
                         EventType.VERIFICATION_COMPLETED,

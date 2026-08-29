@@ -49,6 +49,75 @@ class FakeMonotonicClock:
         return next(self._values)
 
 
+def test_event_observer_runs_only_after_line_is_flushed(tmp_path: Path) -> None:
+    observed: list[tuple[RunEvent, str]] = []
+    logger = RunEventLogger.create(tmp_path, run_id="1" * 32)
+
+    def observer(event: RunEvent) -> None:
+        log_path = tmp_path / logger.metadata.log_path
+        observed.append((event, log_path.read_text(encoding="utf-8")))
+
+    logger.set_event_observer(observer)
+    event = logger.emit(
+        EventType.RUN_STARTED,
+        {"task_chars": 4, "mutation_index": 0},
+    )
+    assert observed[0][0] == event
+    assert json.loads(observed[0][1].splitlines()[-1])["sequence"] == event.sequence
+    logger.close()
+
+
+def test_ordinary_event_observer_failure_does_not_poison_audit_log(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def observer(_: RunEvent) -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError("private bridge detail")
+
+    logger = RunEventLogger.create(tmp_path, run_id="2" * 32)
+    logger.set_event_observer(observer)
+    first = logger.emit(
+        EventType.RUN_STARTED,
+        {"task_chars": 4, "mutation_index": 0},
+    )
+    second = logger.emit(
+        EventType.RUN_COMPLETED,
+        {
+            "status": "failed",
+            "termination_reason": "empty_model_response",
+            "logical_model_calls": 1,
+            "provider_attempts": 1,
+            "tool_calls": 0,
+            "verification_attempts": 0,
+            "mutation_index": 0,
+            "validation_index": None,
+            "elapsed_ms": 1,
+        },
+    )
+    logger.close()
+    assert (first.sequence, second.sequence, calls) == (1, 2, 2)
+    text = (tmp_path / logger.metadata.log_path).read_text(encoding="utf-8")
+    assert "private bridge detail" not in text
+    assert len(text.splitlines()) == 2
+
+
+def test_event_observer_system_exit_is_not_swallowed(tmp_path: Path) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="3" * 32)
+    logger.set_event_observer(
+        lambda _: (_ for _ in ()).throw(SystemExit(7))
+    )
+    with pytest.raises(SystemExit) as captured:
+        logger.emit(
+            EventType.RUN_STARTED,
+            {"task_chars": 4, "mutation_index": 0},
+        )
+    assert captured.value.code == 7
+    logger.close()
+
+
 def test_jsonl_has_deterministic_envelope_sequence_utf8_and_newline(
     tmp_path: Path,
 ) -> None:

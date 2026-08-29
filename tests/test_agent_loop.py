@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Event
 
 import pytest
 from openai import RateLimitError
@@ -69,6 +70,9 @@ def _runner(
     verification_gate: VerificationGate | None = None,
     event_sink: object | None = None,
     instructions: str | None = None,
+    initial_user_message: str | None = None,
+    confirmed_text_handler: Callable[[str], None] | None = None,
+    cancellation_requested: Callable[[], bool] | None = None,
 ) -> tuple[AgentRunner, FakeModelClient]:
     client = FakeModelClient(responses)
     runner = AgentRunner(
@@ -85,8 +89,203 @@ def _runner(
         verification_gate=verification_gate,
         event_sink=event_sink,  # type: ignore[arg-type]
         instructions=instructions,
+        initial_user_message=initial_user_message,
+        confirmed_text_handler=confirmed_text_handler,
+        cancellation_requested=cancellation_requested,
     )
     return runner, client
+
+
+def test_rendered_initial_message_does_not_replace_current_task(tmp_path: Path) -> None:
+    rendered = (
+        "coding-agent session context\n"
+        '{"prior":[{"role":"assistant","content":"old result"}]}\n'
+        "current request\nfix the new failure"
+    )
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="done"),),
+        initial_user_message=rendered,
+    )
+    state = runner.run("fix the new failure")
+    assert state.task == "fix the new failure"
+    assert state.current_goal == "fix the new failure"
+    assert client.requests[0].messages[0] == UserMessage(rendered)
+    assert all(not isinstance(item, ToolResult) for item in client.requests[0].messages)
+
+
+@pytest.mark.parametrize("initial", ["", "   ", 3])
+def test_rendered_initial_message_is_strict(tmp_path: Path, initial: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        AgentRunner(
+            model_client=FakeModelClient((ModelResponse(text="done"),)),
+            tool_registry=ToolRegistry(()),
+            execution_context=ExecutionContext(tmp_path),
+            initial_user_message=initial,  # type: ignore[arg-type]
+        )
+
+
+def test_confirmed_text_handler_receives_each_complete_main_text(
+    tmp_path: Path,
+) -> None:
+    seen: list[str] = []
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(text="I will inspect", tool_calls=(_record_call(1),)),
+            ModelResponse(text="Finished"),
+        ),
+        tools=(RecordingTool(ToolExecution(output="one")),),
+        confirmed_text_handler=seen.append,
+    )
+    state = runner.run("repair")
+    assert state.completion_text == "Finished"
+    assert seen == ["I will inspect", "Finished"]
+
+
+def test_confirmed_text_handler_ignores_empty_and_failed_responses(
+    tmp_path: Path,
+) -> None:
+    seen: list[str] = []
+    runner, _ = _runner(
+        tmp_path,
+        (TransientModelError("hidden"), ModelResponse()),
+        confirmed_text_handler=seen.append,
+    )
+    state = runner.run("repair")
+    assert state.status is AgentStatus.FAILED
+    assert seen == []
+
+
+def test_confirmed_text_handler_system_exit_is_not_swallowed(
+    tmp_path: Path,
+) -> None:
+    def exit_handler(_: str) -> None:
+        raise SystemExit(19)
+
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="done"),),
+        confirmed_text_handler=exit_handler,
+    )
+    with pytest.raises(SystemExit) as captured:
+        runner.run("repair")
+    assert captured.value.code == 19
+
+
+def test_cooperative_cancel_before_model_starts_no_operation(tmp_path: Path) -> None:
+    cancel = Event()
+    cancel.set()
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="must not run"),),
+        cancellation_requested=cancel.is_set,
+    )
+    state = runner.run("stop")
+    assert state.status is AgentStatus.INTERRUPTED
+    assert state.termination_reason is TerminationReason.USER_INTERRUPTED
+    assert client.requests == ()
+    assert state.logical_model_call_count == 0
+    assert state.tool_call_count == 0
+
+
+def test_cancel_after_model_confirms_text_and_pairs_unexecuted_tools(
+    tmp_path: Path,
+) -> None:
+    cancel = Event()
+    seen: list[str] = []
+
+    class CancellingModel:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            cancel.set()
+            return ModelResponse(
+                text="complete text",
+                tool_calls=(_record_call(1), _record_call(2)),
+            )
+
+    tool = RecordingTool(ToolExecution(output="never"))
+    runner = AgentRunner(
+        model_client=CancellingModel(),
+        tool_registry=ToolRegistry((tool,)),
+        execution_context=ExecutionContext(tmp_path),
+        cancellation_requested=cancel.is_set,
+        confirmed_text_handler=seen.append,
+    )
+    state = runner.run("stop after model")
+    assert seen == ["complete text"]
+    assert tool.executions == []
+    assert state.status is AgentStatus.INTERRUPTED
+    results = [item for item in state.messages if isinstance(item, ToolResult)]
+    assert [result.call_id for result in results] == ["call-1", "call-2"]
+    assert all(result.status == "rejected" for result in results)
+    ModelRequest(messages=state.messages)
+
+
+def test_cancel_during_admitted_context_summary_blocks_next_main_model(
+    tmp_path: Path,
+) -> None:
+    cancel = Event()
+    summary = json.dumps(
+        {
+            "goal": "repair",
+            "established_facts": [],
+            "files_examined": [],
+            "changes_made": [],
+            "commands_and_results": [],
+            "unresolved_errors": [],
+            "open_issues": [],
+            "verification_state": {},
+            "avoid_repeating": [],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    class CancellingSummaryModel:
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ModelResponse(tool_calls=(_record_call(1),))
+            if len(self.requests) == 2:
+                return ModelResponse(tool_calls=(_record_call(2),))
+            assert request.tool_schemas == ()
+            cancel.set()
+            return ModelResponse(text=summary)
+
+    client = CancellingSummaryModel()
+    runner = AgentRunner(
+        model_client=client,
+        tool_registry=ToolRegistry(
+            (
+                RecordingTool(
+                    ToolExecution(output="record"),
+                    ToolExecution(output="record"),
+                ),
+            )
+        ),
+        execution_context=ExecutionContext(tmp_path),
+        context_manager=ContextManager(
+            model_client=client,
+            limits=ContextLimits(max_history_items=4, recent_turns=1),
+        ),
+        termination_policy=TerminationPolicy(
+            TerminationLimits(max_logical_model_calls=3)
+        ),
+        cancellation_requested=cancel.is_set,
+    )
+    state = runner.run("repair")
+    assert len(client.requests) == 3
+    assert client.requests[-1].tool_schemas == ()
+    assert state.logical_model_call_count == 3
+    assert state.status is AgentStatus.INTERRUPTED
+    assert state.termination_reason is TerminationReason.USER_INTERRUPTED
 
 
 @dataclass(slots=True)
@@ -159,6 +358,121 @@ def _verification_gate(
         execution_context=ExecutionContext(tmp_path),
         executor=executor,
     )
+
+
+def test_cancel_after_first_tool_pairs_remaining_calls(tmp_path: Path) -> None:
+    cancel = Event()
+
+    class CancellingTool(RecordingTool):
+        def execute(
+            self,
+            arguments: JSONObject,
+            context: ExecutionContext,
+        ) -> ToolExecution:
+            result = super().execute(arguments, context)
+            cancel.set()
+            return result
+
+    tool = CancellingTool(
+        ToolExecution(output="first"),
+        ToolExecution(output="must not run"),
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(_record_call(1), _record_call(2), _record_call(3))
+            ),
+        ),
+        tools=(tool,),
+        cancellation_requested=cancel.is_set,
+    )
+    state = runner.run("stop tools")
+    results = [item for item in state.messages if isinstance(item, ToolResult)]
+    assert state.status is AgentStatus.INTERRUPTED
+    assert state.termination_reason is TerminationReason.USER_INTERRUPTED
+    assert state.tool_call_count == 1
+    assert len(tool.executions) == 1
+    assert [result.call_id for result in results] == ["call-1", "call-2", "call-3"]
+    assert results[0].status == "ok"
+    assert all(result.status == "rejected" for result in results[1:])
+    ModelRequest(messages=state.messages)
+
+
+def test_cancel_before_required_verification_does_not_execute_it(
+    tmp_path: Path,
+) -> None:
+    cancel = Event()
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    gate = _verification_gate(tmp_path, executor=executor)
+
+    def confirm(_: str) -> None:
+        cancel.set()
+
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        verification_gate=gate,
+        confirmed_text_handler=confirm,
+        cancellation_requested=cancel.is_set,
+    )
+    state = runner.run("cancel before verify")
+    assert state.status is AgentStatus.INTERRUPTED
+    assert executor.calls == []
+    assert state.verification_attempt_count == 0
+
+
+def test_cancel_requested_during_verification_stops_after_admitted_result(
+    tmp_path: Path,
+) -> None:
+    cancel = Event()
+
+    class CancellingVerificationExecutor(FakeVerificationExecutor):
+        def execute(
+            self,
+            command: AuthorizedCommand,
+            context: ExecutionContext,
+        ) -> ToolExecution:
+            result = super().execute(command, context)
+            cancel.set()
+            return result
+
+    executor = CancellingVerificationExecutor(_verification_execution(0))
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="candidate"),),
+        verification_gate=_verification_gate(tmp_path, executor=executor),
+        cancellation_requested=cancel.is_set,
+    )
+    state = runner.run("cancel during verify")
+    assert len(executor.calls) == 1
+    assert state.verification_attempt_count == 1
+    assert state.status is AgentStatus.INTERRUPTED
+    assert state.termination_reason is TerminationReason.USER_INTERRUPTED
+
+
+def test_cancellation_check_must_return_strict_bool(tmp_path: Path) -> None:
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="must not run"),),
+        cancellation_requested=lambda: 1,  # type: ignore[return-value]
+    )
+    with pytest.raises(TypeError, match="cancellation_requested must return bool"):
+        runner.run("invalid cancellation")
+
+
+def test_cancellation_check_system_exit_is_not_swallowed(tmp_path: Path) -> None:
+    def exit_check() -> bool:
+        raise SystemExit(23)
+
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="must not run"),),
+        cancellation_requested=exit_check,
+    )
+    with pytest.raises(SystemExit) as captured:
+        runner.run("exit cancellation")
+    assert captured.value.code == 23
 
 
 @dataclass(slots=True)

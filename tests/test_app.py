@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from coding_agent.app import ApplicationFactories, production_factories, run_application
+from coding_agent.app import (
+    ApplicationFactories,
+    execute_agent_run,
+    production_factories,
+    run_application,
+)
 from coding_agent.config import ApiMode, RunConfig, load_run_config
 from coding_agent.instructions import RunInstructionBuilder
 from coding_agent.logging import (
@@ -298,6 +303,28 @@ def test_composition_uses_fixed_tools_and_shared_executor(tmp_path: Path) -> Non
         "write_file",
         "run_command",
     ]
+
+
+def test_execute_agent_run_matches_run_application_report(tmp_path: Path) -> None:
+    direct_workspace = tmp_path / "direct"
+    application_workspace = tmp_path / "application"
+    direct_workspace.mkdir()
+    application_workspace.mkdir()
+    direct = execute_agent_run(
+        _config(direct_workspace),
+        factories=_successful_factories(),
+    )
+    stdout = StringIO()
+    stderr = StringIO()
+    code = run_application(
+        _config(application_workspace),
+        stdout=stdout,
+        stderr=stderr,
+        factories=_successful_factories(),
+    )
+    assert stderr.getvalue() == ""
+    assert code == direct.report.exit_code
+    assert json.loads(stdout.getvalue()) == direct.report.to_dict()
 
 
 def test_composition_builds_private_run_instructions_once(

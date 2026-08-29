@@ -465,6 +465,11 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 12. **Chat Completions 完全依赖本地历史**：continuation 始终为空，工具调用和结果作为完整消息留在上下文中；压缩仍由现有 `ContextManager` 管理。
 13. **运行指令与消息历史分离**：每次运行固定一份受限、可哈希但正文 repr-private 的快照，避免摘要污染指令或运行中读取到变化的工作区策略。
 14. **流式能力是可选内存边界**：核心只认识少量生命周期事件，供应商片段、reasoning 和 SDK 类型留在适配器内；当前 CLI 不展示增量，后续界面无需改动 Agent 消息模型。
+15. **SQLite 会话历史与 JSONL 审计分工**：每个工作区的 SQLite 只保存 UI 可消费的用户消息、已确认助手文本、严格投影的工具/验证活动和安全终态摘要；JSONL 继续作为完整但脱敏的单次运行审计事实来源。
+16. **顺序独立运行而非恢复 Agent 状态**：一个会话可以包含多个顺序 run；每次 follow-up 都创建新的 AgentState、模型客户端、预算、验证状态和 continuation 生命周期，只把安全叙事渲染为一条初始用户消息。
+17. **单工作区进程租约与单活动 worker**：工作区租约阻止多个进程同时管理会话；控制器只允许一个非 daemon worker，取消通过确定性检查点合作完成，不强制终止线程。
+18. **临时增量与持久确认分离**：流式 delta 只进入有数量和字节上限的内存事件缓冲；discard 永不持久化，只有 Agent 完整确认的非空文本才能写入 SQLite。
+19. **重启恢复等于中断收敛**：启动时将遗留的 queued、running 或 cancelling run 标记为 `interrupted/process_restarted` 并把会话恢复为 idle，不重放工具、不恢复 provider continuation，也不声称续跑。
 
 ## 18. 首版不实现的功能
 
@@ -473,11 +478,12 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 - 向量数据库、长期记忆和语义检索。
 - 插件系统或工具市场。
 - 并行工具执行。
-- 跨进程会话恢复。
+- 可执行或可续跑的跨进程 Agent 状态恢复；当前重启只把未完成 run 安全收敛为中断。
 - macOS、Linux 正式支持。
 - 自定义 Responses endpoint、Azure 专用协议或供应商专用非标准 API。
 - 自动 endpoint 探测、按 URL 猜测 API 模式或凭据回退。
 - SSE/WebSocket/GUI 流式传输、异步客户端、多个 choices、旧式 `function_call` 或非函数工具。
+- HTTP/SSE 传输层、TUI、GUI、账户系统和多会话并发执行；当前只提供框架无关的本地 controller/event 边界。
 - 跨运行的 Skill 管理与可执行 Skill；当前仅支持构造器接收已选择的纯文本 Skill 指令。
 - MCP 客户端或服务端集成。
 - 任意 Shell、网络访问、包安装或服务端托管工具。
@@ -493,7 +499,7 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 - 模型生成摘要可能遗漏语义；本地不变量只能保证关键执行事实不丢失。
 - 无 OS 沙箱，运行可信项目的测试仍可能产生工作区外副作用。
 - Windows 优先实现会减少跨平台展示价值。
-- 一次性会话和有限轮次不适合超长开发任务。
+- 会话支持顺序 follow-up，但不支持多个 run 并发执行，也不恢复上次进程中的可执行 Agent 状态，因此仍不适合无人值守的超长开发任务。
 - OpenAI-compatible 只是协议目标而非兼容性保证；第三方 endpoint 必须实现标准 Chat Completions 工具调用、call ID 和 tool result 配对语义。
 - Chat Completions 使用 `max_tokens` 以覆盖目标兼容服务；只接受 `max_completion_tokens` 的 endpoint 不在 Task15 范围内。
 - 真实模型行为具有非确定性，自动测试主要依赖 FakeModelClient；真实 API 测试只能作为单独记录的人工证据。

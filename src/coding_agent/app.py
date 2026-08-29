@@ -5,16 +5,22 @@ from dataclasses import dataclass, field
 import time
 from typing import Protocol, TextIO
 
-from coding_agent.agent import AgentInterrupted, AgentRunner
+from coding_agent.agent import (
+    AgentInterrupted,
+    AgentRunner,
+    CancellationCheck,
+    ConfirmedTextHandler,
+)
 from coding_agent.chat_completions_client import ChatCompletionsModelClient
 from coding_agent.config import ApiMode, RunConfig
 from coding_agent.context import ContextManager
 from coding_agent.instructions import RunInstructionBuilder
-from coding_agent.logging import RunEventLogger, RunLogError
+from coding_agent.logging import RunEventLogger, RunEventObserver, RunLogError
 from coding_agent.model import ModelClient
 from coding_agent.openai_client import OpenAIResponsesClient
-from coding_agent.report import FinalReport, ReportInvariantError
-from coding_agent.state import AgentStatus, TerminationReason
+from coding_agent.report import FinalReport
+from coding_agent.state import AgentState, AgentStatus, TerminationReason
+from coding_agent.streaming import ModelStreamHandler
 from coding_agent.termination import TerminationPolicy
 from coding_agent.tools.base import ExecutionContext
 from coding_agent.tools.filesystem import (
@@ -78,19 +84,37 @@ def production_factories() -> ApplicationFactories:
     )
 
 
-def run_application(
+class ApplicationRunError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionResult:
+    state: AgentState = field(repr=False)
+    report: FinalReport
+
+
+def _close_after_failed_setup(logger: RunEventLogger) -> None:
+    try:
+        logger.close()
+    except Exception:
+        pass
+
+
+def execute_agent_run(
     config: RunConfig,
     *,
-    stdout: TextIO,
-    stderr: TextIO,
     factories: ApplicationFactories | None = None,
-) -> int:
+    stream_handler: ModelStreamHandler | None = None,
+    confirmed_text_handler: ConfirmedTextHandler | None = None,
+    cancellation_requested: CancellationCheck | None = None,
+    initial_user_message: str | None = None,
+    event_observer: RunEventObserver | None = None,
+) -> AgentExecutionResult:
     if not isinstance(config, RunConfig):
         raise TypeError("config must be RunConfig")
-    if not callable(getattr(stdout, "write", None)):
-        raise TypeError("stdout must be writable")
-    if not callable(getattr(stderr, "write", None)):
-        raise TypeError("stderr must be writable")
     selected = production_factories() if factories is None else factories
     if not isinstance(selected, ApplicationFactories):
         raise TypeError("factories must be ApplicationFactories")
@@ -98,16 +122,15 @@ def run_application(
     try:
         logger = selected.logger(config, selected.clock)
     except RunLogError as exc:
-        stderr.write(f"error: audit log unavailable ({exc.code})\n")
-        return 1
+        raise ApplicationRunError(f"audit_log_unavailable:{exc.code}") from None
     except KeyboardInterrupt:
-        stderr.write("error: interrupted\n")
-        return 130
+        raise
     except Exception:
-        stderr.write("error: internal application failure\n")
-        return 1
+        raise ApplicationRunError("internal_application_failure") from None
 
     try:
+        if event_observer is not None:
+            logger.set_event_observer(event_observer)
         execution_context = ExecutionContext(config.workspace)
         executor = selected.command_executor()
         registry = ToolRegistry(
@@ -138,21 +161,17 @@ def run_application(
             verification_gate=verification_gate,
             event_sink=logger,
             instructions=instruction_snapshot.text,
+            stream_handler=stream_handler,
+            confirmed_text_handler=confirmed_text_handler,
+            cancellation_requested=cancellation_requested,
+            initial_user_message=initial_user_message,
         )
     except KeyboardInterrupt:
-        try:
-            logger.close()
-        except Exception:
-            pass
-        stderr.write("error: interrupted\n")
-        return 130
+        _close_after_failed_setup(logger)
+        raise
     except Exception:
-        try:
-            logger.close()
-        except Exception:
-            pass
-        stderr.write("error: internal application failure\n")
-        return 1
+        _close_after_failed_setup(logger)
+        raise ApplicationRunError("internal_application_failure") from None
 
     interrupted = False
     try:
@@ -161,19 +180,11 @@ def run_application(
         state = exc.state
         interrupted = True
     except KeyboardInterrupt:
-        try:
-            logger.close()
-        except Exception:
-            pass
-        stderr.write("error: interrupted\n")
-        return 130
+        _close_after_failed_setup(logger)
+        raise
     except Exception:
-        try:
-            logger.close()
-        except Exception:
-            pass
-        stderr.write("error: internal application failure\n")
-        return 1
+        _close_after_failed_setup(logger)
+        raise ApplicationRunError("internal_application_failure") from None
 
     if logger.metadata.finished_elapsed_ms is None:
         logger.metadata.finished_elapsed_ms = max(
@@ -191,11 +202,9 @@ def run_application(
             state.termination_reason = TerminationReason.AUDIT_LOG_FAILURE
             state.failure_reason = TerminationReason.AUDIT_LOG_FAILURE.value
     except KeyboardInterrupt:
-        stderr.write("error: interrupted\n")
-        return 130
+        raise
     except Exception:
-        stderr.write("error: internal application failure\n")
-        return 1
+        raise ApplicationRunError("internal_application_failure") from None
 
     try:
         report = FinalReport.from_state(
@@ -203,10 +212,38 @@ def run_application(
             logger.metadata,
             sensitive_values=(config.api_key,),
         )
-        rendered = report.to_json()
-    except (ReportInvariantError, Exception):
-        stderr.write("error: internal application failure\n")
+    except Exception:
+        raise ApplicationRunError("internal_application_failure") from None
+    return AgentExecutionResult(state=state, report=report)
+
+
+def run_application(
+    config: RunConfig,
+    *,
+    stdout: TextIO,
+    stderr: TextIO,
+    factories: ApplicationFactories | None = None,
+) -> int:
+    if not isinstance(config, RunConfig):
+        raise TypeError("config must be RunConfig")
+    if not callable(getattr(stdout, "write", None)):
+        raise TypeError("stdout must be writable")
+    if not callable(getattr(stderr, "write", None)):
+        raise TypeError("stderr must be writable")
+    try:
+        execution = execute_agent_run(config, factories=factories)
+    except ApplicationRunError as exc:
+        if exc.code.startswith("audit_log_unavailable:"):
+            detail = exc.code.partition(":")[2]
+            stderr.write(f"error: audit log unavailable ({detail})\n")
+        else:
+            stderr.write("error: internal application failure\n")
         return 1
+    except KeyboardInterrupt:
+        stderr.write("error: interrupted\n")
+        return 130
+    report = execution.report
+    rendered = report.to_json()
     try:
         stdout.write(rendered)
     except Exception:
