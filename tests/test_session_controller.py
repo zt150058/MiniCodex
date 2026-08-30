@@ -21,8 +21,9 @@ from coding_agent.session import (
 from coding_agent.session_controller import CancellationResult, SessionController
 from coding_agent.logging import EventType, RunEvent
 from coding_agent.session_events import SessionEventHub, SessionUpdateKind
-from coding_agent.session_runtime import SessionRunOutcome
+from coding_agent.session_runtime import SessionRunOutcome, SessionRunRequest
 from coding_agent.session_store import SQLiteSessionStore, WorkspaceSessionLease
+from coding_agent.skills import SkillCatalog, SkillDescriptor
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 
 
@@ -91,11 +92,16 @@ def make_controller(
     *,
     store: SQLiteSessionStore | None = None,
     thread_factory: object | None = None,
+    skill_catalog: SkillCatalog | None = None,
 ) -> SessionController:
     lease = WorkspaceSessionLease.acquire(tmp_path)
     selected_store = store or SQLiteSessionStore(tmp_path)
     selected_store.initialize()
     selected_store.recover_incomplete_runs()
+    selected_catalog = skill_catalog or SkillCatalog(
+        user_root=tmp_path / "user-skills",
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
     kwargs: dict[str, object] = {}
     if thread_factory is not None:
         kwargs["thread_factory"] = thread_factory
@@ -104,8 +110,264 @@ def make_controller(
         lease=lease,
         executor=executor,  # type: ignore[arg-type]
         event_hub=SessionEventHub(),
+        skill_catalog=selected_catalog,
         **kwargs,  # type: ignore[arg-type]
     )
+
+
+def write_skill(root: Path, skill_id: str, body: str) -> Path:
+    directory = root / skill_id
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "SKILL.md"
+    path.write_text(
+        "---\n"
+        f"id: {skill_id}\n"
+        f"name: {skill_id.title()}\n"
+        "description: deterministic controller test skill\n"
+        "---\n"
+        f"{body}",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_create_session_resolves_and_persists_ordered_first_run_skills(
+    tmp_path: Path,
+) -> None:
+    user_root = tmp_path / "user-skills"
+    workspace_root = tmp_path / ".coding-agent" / "skills"
+    write_skill(user_root, "first", "first private body")
+    write_skill(workspace_root, "second", "second private body")
+    catalog = SkillCatalog(user_root=user_root, workspace_root=workspace_root)
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+    handle = controller.create_session("inspect", skill_ids=("second", "first"))
+    assert executor.started.wait(timeout=1.0)
+    request = executor.requests[0]
+    assert isinstance(request, SessionRunRequest)
+    assert request.skill_bundle is not None
+    assert [item.descriptor.skill_id for item in request.skill_bundle.items] == [
+        "second",
+        "first",
+    ]
+    assert controller.get_session_skills(handle.session_id) == ("second", "first")
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_controller_rejects_catalog_for_different_workspace(
+    tmp_path: Path,
+) -> None:
+    other = tmp_path / "other"
+    other.mkdir()
+    lease = WorkspaceSessionLease.acquire(tmp_path)
+    store = SQLiteSessionStore(tmp_path)
+    store.initialize()
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    catalog = SkillCatalog(
+        user_root=tmp_path / "user-skills",
+        workspace_root=other / ".coding-agent" / "skills",
+    )
+    try:
+        with pytest.raises(SessionControllerError) as captured:
+            SessionController(
+                store=store,
+                lease=lease,
+                executor=executor,
+                event_hub=SessionEventHub(),
+                skill_catalog=catalog,
+            )
+        assert captured.value.code == "invalid_session_state"
+    finally:
+        lease.close()
+
+
+def test_idle_session_selection_can_be_reordered_and_cleared(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "user-skills"
+    write_skill(root, "first", "first")
+    write_skill(root, "second", "second")
+    catalog = SkillCatalog(
+        user_root=root,
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+    first = controller.create_session("first")
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(first.run_id, timeout_seconds=2.0)
+    assert [item.skill_id for item in controller.list_skills().skills] == [
+        "first",
+        "second",
+    ]
+    assert controller.set_session_skills(
+        first.session_id,
+        ("second", "first"),
+    ) == ("second", "first")
+    assert controller.get_session_skills(first.session_id) == ("second", "first")
+    assert controller.set_session_skills(first.session_id, ()) == ()
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_selection_change_is_rejected_while_any_run_is_active(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "user-skills"
+    write_skill(root, "review", "review")
+    catalog = SkillCatalog(
+        user_root=root,
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+    handle = controller.create_session("running")
+    assert executor.started.wait(timeout=1.0)
+    with pytest.raises(SessionControllerError) as captured:
+        controller.set_session_skills(handle.session_id, ("review",))
+    assert captured.value.code == "controller_busy"
+    assert controller.get_session_skills(handle.session_id) == ()
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_submit_message_resolves_persisted_selection_for_new_run(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "user-skills"
+    write_skill(root, "review", "follow-up private body")
+    catalog = SkillCatalog(
+        user_root=root,
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(), failed_outcome()))
+    store = SQLiteSessionStore(tmp_path)
+    controller = make_controller(
+        tmp_path,
+        executor,
+        store=store,
+        skill_catalog=catalog,
+    )
+    first = controller.create_session("first")
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(first.run_id, timeout_seconds=2.0)
+    assert controller.set_session_skills(first.session_id, ("review",)) == (
+        "review",
+    )
+    executor.started.clear()
+    executor.release.clear()
+    second = controller.submit_message(first.session_id, "second")
+    assert executor.started.wait(timeout=1.0)
+    request = executor.requests[-1]
+    assert isinstance(request, SessionRunRequest)
+    assert request.skill_bundle is not None
+    assert request.skill_bundle.text.endswith("follow-up private body")
+    snapshots = store.get_run_skill_snapshots(second.run_id)
+    assert [item.skill_id for item in snapshots] == ["review"]
+    executor.release.set()
+    controller.wait_for_run(second.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_missing_selected_skill_creates_no_follow_up_run_or_event(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "user-skills"
+    skill_file = write_skill(root, "review", "private removed body")
+    catalog = SkillCatalog(
+        user_root=root,
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+    first = controller.create_session("first")
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(first.run_id, timeout_seconds=2.0)
+    controller.set_session_skills(first.session_id, ("review",))
+    before = controller.get_session(first.session_id)
+    skill_file.unlink()
+    with pytest.raises(SessionControllerError) as captured:
+        controller.submit_message(first.session_id, "second")
+    assert captured.value.code == "selected_skill_unavailable"
+    after = controller.get_session(first.session_id)
+    assert after.runs == before.runs
+    assert after.events == before.events
+    assert len(executor.requests) == 1
+    assert "private removed body" not in repr(captured.value)
+    assert str(tmp_path) not in repr(captured.value)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_catalog_change_after_admission_does_not_change_active_bundle(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "user-skills"
+    skill_file = write_skill(root, "review", "old private body")
+    catalog = SkillCatalog(
+        user_root=root,
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+    handle = controller.create_session("first", skill_ids=("review",))
+    assert executor.started.wait(timeout=1.0)
+    request = executor.requests[0]
+    assert isinstance(request, SessionRunRequest)
+    assert request.skill_bundle is not None
+    write_skill(root, "review", "new private body")
+    assert "old private body" in request.skill_bundle.text
+    assert "new private body" not in request.skill_bundle.text
+    assert skill_file.read_text(encoding="utf-8").endswith("new private body")
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_skill_resolution_failure_creates_no_first_session_or_worker(
+    tmp_path: Path,
+) -> None:
+    catalog = SkillCatalog(
+        user_root=tmp_path / "user-skills",
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+    with pytest.raises(SessionControllerError) as captured:
+        controller.create_session("first", skill_ids=("missing",))
+    assert captured.value.code == "selected_skill_unavailable"
+    assert controller.list_sessions() == ()
+    assert executor.requests == []
+    assert executor.started.is_set() is False
+    assert str(tmp_path) not in repr(captured.value)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_create_session_rejects_empty_tuple_subclass_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    class EmptyTuple(tuple[()]):
+        pass
+
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+    try:
+        with pytest.raises(SessionControllerError) as captured:
+            controller.create_session(
+                "first",
+                skill_ids=EmptyTuple(),  # type: ignore[arg-type]
+            )
+        assert captured.value.code == "invalid_skill_selection"
+        assert controller.list_sessions() == ()
+        assert executor.requests == []
+        assert executor.started.is_set() is False
+    finally:
+        executor.release.set()
+        assert controller.shutdown(timeout_seconds=1.0) is True
 
 
 def test_controller_rejects_mismatched_workspace_components(
@@ -703,10 +965,18 @@ def test_shutdown_timeout_includes_blocked_session_admission(tmp_path: Path) -> 
             self.create_entered = Event()
             self.release_create = Event()
 
-        def create_session(self, message: str):  # type: ignore[no-untyped-def]
+        def create_session(
+            self,
+            message: str,
+            *,
+            selected_skills: tuple[SkillDescriptor, ...] = (),
+        ):  # type: ignore[no-untyped-def]
             self.create_entered.set()
             assert self.release_create.wait(timeout=2.0)
-            return super().create_session(message)
+            return super().create_session(
+                message,
+                selected_skills=selected_skills,
+            )
 
     store = BlockingCreateStore(tmp_path)
     store.initialize()
@@ -751,10 +1021,16 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
             self,
             session_id: str,
             message: str,
+            *,
+            selected_skills: tuple[SkillDescriptor, ...] = (),
         ):  # type: ignore[no-untyped-def]
             self.submit_entered.set()
             assert self.release_submit.wait(timeout=2.0)
-            return super().submit_message(session_id, message)
+            return super().submit_message(
+                session_id,
+                message,
+                selected_skills=selected_skills,
+            )
 
     store = BlockingSubmitStore(tmp_path)
     store.initialize()

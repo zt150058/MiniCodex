@@ -29,11 +29,28 @@ from coding_agent.session_runtime import (
     SessionNarrativeRenderer,
     SessionRunRequest,
 )
+from coding_agent.skills import SkillCatalog
 from coding_agent.tools.base import ExecutionContext, ToolExecution
 
 
 RUN_1 = "1" * 32
 RUN_2 = "2" * 32
+
+
+def write_skill(root: Path, skill_id: str, body: str) -> Path:
+    directory = root / skill_id
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "SKILL.md"
+    path.write_text(
+        "---\n"
+        f"id: {skill_id}\n"
+        f"name: {skill_id.title()}\n"
+        "description: deterministic test skill\n"
+        "---\n"
+        f"{body}",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _entry(
@@ -42,6 +59,35 @@ def _entry(
     content: str,
 ) -> SessionNarrativeEntry:
     return SessionNarrativeEntry(run_id=run_id, kind=kind, content=content)
+
+
+def test_session_run_request_accepts_frozen_skill_bundle_and_hides_body(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "skills"
+    write_skill(root, "review", "task21 private runtime body")
+    bundle = SkillCatalog(
+        user_root=root,
+        workspace_root=tmp_path / "workspace",
+    ).resolve(("review",))
+    assert bundle is not None
+    request = SessionRunRequest(
+        session_id="1" * 32,
+        run_id="2" * 32,
+        current_message="inspect",
+        initial_user_message="inspect",
+        skill_bundle=bundle,
+    )
+    assert request.skill_bundle is bundle
+    assert "task21 private runtime body" not in repr(request)
+    with pytest.raises(TypeError):
+        SessionRunRequest(
+            session_id="1" * 32,
+            run_id="2" * 32,
+            current_message="inspect",
+            initial_user_message="inspect",
+            skill_bundle="invalid",  # type: ignore[arg-type]
+        )
 
 
 def test_session_modules_import_without_provider_sdk_or_network(tmp_path: Path) -> None:
@@ -205,6 +251,58 @@ def test_agent_session_executor_returns_sdk_free_terminal_outcome(
         assert forbidden not in persisted
     assert "OpenAI" not in type(outcome).__module__
     assert confirmed
+
+
+def test_agent_session_executor_passes_skill_bundle_without_persisting_body(
+    tmp_path: Path,
+) -> None:
+    private_body = "task21 private runtime body"
+    root = tmp_path / "skills"
+    write_skill(root, "review", private_body)
+    bundle = SkillCatalog(
+        user_root=root,
+        workspace_root=tmp_path / "workspace-skills",
+    ).resolve(("review",))
+    assert bundle is not None
+    client = FakeModelClient((ModelResponse(text="done"),))
+    config = load_run_config(
+        task="template task",
+        workspace=tmp_path,
+        model="fake-model",
+        verify_command="pytest -q",
+        environ={"OPENAI_API_KEY": "obviously-fake-session-key"},
+    )
+    factories = ApplicationFactories(
+        model_client=lambda _: client,
+        logger=lambda selected, clock: RunEventLogger.create(
+            selected.workspace,
+            run_id="8" * 32,
+            sensitive_values=(selected.api_key,),
+            monotonic_clock=clock,
+        ),
+        command_executor=PassingExecutor,
+        clock=lambda: 0.0,
+    )
+    executor = AgentSessionRunExecutor(config, factories=factories)
+    request = SessionRunRequest(
+        session_id="1" * 32,
+        run_id="2" * 32,
+        current_message="actual follow-up",
+        initial_user_message="current request\nactual follow-up",
+        skill_bundle=bundle,
+    )
+    outcome = executor.execute(
+        request,
+        stream_handler=lambda event: None,
+        confirmed_text_handler=lambda text: None,
+        cancellation_requested=lambda: False,
+        run_event_handler=lambda event: None,
+    )
+    assert client.requests
+    assert client.requests[0].instructions is not None
+    assert private_body in client.requests[0].instructions
+    assert private_body not in json.dumps(outcome.safe_summary, ensure_ascii=False)
+    assert private_body not in json.dumps(outcome.final_report, ensure_ascii=False)
 
 
 def test_fresh_run_has_fresh_model_budget_and_no_prior_continuation(

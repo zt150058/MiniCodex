@@ -21,6 +21,7 @@ from coding_agent.session import (
     SessionRunRecord,
     SessionRunResult,
     SessionRunStatus,
+    SessionStatus,
     SessionStoreError,
     make_safe_run_summary,
     utc_now,
@@ -40,6 +41,11 @@ from coding_agent.session_store import (
     SQLiteSessionStore,
     SessionStore,
     WorkspaceSessionLease,
+)
+from coding_agent.skills import (
+    SkillCatalog,
+    SkillCatalogError,
+    SkillCatalogView,
 )
 from coding_agent.logging import EventType, RunEvent
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
@@ -132,6 +138,7 @@ class SessionController:
         event_hub: SessionEventHub,
         narrative_renderer: SessionNarrativeRenderer = SessionNarrativeRenderer(),
         thread_factory: ThreadFactory = default_thread_factory,
+        skill_catalog: SkillCatalog | None = None,
     ) -> None:
         if not isinstance(event_hub, SessionEventHub):
             raise TypeError("event_hub must be SessionEventHub")
@@ -149,12 +156,22 @@ class SessionController:
             raise SessionControllerError("invalid_session_state") from None
         if len(identities) != 1:
             raise SessionControllerError("invalid_session_state")
+        if skill_catalog is None:
+            skill_catalog = SkillCatalog.from_environment(store.workspace)
+        elif type(skill_catalog) is not SkillCatalog:
+            raise TypeError("skill_catalog must be SkillCatalog or None")
+        expected_skill_root = (
+            store.workspace / ".coding-agent" / "skills"
+        ).resolve(strict=False)
+        if skill_catalog.workspace_root != expected_skill_root:
+            raise SessionControllerError("invalid_session_state")
         self._store = store
         self._lease = lease
         self._executor = executor
         self._event_hub = event_hub
         self._narrative_renderer = narrative_renderer
         self._thread_factory = thread_factory
+        self._skill_catalog = skill_catalog
         self._lock = RLock()
         self._active: _ActiveRun | None = None
         self._admission_done: Event | None = None
@@ -171,6 +188,7 @@ class SessionController:
         sensitive_values: tuple[str, ...] = (),
         utc_clock: Callable[[], datetime] = utc_now,
         thread_factory: ThreadFactory = default_thread_factory,
+        skill_catalog: SkillCatalog | None = None,
     ) -> SessionController:
         try:
             requested_identity = _workspace_identity(workspace)
@@ -197,6 +215,7 @@ class SessionController:
                     sensitive_values=sensitive_values,
                 ),
                 thread_factory=thread_factory,
+                skill_catalog=skill_catalog,
             )
         except BaseException:
             lease.close()
@@ -231,7 +250,45 @@ class SessionController:
                 self._admission_done = None
         done.set()
 
-    def create_session(self, message: str) -> RunHandle:
+    def list_skills(self) -> SkillCatalogView:
+        return self._skill_catalog.discover()
+
+    def get_session_skills(self, session_id: str) -> tuple[str, ...]:
+        try:
+            return self._store.get_skill_selection(session_id)
+        except SessionStoreError as exc:
+            raise self._translate_store_error(exc) from None
+
+    def set_session_skills(
+        self,
+        session_id: str,
+        skill_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        admission = self._reserve_admission()
+        try:
+            try:
+                session = self._store.get_session(session_id)
+            except SessionStoreError as exc:
+                raise self._translate_store_error(exc) from None
+            if session.status is not SessionStatus.IDLE:
+                raise SessionControllerError("invalid_session_state")
+            try:
+                self._skill_catalog.resolve(skill_ids)
+            except SkillCatalogError as exc:
+                raise SessionControllerError(exc.code) from None
+            try:
+                return self._store.replace_skill_selection(session_id, skill_ids)
+            except SessionStoreError as exc:
+                raise self._translate_store_error(exc) from None
+        finally:
+            self._release_admission(admission)
+
+    def create_session(
+        self,
+        message: str,
+        *,
+        skill_ids: tuple[str, ...] = (),
+    ) -> RunHandle:
         try:
             initial = self._narrative_renderer.render((), message)
         except (SessionError, TypeError, ValueError) as exc:
@@ -240,7 +297,19 @@ class SessionController:
         admission = self._reserve_admission()
         try:
             try:
-                submission = self._store.create_session(message)
+                bundle = self._skill_catalog.resolve(skill_ids)
+            except SkillCatalogError as exc:
+                raise SessionControllerError(exc.code) from None
+            selected_skills = (
+                ()
+                if bundle is None
+                else tuple(item.descriptor for item in bundle.items)
+            )
+            try:
+                submission = self._store.create_session(
+                    message,
+                    selected_skills=selected_skills,
+                )
             except SessionStoreError as exc:
                 raise self._translate_store_error(exc) from None
             request = SessionRunRequest(
@@ -248,6 +317,7 @@ class SessionController:
                 run_id=submission.run.run_id,
                 current_message=message,
                 initial_user_message=initial,
+                skill_bundle=bundle,
             )
             handle = self._start_worker(request, admission)
             admission = None
@@ -269,7 +339,26 @@ class SessionController:
                 code = getattr(exc, "code", "invalid_message")
                 raise SessionControllerError(code) from None
             try:
-                submission = self._store.submit_message(session_id, message)
+                skill_ids = self._store.get_skill_selection(session_id)
+            except SessionStoreError as exc:
+                raise self._translate_store_error(exc) from None
+            try:
+                bundle = (
+                    None if skill_ids == () else self._skill_catalog.resolve(skill_ids)
+                )
+            except SkillCatalogError as exc:
+                raise SessionControllerError(exc.code) from None
+            selected_skills = (
+                ()
+                if bundle is None
+                else tuple(item.descriptor for item in bundle.items)
+            )
+            try:
+                submission = self._store.submit_message(
+                    session_id,
+                    message,
+                    selected_skills=selected_skills,
+                )
             except SessionStoreError as exc:
                 raise self._translate_store_error(exc) from None
             request = SessionRunRequest(
@@ -277,6 +366,7 @@ class SessionController:
                 run_id=submission.run.run_id,
                 current_message=message,
                 initial_user_message=initial,
+                skill_bundle=bundle,
             )
             handle = self._start_worker(request, admission)
             admission = None

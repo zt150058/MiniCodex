@@ -112,6 +112,7 @@ def execute_agent_run(
     cancellation_requested: CancellationCheck | None = None,
     initial_user_message: str | None = None,
     event_observer: RunEventObserver | None = None,
+    skill_instructions: str | None = None,
 ) -> AgentExecutionResult:
     if not isinstance(config, RunConfig):
         raise TypeError("config must be RunConfig")
@@ -150,7 +151,10 @@ def execute_agent_run(
             execution_context=execution_context,
             executor=executor,
         )
-        instruction_snapshot = RunInstructionBuilder().build(config.workspace)
+        instruction_snapshot = RunInstructionBuilder().build(
+            config.workspace,
+            skill_instructions=skill_instructions,
+        )
         runner = AgentRunner(
             model_client=model_client,
             tool_registry=registry,

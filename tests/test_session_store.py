@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -21,6 +22,11 @@ from coding_agent.session import (
     make_safe_run_summary,
 )
 from coding_agent.session_store import SQLiteSessionStore, WorkspaceSessionLease
+from coding_agent.skills import (
+    RunSkillSnapshotMetadata,
+    SkillDescriptor,
+    SkillSource,
+)
 
 
 NOW = datetime(2026, 8, 29, 8, 0, tzinfo=timezone.utc)
@@ -86,15 +92,198 @@ def test_initialize_creates_versioned_wal_database(tmp_path: Path) -> None:
     database = tmp_path / ".coding-agent" / "sessions.sqlite3"
     assert database.is_file()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
         names = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        assert {"sessions", "session_runs", "session_events"} <= names
+        assert {
+            "sessions",
+            "session_runs",
+            "session_skill_selections",
+            "run_skill_snapshots",
+            "session_events",
+        } <= names
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_initialize_migrates_v1_sessions_to_empty_skill_selection(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("existing")
+    database = tmp_path / ".coding-agent" / "sessions.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE IF EXISTS run_skill_snapshots")
+        connection.execute("DROP TABLE IF EXISTS session_skill_selections")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    migrated = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    migrated.initialize()
+    assert migrated.get_session(submission.session.session_id).title == "existing"
+    assert migrated.get_skill_selection(submission.session.session_id) == ()
+    assert migrated.get_run_skill_snapshots(submission.run.run_id) == ()
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+
+
+def test_skill_reads_distinguish_missing_parent_from_empty_children(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    with pytest.raises(SessionStoreError) as session_error:
+        store.get_skill_selection("f" * 32)
+    assert session_error.value.code == "session_not_found"
+    with pytest.raises(SessionStoreError) as run_error:
+        store.get_run_skill_snapshots("e" * 32)
+    assert run_error.value.code == "run_not_found"
+
+
+def test_replace_skill_selection_is_ordered_and_atomic(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("first")
+    store.recover_incomplete_runs()
+    assert store.replace_skill_selection(
+        submission.session.session_id,
+        ("second", "first"),
+    ) == ("second", "first")
+    assert store.get_skill_selection(submission.session.session_id) == (
+        "second",
+        "first",
+    )
+    with pytest.raises(SessionStoreError) as captured:
+        store.replace_skill_selection(
+            submission.session.session_id,
+            ("valid", "valid"),
+        )
+    assert captured.value.code == "invalid_skill_selection"
+    assert store.get_skill_selection(submission.session.session_id) == (
+        "second",
+        "first",
+    )
+    assert store.replace_skill_selection(submission.session.session_id, ()) == ()
+
+
+def test_replace_skill_selection_rejects_running_session(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("running")
+    with pytest.raises(SessionStoreError) as captured:
+        store.replace_skill_selection(submission.session.session_id, ("review",))
+    assert captured.value.code == "invalid_session_state"
+    assert store.get_skill_selection(submission.session.session_id) == ()
+
+
+def descriptor(skill_id: str, source: SkillSource) -> SkillDescriptor:
+    body = f"body-{skill_id}"
+    return SkillDescriptor(
+        skill_id=skill_id,
+        name=skill_id.title(),
+        description="safe",
+        source=source,
+        sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        char_count=len(body),
+    )
+
+
+def test_create_and_submit_persist_safe_skill_snapshot_metadata(
+    tmp_path: Path,
+) -> None:
+    ids = iter(("1" * 32, "2" * 32, "3" * 32))
+    store = SQLiteSessionStore(tmp_path, id_factory=lambda: next(ids))
+    store.initialize()
+    selected = (
+        descriptor("second", SkillSource.WORKSPACE),
+        descriptor("first", SkillSource.USER),
+    )
+    first = store.create_session("first", selected_skills=selected)
+    assert store.get_skill_selection(first.session.session_id) == (
+        "second",
+        "first",
+    )
+    assert store.get_run_skill_snapshots(first.run.run_id) == tuple(
+        RunSkillSnapshotMetadata(
+            skill_id=item.skill_id,
+            source=item.source,
+            sha256=item.sha256,
+            char_count=item.char_count,
+        )
+        for item in selected
+    )
+    store.recover_incomplete_runs()
+    second = store.submit_message(
+        first.session.session_id,
+        "second",
+        selected_skills=selected,
+    )
+    assert store.get_run_skill_snapshots(
+        second.run.run_id
+    ) == store.get_run_skill_snapshots(first.run.run_id)
+
+
+def test_submit_rejects_stale_resolved_selection_without_side_effect(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path)
+    store.initialize()
+    first = store.create_session(
+        "first",
+        selected_skills=(descriptor("first", SkillSource.USER),),
+    )
+    store.recover_incomplete_runs()
+    store.replace_skill_selection(first.session.session_id, ("second",))
+    before_runs = store.list_runs(first.session.session_id)
+    before_events = store.load_events(first.session.session_id)
+    with pytest.raises(SessionStoreError) as captured:
+        store.submit_message(
+            first.session.session_id,
+            "stale",
+            selected_skills=(descriptor("first", SkillSource.USER),),
+        )
+    assert captured.value.code == "invalid_session_state"
+    assert store.list_runs(first.session.session_id) == before_runs
+    assert store.load_events(first.session.session_id) == before_events
+
+
+@pytest.mark.parametrize(
+    ("table", "assignment"),
+    (
+        ("session_skill_selections", "skill_id = 'Bad_ID'"),
+        ("session_skill_selections", "position = 0"),
+        ("run_skill_snapshots", "source = 'corrupt'"),
+        ("run_skill_snapshots", "sha256 = 'not-a-hash'"),
+        ("run_skill_snapshots", "char_count = 0"),
+    ),
+)
+def test_corrupt_skill_rows_are_reported_as_database_corrupt(
+    tmp_path: Path,
+    table: str,
+    assignment: str,
+) -> None:
+    store = SQLiteSessionStore(tmp_path)
+    store.initialize()
+    first = store.create_session(
+        "first",
+        selected_skills=(descriptor("first", SkillSource.USER),),
+    )
+    database = tmp_path / ".coding-agent" / "sessions.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(f"UPDATE {table} SET {assignment}")
+        connection.commit()
+    with pytest.raises(SessionStoreError) as captured:
+        if table == "session_skill_selections":
+            store.get_skill_selection(first.session.session_id)
+        else:
+            store.get_run_skill_snapshots(first.run.run_id)
+    assert captured.value.code == "database_corrupt"
+    assert "Bad_ID" not in repr(captured.value)
+    assert "not-a-hash" not in repr(captured.value)
 
 
 def test_workspace_lease_is_exclusive_and_reacquirable(tmp_path: Path) -> None:
@@ -561,12 +750,12 @@ def test_schema_unsupported_newer_version_is_not_replaced(tmp_path: Path) -> Non
     internal.mkdir()
     database = internal / "sessions.sqlite3"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 2")
+        connection.execute("PRAGMA user_version = 3")
     with pytest.raises(SessionStoreError) as captured:
         SQLiteSessionStore(tmp_path).initialize()
     assert captured.value.code == "schema_unsupported"
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
 
 
 def test_database_corrupt_non_database_bytes_are_not_replaced(

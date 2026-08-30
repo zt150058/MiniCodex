@@ -470,6 +470,7 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 17. **单工作区进程租约与单活动 worker**：工作区租约阻止多个进程同时管理会话；控制器只允许一个非 daemon worker，取消通过确定性检查点合作完成，不强制终止线程。
 18. **临时增量与持久确认分离**：流式 delta 只进入有数量和字节上限的内存事件缓冲；discard 永不持久化，只有 Agent 完整确认的非空文本才能写入 SQLite。
 19. **重启恢复等于中断收敛**：启动时将遗留的 queued、running 或 cancelling run 标记为 `interrupted/process_restarted` 并把会话恢复为 idle，不重放工具、不恢复 provider continuation，也不声称续跑。
+20. **声明式 Skill 目录与执行能力分离**：Task21 允许从用户级和工作区级可信本地目录发现受限 `SKILL.md`，按会话持久化有序 Skill ID，并在每次 run 开始前冻结仅存在于内存的指令快照；Skill 正文不进入 SQLite、日志、事件或报告，Skill 不能注册工具、扩大权限或绕过确定性安全与验证策略。
 
 ## 18. 首版不实现的功能
 
@@ -484,7 +485,7 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 - 自动 endpoint 探测、按 URL 猜测 API 模式或凭据回退。
 - SSE/WebSocket/GUI 流式传输、异步客户端、多个 choices、旧式 `function_call` 或非函数工具。
 - HTTP/SSE 传输层、TUI、GUI、账户系统和多会话并发执行；当前只提供框架无关的本地 controller/event 边界。
-- 跨运行的 Skill 管理与可执行 Skill；当前仅支持构造器接收已选择的纯文本 Skill 指令。
+- 可执行 Skill、远程 Skill、Skill 安装/编辑/市场和 Skill 自定义工具；Task21 只实现可信本地声明式目录、会话级有序选择和逐 run 不可变指令快照。
 - MCP 客户端或服务端集成。
 - 任意 Shell、网络访问、包安装或服务端托管工具。
 - 文件删除、移动、权限修改和二进制文件编辑。

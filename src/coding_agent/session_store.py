@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import sys
@@ -29,12 +30,18 @@ from coding_agent.session import (
     uuid4_hex,
 )
 from coding_agent.logging import scrub_text
+from coding_agent.skills import (
+    RunSkillSnapshotMetadata,
+    SkillDescriptor,
+    SkillSource,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _INTERNAL_DIRECTORY = ".coding-agent"
 _DATABASE_NAME = "sessions.sqlite3"
 _LOCK_NAME = "sessions.lock"
+_SKILL_ID_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
 
 
 class SessionStore(Protocol):
@@ -42,12 +49,33 @@ class SessionStore(Protocol):
     def workspace(self) -> Path: ...
 
     def initialize(self) -> None: ...
-    def create_session(self, message: str) -> SessionSubmission: ...
+    def create_session(
+        self,
+        message: str,
+        *,
+        selected_skills: tuple[SkillDescriptor, ...] = (),
+    ) -> SessionSubmission: ...
     def get_session(self, session_id: str) -> SessionRecord: ...
     def get_run(self, run_id: str) -> SessionRunRecord: ...
+    def get_skill_selection(self, session_id: str) -> tuple[str, ...]: ...
+    def get_run_skill_snapshots(
+        self,
+        run_id: str,
+    ) -> tuple[RunSkillSnapshotMetadata, ...]: ...
+    def replace_skill_selection(
+        self,
+        session_id: str,
+        skill_ids: tuple[str, ...],
+    ) -> tuple[str, ...]: ...
     def list_sessions(self, *, limit: int = 50) -> tuple[SessionRecord, ...]: ...
     def list_runs(self, session_id: str) -> tuple[SessionRunRecord, ...]: ...
-    def submit_message(self, session_id: str, message: str) -> SessionSubmission: ...
+    def submit_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        selected_skills: tuple[SkillDescriptor, ...] = (),
+    ) -> SessionSubmission: ...
     def start_run(self, run_id: str) -> SessionRunRecord: ...
     def append_event(self, event: NewSessionEvent) -> SessionEvent: ...
     def request_cancellation(self, run_id: str) -> SessionRunRecord: ...
@@ -207,6 +235,25 @@ CREATE TABLE IF NOT EXISTS session_runs (
     audit_run_id TEXT,
     final_report_json TEXT,
     UNIQUE(session_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS session_skill_selections (
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    position INTEGER NOT NULL CHECK(position > 0),
+    skill_id TEXT NOT NULL,
+    PRIMARY KEY(session_id, position),
+    UNIQUE(session_id, skill_id)
+);
+
+CREATE TABLE IF NOT EXISTS run_skill_snapshots (
+    run_id TEXT NOT NULL REFERENCES session_runs(run_id),
+    position INTEGER NOT NULL CHECK(position > 0),
+    skill_id TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('user', 'workspace')),
+    sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+    char_count INTEGER NOT NULL CHECK(char_count > 0),
+    PRIMARY KEY(run_id, position),
+    UNIQUE(run_id, skill_id)
 );
 
 CREATE TABLE IF NOT EXISTS session_events (
@@ -418,6 +465,80 @@ class SQLiteSessionStore:
         return value
 
     @staticmethod
+    def _validate_selected_skills(
+        selected_skills: tuple[SkillDescriptor, ...],
+    ) -> tuple[SkillDescriptor, ...]:
+        if type(selected_skills) is not tuple or any(
+            type(item) is not SkillDescriptor for item in selected_skills
+        ):
+            raise SessionStoreError("invalid_skill_selection")
+        skill_ids = tuple(item.skill_id for item in selected_skills)
+        if len(set(skill_ids)) != len(skill_ids):
+            raise SessionStoreError("invalid_skill_selection")
+        return selected_skills
+
+    @staticmethod
+    def _read_skill_ids(
+        connection: sqlite3.Connection,
+        session_id: str,
+    ) -> tuple[str, ...]:
+        rows = connection.execute(
+            "SELECT position, skill_id "
+            "FROM session_skill_selections "
+            "WHERE session_id = ? "
+            "ORDER BY position",
+            (session_id,),
+        ).fetchall()
+        selected: list[str] = []
+        for expected_position, row in enumerate(rows, start=1):
+            position = row["position"]
+            skill_id = row["skill_id"]
+            if (
+                type(position) is not int
+                or position != expected_position
+                or not isinstance(skill_id, str)
+                or _SKILL_ID_PATTERN.fullmatch(skill_id) is None
+            ):
+                raise SessionStoreError("database_corrupt")
+            selected.append(skill_id)
+        return tuple(selected)
+
+    @staticmethod
+    def _insert_skill_configuration(
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        run_id: str,
+        selected_skills: tuple[SkillDescriptor, ...],
+        insert_selection: bool,
+    ) -> None:
+        if insert_selection:
+            connection.executemany(
+                "INSERT INTO session_skill_selections "
+                "(session_id, position, skill_id) VALUES (?, ?, ?)",
+                (
+                    (session_id, position, item.skill_id)
+                    for position, item in enumerate(selected_skills, start=1)
+                ),
+            )
+        connection.executemany(
+            "INSERT INTO run_skill_snapshots "
+            "(run_id, position, skill_id, source, sha256, char_count) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                (
+                    run_id,
+                    position,
+                    item.skill_id,
+                    item.source.value,
+                    item.sha256,
+                    item.char_count,
+                )
+                for position, item in enumerate(selected_skills, start=1)
+            ),
+        )
+
+    @staticmethod
     def _select_session(
         connection: sqlite3.Connection,
         session_id: str,
@@ -457,9 +578,15 @@ class SQLiteSessionStore:
             ),
         )
 
-    def create_session(self, message: str) -> SessionSubmission:
+    def create_session(
+        self,
+        message: str,
+        *,
+        selected_skills: tuple[SkillDescriptor, ...] = (),
+    ) -> SessionSubmission:
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
+        selected_skills = self._validate_selected_skills(selected_skills)
         safe_message = scrub_text(message, self._sensitive_values)
         try:
             title = make_session_title(safe_message)
@@ -540,6 +667,13 @@ class SQLiteSessionStore:
                     None,
                 ),
             )
+            self._insert_skill_configuration(
+                connection,
+                session_id=session.session_id,
+                run_id=run.run_id,
+                selected_skills=selected_skills,
+                insert_selection=True,
+            )
             self._insert_event(connection, user_event)
             self._insert_event(connection, queued_event)
             connection.commit()
@@ -574,6 +708,125 @@ class SQLiteSessionStore:
         try:
             return self._decode_run(self._select_run(connection, run_id))
         except sqlite3.Error as exc:
+            raise _sqlite_store_error(exc) from None
+        finally:
+            connection.close()
+
+    def get_skill_selection(self, session_id: str) -> tuple[str, ...]:
+        if not isinstance(session_id, str):
+            raise SessionStoreError("session_not_found")
+        connection = self._connect()
+        try:
+            self._select_session(connection, session_id)
+            return self._read_skill_ids(connection, session_id)
+        except sqlite3.Error as exc:
+            raise _sqlite_store_error(exc) from None
+        finally:
+            connection.close()
+
+    def get_run_skill_snapshots(
+        self,
+        run_id: str,
+    ) -> tuple[RunSkillSnapshotMetadata, ...]:
+        if not isinstance(run_id, str):
+            raise SessionStoreError("run_not_found")
+        connection = self._connect()
+        try:
+            self._select_run(connection, run_id)
+            rows = connection.execute(
+                "SELECT position, skill_id, source, sha256, char_count "
+                "FROM run_skill_snapshots "
+                "WHERE run_id = ? "
+                "ORDER BY position",
+                (run_id,),
+            ).fetchall()
+            snapshots: list[RunSkillSnapshotMetadata] = []
+            try:
+                for expected_position, row in enumerate(rows, start=1):
+                    if type(row["position"]) is not int or row["position"] != expected_position:
+                        raise ValueError
+                    snapshots.append(
+                        RunSkillSnapshotMetadata(
+                            skill_id=row["skill_id"],
+                            source=SkillSource(row["source"]),
+                            sha256=row["sha256"],
+                            char_count=row["char_count"],
+                        )
+                    )
+            except (KeyError, TypeError, ValueError):
+                raise SessionStoreError("database_corrupt") from None
+            return tuple(snapshots)
+        except sqlite3.Error as exc:
+            raise _sqlite_store_error(exc) from None
+        finally:
+            connection.close()
+
+    def replace_skill_selection(
+        self,
+        session_id: str,
+        skill_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if (
+            type(skill_ids) is not tuple
+            or any(
+                type(skill_id) is not str
+                or _SKILL_ID_PATTERN.fullmatch(skill_id) is None
+                for skill_id in skill_ids
+            )
+            or len(set(skill_ids)) != len(skill_ids)
+        ):
+            raise SessionStoreError("invalid_skill_selection")
+        connection = self._connect()
+        try:
+            self._begin(connection)
+            session = self._decode_session(
+                self._select_session(connection, session_id)
+            )
+            if session.status is not SessionStatus.IDLE or self._active_run_exists(
+                connection
+            ):
+                raise SessionStoreError("invalid_session_state")
+            connection.execute(
+                "DELETE FROM session_skill_selections WHERE session_id = ?",
+                (session_id,),
+            )
+            connection.executemany(
+                "INSERT INTO session_skill_selections "
+                "(session_id, position, skill_id) VALUES (?, ?, ?)",
+                (
+                    (session_id, position, skill_id)
+                    for position, skill_id in enumerate(skill_ids, start=1)
+                ),
+            )
+            rows = connection.execute(
+                "SELECT position, skill_id "
+                "FROM session_skill_selections "
+                "WHERE session_id = ? ORDER BY position",
+                (session_id,),
+            ).fetchall()
+            reread: list[str] = []
+            for expected_position, row in enumerate(rows, start=1):
+                if (
+                    type(row["position"]) is not int
+                    or row["position"] != expected_position
+                    or not isinstance(row["skill_id"], str)
+                    or _SKILL_ID_PATTERN.fullmatch(row["skill_id"]) is None
+                ):
+                    raise SessionStoreError("database_corrupt")
+                reread.append(row["skill_id"])
+            result = tuple(reread)
+            if result != skill_ids:
+                raise SessionStoreError("database_corrupt")
+            connection.commit()
+            return result
+        except SessionStoreError:
+            self._rollback(connection)
+            raise
+        except sqlite3.IntegrityError:
+            self._rollback(connection)
+            raise SessionStoreError("storage_unavailable") from None
+        except sqlite3.Error as exc:
+            self._rollback(connection)
             raise _sqlite_store_error(exc) from None
         finally:
             connection.close()
@@ -634,9 +887,16 @@ class SQLiteSessionStore:
         finally:
             connection.close()
 
-    def submit_message(self, session_id: str, message: str) -> SessionSubmission:
+    def submit_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        selected_skills: tuple[SkillDescriptor, ...] = (),
+    ) -> SessionSubmission:
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
+        selected_skills = self._validate_selected_skills(selected_skills)
         safe_message = scrub_text(message, self._sensitive_values)
         try:
             make_session_title(safe_message)
@@ -650,6 +910,10 @@ class SQLiteSessionStore:
             self._begin(connection)
             current = self._decode_session(self._select_session(connection, session_id))
             if current.status is not SessionStatus.IDLE or self._active_run_exists(connection):
+                raise SessionStoreError("invalid_session_state")
+            if self._read_skill_ids(connection, session_id) != tuple(
+                item.skill_id for item in selected_skills
+            ):
                 raise SessionStoreError("invalid_session_state")
             ordinal = int(
                 connection.execute(
@@ -703,6 +967,13 @@ class SQLiteSessionStore:
                     None,
                     None,
                 ),
+            )
+            self._insert_skill_configuration(
+                connection,
+                session_id=session_id,
+                run_id=run.run_id,
+                selected_skills=selected_skills,
+                insert_selection=False,
             )
             self._insert_event(connection, user_event)
             self._insert_event(connection, queued_event)

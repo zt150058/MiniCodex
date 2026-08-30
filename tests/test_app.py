@@ -152,6 +152,86 @@ def _successful_factories() -> ApplicationFactories:
     )
 
 
+def _factories_with_model_client(
+    workspace: Path,
+    client: FakeModelClient,
+    *,
+    run_id: str,
+) -> ApplicationFactories:
+    executor = RecordingExecutor()
+
+    def logger_factory(config: RunConfig, clock: object) -> RunEventLogger:
+        assert config.workspace == workspace.resolve(strict=True)
+        return RunEventLogger.create(
+            config.workspace,
+            run_id=run_id,
+            sensitive_values=(config.api_key,),
+            monotonic_clock=clock,  # type: ignore[arg-type]
+        )
+
+    return ApplicationFactories(
+        model_client=lambda config: client,
+        logger=logger_factory,
+        command_executor=lambda: executor,  # type: ignore[arg-type]
+        clock=lambda: 0.0,
+    )
+
+
+def test_execute_agent_run_includes_selected_skill_in_main_request_only(
+    tmp_path: Path,
+) -> None:
+    client = FakeModelClient((ModelResponse(text="done"),))
+    factories = _factories_with_model_client(
+        tmp_path,
+        client,
+        run_id="6" * 32,
+    )
+    private_body = "private selected instructions"
+    result = execute_agent_run(
+        _config(tmp_path),
+        factories=factories,
+        skill_instructions=f"### Skill: review — Review\n{private_body}",
+    )
+    assert result.report.status.value == "success"
+    assert client.requests
+    instructions = client.requests[0].instructions
+    assert instructions is not None
+    assert "## Selected skill instructions" in instructions
+    assert private_body in instructions
+    assert private_body not in json.dumps(result.report.to_dict(), ensure_ascii=False)
+    assert private_body not in (tmp_path / result.report.log_path).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_execute_agent_run_without_skills_preserves_existing_instructions(
+    tmp_path: Path,
+) -> None:
+    first_client = FakeModelClient((ModelResponse(text="done"),))
+    second_client = FakeModelClient((ModelResponse(text="done"),))
+    execute_agent_run(
+        _config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            first_client,
+            run_id="7" * 32,
+        ),
+    )
+    execute_agent_run(
+        _config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            second_client,
+            run_id="8" * 32,
+        ),
+        skill_instructions=None,
+    )
+    first_instructions = first_client.requests[0].instructions
+    assert first_instructions == second_client.requests[0].instructions
+    assert first_instructions is not None
+    assert "## Selected skill instructions" not in first_instructions
+
+
 def test_production_factory_selects_responses_adapter_without_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

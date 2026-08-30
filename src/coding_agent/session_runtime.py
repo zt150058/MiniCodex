@@ -19,6 +19,7 @@ from coding_agent.session import (
     make_persisted_run_report,
     make_safe_run_summary,
 )
+from coding_agent.skills import SkillInstructionBundle
 from coding_agent.streaming import ModelStreamHandler
 
 if TYPE_CHECKING:
@@ -122,8 +123,11 @@ class SessionRunRequest:
     run_id: str
     current_message: str = field(repr=False)
     initial_user_message: str = field(repr=False)
+    skill_bundle: SkillInstructionBundle | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.skill_bundle is not None and type(self.skill_bundle) is not SkillInstructionBundle:
+            raise TypeError("skill_bundle must be SkillInstructionBundle or None")
         for value, name in (
             (self.session_id, "session_id"),
             (self.run_id, "run_id"),
@@ -202,6 +206,9 @@ class AgentSessionRunExecutor:
         from coding_agent.app import execute_agent_run
 
         config = replace(self._base_config, task=request.current_message)
+        skill_instructions = (
+            None if request.skill_bundle is None else request.skill_bundle.text
+        )
         execution = execute_agent_run(
             config,
             factories=self._factories,
@@ -210,6 +217,7 @@ class AgentSessionRunExecutor:
             cancellation_requested=cancellation_requested,
             initial_user_message=request.initial_user_message,
             event_observer=run_event_handler,
+            skill_instructions=skill_instructions,
         )
         report = execution.report.to_dict()
         agent_status = execution.report.status.value
