@@ -7,16 +7,20 @@ name = "coding-agent"
 version = "0.1.0"
 description = "A locally executed coding agent implemented from scratch"
 requires-python = ">=3.11"
-dependencies = ["openai"]
+dependencies = ["openai", "fastapi", "uvicorn"]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "httpx"]
 
 [project.scripts]
 coding-agent = "coding_agent.cli:entrypoint"
+coding-agent-web = "coding_agent.web_cli:entrypoint"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+coding_agent = ["web_static/*.html", "web_static/*.css", "web_static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

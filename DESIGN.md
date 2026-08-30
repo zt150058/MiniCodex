@@ -472,10 +472,15 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 19. **重启恢复等于中断收敛**：启动时将遗留的 queued、running 或 cancelling run 标记为 `interrupted/process_restarted` 并把会话恢复为 idle，不重放工具、不恢复 provider continuation，也不声称续跑。
 20. **声明式 Skill 目录与执行能力分离**：Task21 允许从用户级和工作区级可信本地目录发现受限 `SKILL.md`，按会话持久化有序 Skill ID，并在每次 run 开始前冻结仅存在于内存的指令快照；Skill 正文不进入 SQLite、日志、事件或报告，Skill 不能注册工具、扩大权限或绕过确定性安全与验证策略。
 
-## 18. 首版不实现的功能
+## 18. 已批准、正在实施的本地 Web 里程碑
+
+Task22–Task23 已通过 `docs/superpowers/specs/2026-08-30-local-web-gui-design.md` 的架构审批。实施顺序为：先增加仅绑定 IPv4 loopback、使用进程级 Bearer/Host/Origin 防护的 FastAPI REST/SSE 薄适配层，再增加同源、无构建步骤的本地静态 GUI。AgentRunner、SessionController、SessionEventHub、声明式 Skill、安全策略、验证门和 provider 边界保持不变。
+
+在对应行为通过测试和用户验收前，本节只表示设计已批准，不表示 HTTP/SSE 或 GUI 已经交付。远程访问、WebSocket、账户、多用户、多活动运行、MCP、可执行 Skill 和前端框架仍不在范围内。
+
+## 19. 首版不实现的功能
 
 - 多智能体、子 Agent 和独立 Planner。
-- Web UI、桌面 UI 和聊天式 REPL。
 - 向量数据库、长期记忆和语义检索。
 - 插件系统或工具市场。
 - 并行工具执行。
@@ -483,8 +488,8 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 - macOS、Linux 正式支持。
 - 自定义 Responses endpoint、Azure 专用协议或供应商专用非标准 API。
 - 自动 endpoint 探测、按 URL 猜测 API 模式或凭据回退。
-- SSE/WebSocket/GUI 流式传输、异步客户端、多个 choices、旧式 `function_call` 或非函数工具。
-- HTTP/SSE 传输层、TUI、GUI、账户系统和多会话并发执行；当前只提供框架无关的本地 controller/event 边界。
+- WebSocket、异步客户端、多个 choices、旧式 `function_call` 或非函数工具。
+- TUI、桌面 GUI、账户系统和多会话并发执行。
 - 可执行 Skill、远程 Skill、Skill 安装/编辑/市场和 Skill 自定义工具；Task21 只实现可信本地声明式目录、会话级有序选择和逐 run 不可变指令快照。
 - MCP 客户端或服务端集成。
 - 任意 Shell、网络访问、包安装或服务端托管工具。
@@ -492,7 +497,7 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 - Git 写操作、自动提交、自动推送或远程仓库操作。
 - 对恶意工作区代码的操作系统级隔离保证。
 
-## 19. 当前方案的局限性
+## 20. 当前方案的局限性
 
 - 有限命令白名单只覆盖 Python 演示场景，不是通用 Coding Agent 的完整命令生态。
 - `replace_text` 不适合大规模重构或重复片段复杂编辑。

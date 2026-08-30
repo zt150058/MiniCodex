@@ -620,19 +620,23 @@ def test_dependency_declarations_are_limited_to_approved_packages() -> None:
     metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert metadata["project"]["requires-python"] == ">=3.11"
-    assert metadata["project"]["dependencies"] == ["openai"]
-    assert metadata["project"]["optional-dependencies"]["test"] == ["pytest"]
+    assert metadata["project"]["dependencies"] == ["openai", "fastapi", "uvicorn"]
+    assert metadata["project"]["optional-dependencies"]["test"] == ["pytest", "httpx"]
     assert metadata["build-system"]["requires"] == ["setuptools>=68"]
     assert metadata["build-system"]["build-backend"] == "setuptools.build_meta"
 
 
-def test_console_script_points_to_task_one_entrypoint() -> None:
+def test_console_scripts_and_web_assets_use_approved_entrypoints() -> None:
     metadata = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert metadata["project"]["scripts"] == {
-        "coding-agent": "coding_agent.cli:entrypoint"
+        "coding-agent": "coding_agent.cli:entrypoint",
+        "coding-agent-web": "coding_agent.web_cli:entrypoint",
     }
     assert metadata["tool"]["setuptools"]["packages"]["find"]["where"] == ["src"]
+    assert metadata["tool"]["setuptools"]["package-data"] == {
+        "coding_agent": ["web_static/*.html", "web_static/*.css", "web_static/*.js"]
+    }
 
 
 def test_gitignore_covers_runtime_and_local_credentials() -> None:

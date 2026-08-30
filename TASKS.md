@@ -859,7 +859,81 @@
 
 **当前状态**
 
+`已完成`
+
+## 22. 本地 FastAPI、REST 与 SSE 传输层
+
+**任务目标**
+
+以经过认证的 loopback FastAPI 边界暴露现有 SessionController、SessionEventHub 和声明式 Skill 能力，不改变 Agent、会话或安全语义。
+
+**涉及模块**
+
+- `src/coding_agent/web_auth.py`
+- `src/coding_agent/web.py`
+- `src/coding_agent/web_cli.py`
+- Web 传输层离线测试
+
+**验收标准**
+
+- 只绑定 IPv4 `127.0.0.1`，默认使用系统分配端口。
+- REST 和 SSE 均要求进程级 Bearer token、严格 Host 与 Origin 检查。
+- 所有业务操作委托给现有 SessionController；不增加运行队列或第二套状态机。
+- SSE 保持既有安全事件顺序、游标、重放、等待和 reset-required 语义。
+- HTTP 错误、日志和对象表示不泄漏凭据、路径、异常正文、Skill 指令或 provider 数据。
+- Task 1-21 行为保持，测试不调用真实外部 API。
+
+**需要编写的测试**
+
+- token、Host、Origin、重复 header 和脱敏测试。
+- 严格 DTO、请求体上限、REST 映射和稳定错误测试。
+- SSE 顺序、heartbeat、重放、reset、断连、终止和连接上限测试。
+- Web CLI、loopback socket、随机端口、资源关闭和安装入口测试。
+
+**建议的 Git 提交说明**
+
+`feat: add authenticated local web transport`
+
+**当前状态**
+
 `进行中`
+
+## 23. 本地静态 GUI
+
+**任务目标**
+
+在 Task 22 同源服务中增加无构建步骤的暖色浅色 GUI，展示持久会话、流式 Agent 状态、Skill 选择、取消与验证结果。
+
+**涉及模块**
+
+- `src/coding_agent/web_static/index.html`
+- `src/coding_agent/web_static/app.js`
+- `src/coding_agent/web_static/styles.css`
+- GUI 资源、安全、交互合同和打包测试
+
+**验收标准**
+
+- 左侧会话列表、中间大对话区、顶部运行状态与耗时、底部输入框符合批准设计。
+- 使用 fetch Bearer SSE；token 只在页面内存中存在。
+- 可新建会话、提交 follow-up、选择 Skill、取消 run，并恢复 SSE 游标。
+- 模型文本不经过不安全 HTML sink；不加载远程脚本、样式、字体或图像。
+- GUI 不伪造 SUCCESS，不把浏览器断开映射为 Agent 取消。
+- 静态资源随 wheel 安装，现有 CLI 和 Task 1-22 全部回归通过。
+
+**需要编写的测试**
+
+- HTML/CSS/JS 结构、CSP、token bootstrap 和禁止模式测试。
+- API 路径、Bearer、SSE 游标、重连、reset 和终止合同测试。
+- wheel 资源、安装入口、响应 header 和无外部资源测试。
+- 离线视觉 fixture 和人工多尺寸状态验收。
+
+**建议的 Git 提交说明**
+
+`feat: add local coding agent web interface`
+
+**当前状态**
+
+`未开始`
 
 ## 任务完成规则
 
