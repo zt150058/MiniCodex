@@ -59,6 +59,8 @@ coding-agent "修复失败测试" --workspace . --api-mode chat-completions --ba
 
 这些是正常生产调用，会访问网络、可能产生费用且结果非确定。配置错误以退出码 2 结束，并发生在模型客户端构造和任何网络请求之前。
 
+同一 provider 配置也可用于本地 GUI；通用形式是 `coding-agent-web --workspace <path>`。默认 Responses 示例为 `coding-agent-web --workspace . --model '<openai-model-id>'`；Chat Completions 仍必须同时提供 `--api-mode chat-completions` 和 HTTPS `--base-url`。浏览器只连接本机 GUI 的 REST/SSE，模型请求仍由 Python 适配器发出，GUI 不读取 API key。
+
 ## ModelClient 与适配器边界
 
 核心只依赖 `src/coding_agent/model.py` 中的 `ModelClient.complete(ModelRequest) -> ModelResponse`。`src/coding_agent/openai_client.py` 实现 `OpenAIResponsesClient`；`src/coding_agent/chat_completions_client.py` 独立实现 `ChatCompletionsModelClient`。两者都把 SDK 对象、异常和响应转换为 provider-neutral 内部类型。
@@ -172,8 +174,6 @@ OpenAI-compatible 是协议目标而不是兼容保证。下列扩展仍不在�
 | Azure-specific API | 当前未实现 |
 | proxy 配置 | 当前未实现 |
 | server conversation | 当前未实现 |
-| session persistence | 当前未实现 |
-| SSE / GUI | 当前未实现 |
 | async API | 当前未实现 |
 | automatic endpoint detection | 当前未实现 |
 | executable Skills | 当前未实现 |

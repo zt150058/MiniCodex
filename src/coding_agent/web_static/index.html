@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta id="coding-agent-bootstrap" name="coding-agent-token" content="__CODING_AGENT_ACCESS_TOKEN__">
+    <title>Local Coding Agent</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside id="session-sidebar" class="sidebar" aria-label="会话与 Skill">
+        <div class="brand-row">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" focusable="false">
+              <path d="M7 7.5 3.5 12 7 16.5M17 7.5l3.5 4.5-3.5 4.5M14 5l-4 14" />
+            </svg>
+          </div>
+          <div>
+            <p class="eyebrow">LOCAL WORKSPACE</p>
+            <p class="brand-name">Coding Agent</p>
+          </div>
+          <button id="sidebar-close" class="icon-button sidebar-close" type="button" aria-label="关闭会话栏">×</button>
+        </div>
+
+        <nav aria-label="会话">
+          <button id="new-session-button" class="primary-button new-session" type="button" aria-label="创建新会话">
+            <span aria-hidden="true">＋</span>
+            新会话
+          </button>
+          <div class="section-heading">
+            <h2>最近会话</h2>
+            <span class="section-count" id="session-count">0</span>
+          </div>
+          <ol id="session-list" class="session-list" aria-label="最近会话列表"></ol>
+        </nav>
+
+        <section class="skill-section" aria-labelledby="skill-heading">
+          <button id="skill-toggle" class="skill-toggle" type="button" aria-expanded="false" aria-controls="skill-panel" aria-labelledby="skill-heading skill-summary">
+            <span id="skill-heading" class="skill-toggle__title">Skills</span>
+            <span id="skill-summary" class="skill-toggle__summary">已选择 0 个</span>
+            <span class="skill-toggle__chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div id="skill-panel" class="skill-panel" hidden>
+            <p class="section-copy">选择用于下一次运行的本地声明式指令。</p>
+            <div id="skill-list" class="skill-list" role="group" aria-labelledby="skill-heading"></div>
+          </div>
+        </section>
+
+        <footer class="sidebar-footer">
+          <span class="local-dot" aria-hidden="true"></span>
+          仅在本机工作区运行
+        </footer>
+      </aside>
+
+      <div id="sidebar-scrim" class="sidebar-scrim" aria-hidden="true"></div>
+
+      <main class="workspace" aria-labelledby="conversation-title">
+        <header class="run-header">
+          <button id="sidebar-toggle" class="icon-button sidebar-toggle" type="button" aria-label="打开会话栏">☰</button>
+          <div class="run-identity">
+            <p class="eyebrow">CURRENT SESSION</p>
+            <h1 id="conversation-title">准备开始</h1>
+          </div>
+          <div class="run-facts" aria-label="Agent 运行状态">
+            <div class="run-fact">
+              <span class="fact-label">状态</span>
+              <span id="run-status" class="status-pill status-pill--idle">空闲</span>
+            </div>
+            <div class="run-fact phase-fact">
+              <span class="fact-label">当前阶段</span>
+              <span id="run-phase">等待任务</span>
+            </div>
+            <div class="run-fact">
+              <span class="fact-label">已运行</span>
+              <span id="run-elapsed" class="elapsed-value">00:00</span>
+            </div>
+          </div>
+          <button id="cancel-run-button" class="danger-button" type="button" aria-label="取消当前运行" disabled>取消</button>
+        </header>
+
+        <div id="connection-status" class="connection-status" role="status" aria-live="polite">
+          <span class="connection-dot" aria-hidden="true"></span>
+          正在连接本地服务…
+        </div>
+
+        <section id="conversation-log" class="conversation-log" aria-label="会话内容" aria-live="polite">
+          <div class="empty-state" id="empty-state">
+            <div class="empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <path d="M5 6.5A2.5 2.5 0 0 1 7.5 4h9A2.5 2.5 0 0 1 19 6.5v7a2.5 2.5 0 0 1-2.5 2.5H11l-4.5 3v-3A2.5 2.5 0 0 1 4 13.5v-7Z" />
+                <path d="M8 9h8M8 12h5" />
+              </svg>
+            </div>
+            <p class="eyebrow">READY WHEN YOU ARE</p>
+            <h2>把一个清晰的代码任务交给 Agent</h2>
+            <p>Agent 可以在授权范围内读取和修改工作区文件、运行受控命令，并展示真实验证结果。</p>
+          </div>
+        </section>
+
+        <form id="message-composer" class="composer">
+          <label class="visually-hidden" for="message-input">输入代码任务或后续要求</label>
+          <div class="composer-box">
+            <textarea id="message-input" rows="3" maxlength="12000" placeholder="描述你想检查、修复或实现的内容…"></textarea>
+            <div class="composer-actions">
+              <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
+              <button id="send-message-button" class="send-button" type="submit" aria-label="发送消息">
+                发送
+                <span aria-hidden="true">↗</span>
+              </button>
+            </div>
+          </div>
+        </form>
+      </main>
+    </div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import html
+from importlib.resources import files
 from importlib.resources.abc import Traversable
 import json
 import re
@@ -13,7 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Receive, Scope, Send
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 from .session import (
     SessionControllerError,
@@ -51,6 +53,21 @@ _CONTROLLER_ERROR_STATUS = {
     "schema_unsupported": 503,
 }
 _EVENT_CURSOR_PATTERN = re.compile(r"[0-9]+\Z")
+_ACCESS_TOKEN_MARKER = "__CODING_AGENT_ACCESS_TOKEN__"
+_DOCUMENT_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "img-src 'self'; connect-src 'self'; frame-ancestors 'none'; "
+        "object-src 'none'; base-uri 'none'; form-action 'none'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+}
+_STATIC_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+}
 
 
 class WebStreamLimitError(RuntimeError):
@@ -395,7 +412,11 @@ def create_web_app(
     access_policy: WebAccessPolicy,
     gui_root: Traversable | None = None,
 ) -> FastAPI:
-    del gui_root
+    resource_root = (
+        files("coding_agent").joinpath("web_static")
+        if gui_root is None
+        else gui_root
+    )
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     sse_limiter = _SseConnectionLimiter(max_connections=4, max_per_run=2)
     app.add_middleware(
@@ -443,6 +464,43 @@ def create_web_app(
         if is_api:
             response.headers["Cache-Control"] = "no-store"
         return response
+
+    @app.get("/")
+    def gui_document() -> Response:
+        source = resource_root.joinpath("index.html").read_text(
+            encoding="utf-8"
+        )
+        if source.count(_ACCESS_TOKEN_MARKER) != 1:
+            raise RuntimeError("invalid GUI bootstrap resource")
+        rendered = source.replace(
+            _ACCESS_TOKEN_MARKER,
+            html.escape(access_policy.token, quote=True),
+        )
+        return Response(
+            rendered,
+            media_type="text/html",
+            headers=_DOCUMENT_SECURITY_HEADERS,
+        )
+
+    @app.get("/app.js")
+    def gui_script() -> Response:
+        source = resource_root.joinpath("app.js").read_text(encoding="utf-8")
+        return Response(
+            source,
+            media_type="text/javascript",
+            headers=_STATIC_SECURITY_HEADERS,
+        )
+
+    @app.get("/styles.css")
+    def gui_styles() -> Response:
+        source = resource_root.joinpath("styles.css").read_text(
+            encoding="utf-8"
+        )
+        return Response(
+            source,
+            media_type="text/css",
+            headers=_STATIC_SECURITY_HEADERS,
+        )
 
     @app.get("/api/v1/health")
     def health() -> dict[str, object]:

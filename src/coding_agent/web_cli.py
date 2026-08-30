@@ -4,6 +4,7 @@ import argparse
 import socket
 import sys
 from typing import Mapping, NoReturn, Protocol, Sequence, TextIO
+import webbrowser
 
 import uvicorn
 
@@ -42,7 +43,31 @@ def _uvicorn_config_factory(app: object, **options: object) -> uvicorn.Config:
     )
 
 
-_uvicorn_server_factory = uvicorn.Server
+class _ReadyUvicornServer(uvicorn.Server):
+    def __init__(
+        self,
+        config: uvicorn.Config,
+        *,
+        on_ready,
+    ) -> None:
+        super().__init__(config)
+        self._on_ready = on_ready
+
+    async def startup(self, sockets=None) -> None:
+        await super().startup(sockets=sockets)
+        if self.started:
+            self._on_ready()
+
+
+def _uvicorn_server_factory(
+    config: uvicorn.Config,
+    *,
+    on_ready,
+) -> uvicorn.Server:
+    return _ReadyUvicornServer(config, on_ready=on_ready)
+
+
+_browser_open = webbrowser.open
 
 
 def _explicit_port(value: str) -> int:
@@ -149,7 +174,6 @@ def run_web_application(
     stdout: TextIO,
     stderr: TextIO,
 ) -> int:
-    del open_browser
     listener = None
     controller = None
     exit_code = 0
@@ -183,10 +207,26 @@ def run_web_application(
             proxy_headers=False,
             reload=False,
         )
-        server = _uvicorn_server_factory(server_config)
-        stdout.write(
-            f"Local coding agent: http://127.0.0.1:{assigned_port}/\n"
+        local_url = f"http://127.0.0.1:{assigned_port}/"
+
+        def on_ready() -> None:
+            if not open_browser:
+                return
+            try:
+                opened = _browser_open(local_url)
+            except Exception:
+                opened = False
+            if not opened:
+                _write_fixed(
+                    stderr,
+                    "warning: unable to open local browser\n",
+                )
+
+        server = _uvicorn_server_factory(
+            server_config,
+            on_ready=on_ready,
         )
+        stdout.write(f"Local coding agent: {local_url}\n")
         server.run(sockets=[listener])
     except KeyboardInterrupt:
         exit_code = 130

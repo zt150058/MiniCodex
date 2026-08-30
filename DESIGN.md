@@ -472,11 +472,11 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 19. **重启恢复等于中断收敛**：启动时将遗留的 queued、running 或 cancelling run 标记为 `interrupted/process_restarted` 并把会话恢复为 idle，不重放工具、不恢复 provider continuation，也不声称续跑。
 20. **声明式 Skill 目录与执行能力分离**：Task21 允许从用户级和工作区级可信本地目录发现受限 `SKILL.md`，按会话持久化有序 Skill ID，并在每次 run 开始前冻结仅存在于内存的指令快照；Skill 正文不进入 SQLite、日志、事件或报告，Skill 不能注册工具、扩大权限或绕过确定性安全与验证策略。
 
-## 18. 已批准、正在实施的本地 Web 里程碑
+## 18. 本地 Web 里程碑
 
-Task22–Task23 已通过 `docs/superpowers/specs/2026-08-30-local-web-gui-design.md` 的架构审批。实施顺序为：先增加仅绑定 IPv4 loopback、使用进程级 Bearer/Host/Origin 防护的 FastAPI REST/SSE 薄适配层，再增加同源、无构建步骤的本地静态 GUI。AgentRunner、SessionController、SessionEventHub、声明式 Skill、安全策略、验证门和 provider 边界保持不变。
+Task22–Task23 按 `docs/superpowers/specs/2026-08-30-local-web-gui-design.md` 实施：仅绑定 IPv4 loopback、使用进程级 Bearer/Host/Origin 防护的 FastAPI REST/SSE 薄适配层，承载同源、无构建步骤的本地静态 GUI。GUI 复用既有持久会话、单活动运行、follow-up、协作式取消和声明式 Skill；AgentRunner、SessionController、SessionEventHub、安全策略、验证门和 provider 边界保持不变。
 
-在对应行为通过测试和用户验收前，本节只表示设计已批准，不表示 HTTP/SSE 或 GUI 已经交付。远程访问、WebSocket、账户、多用户、多活动运行、MCP、可执行 Skill 和前端框架仍不在范围内。
+REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果仍需人工 checkpoint。远程访问、WebSocket、账户、多用户、多活动运行、MCP、可执行 Skill 和前端框架仍不在范围内。
 
 ## 19. 首版不实现的功能
 

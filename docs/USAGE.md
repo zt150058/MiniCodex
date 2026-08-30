@@ -1,18 +1,18 @@
 # MiniCodex 使用说明
 
-MiniCodex 是一次性运行的本地 Coding Agent。它在用户指定的工作区内读取和修改 UTF-8 文本、执行受控命令，并由本地验证门决定任务是否成功。模型层默认使用 OpenAI Responses，也可显式选择 compatible Chat Completions。项目入口见[仓库首页](../README.md)，模型接入细节见 [API 说明](OPENAI_API.md)。
+MiniCodex 是本地 Coding Agent，提供一次性 CLI 和同源 Web GUI。它在用户指定的工作区内读取和修改 UTF-8 文本、执行受控命令，并由本地验证门决定任务是否成功。模型层默认使用 OpenAI Responses，也可显式选择 compatible Chat Completions。项目入口见[仓库首页](../README.md)，模型接入细节见 [API 说明](OPENAI_API.md)。
 
 ## 功能与适用场景
 
 适合在可信、可丢弃的 Python 项目副本中检查代码、进行确定性文本修改、运行测试并根据失败结果继续修复。Agent 主循环、消息历史、上下文压缩、工具分派、路径与命令策略、终止条件、验证新鲜度、JSONL 日志和 FinalReport 都由本项目本地实现。
 
-首版不提供聊天 REPL、多 Agent、任意 Shell、网络下载、包安装、文件删除、Git 写入或自动推送。
+Web GUI 提供本地会话持久化、会话切换、follow-up、声明式 Skill 选择、运行状态、流式文本、安全活动卡和协作式取消。首版不提供多 Agent、任意 Shell、网络下载、包安装、文件删除、Git 写入或自动推送。
 
 ## 已验证环境与系统要求
 
 - Windows 优先；当前版本不承诺 Linux 或 macOS 支持。
 - Python 3.11+。
-- 生产依赖为官方 `openai` Python 包，测试依赖为 pytest。
+- 生产依赖为官方 `openai` Python 包、FastAPI 和 Uvicorn；测试依赖为 pytest 与 HTTPX。
 - 默认自动测试完全离线，不需要真实 API key，也不会探测 endpoint。
 
 ## Windows PowerShell 安装
@@ -24,6 +24,7 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[test]"
 coding-agent --help
+coding-agent-web --help
 ```
 
 最后一条命令应只显示 CLI 帮助，不调用模型。若 PowerShell 阻止激活脚本，可直接使用 `.\.venv\Scripts\python.exe` 和 `.\.venv\Scripts\coding-agent.exe`。
@@ -64,6 +65,26 @@ coding-agent "修复失败测试" --workspace . --api-mode chat-completions --ba
 
 `responses` 可省略 `--api-mode`。未提供 `--verify` 时，模型必须通过 `run_command` 选择经过本地安全策略允许且 `purpose="verification"` 的可信命令。目录查看、echo 和 `git status` 不能成为成功证据。
 
+## 本地 Web GUI
+
+通用形式是 `coding-agent-web --workspace <path>`。例如使用默认 Responses mode：
+
+```powershell
+coding-agent-web --workspace . --model '<openai-model-id>' --verify "pytest -q"
+```
+
+compatible Chat Completions 仍需显式 mode、HTTPS API 前缀和对应凭据：
+
+```powershell
+coding-agent-web --workspace . --api-mode chat-completions --base-url '<https-provider-base-url-with-api-prefix>' --model '<compatible-model-id>' --verify "pytest -q"
+```
+
+服务只绑定 IPv4 `127.0.0.1`，默认使用系统分配的随机端口，监听成功后才打开浏览器。传 `--no-open-browser` 可只输出本地 URL。页面、REST 和 fetch-SSE 使用同一进程级 Bearer token，并执行严格 Host 与 Origin 检查；token 不进入 URL、持久存储或日志。它不是远程服务，不应通过端口转发、代理或网络共享暴露。
+
+左侧可新建和切换持久会话；空闲会话可提交 follow-up，并为下一次运行选择有序的声明式 Skill。Skill 选择器只显示可用 Skill 的名称、描述和来源；发现诊断不在 GUI 中展示，指令正文也不会显示，GUI 不执行 Skill。全局一次只运行一个 Agent；运行或取消期间，历史仍可浏览，但发送和 Skill 修改会禁用。取消按钮只请求既有协作式取消，关闭浏览器不会取消正在运行的 Agent，重新打开页面会从持久快照和 SSE 游标恢复。页面通过服务器终态显示成功或失败，不根据浏览器断开伪造结果。
+
+本地 GUI 不提供账户，不支持 MCP，不支持并行运行，也不允许远程使用。浏览器启动失败只产生固定警告，服务仍继续运行。
+
 ## 推荐的安全运行示例
 
 在已备份的项目副本中固定验证命令：
@@ -84,7 +105,7 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 6. 完成候选只有在本地验证门接受新鲜证据后才能成为 SUCCESS。
 7. 预算耗尽、重复无进展、安全拒绝或不可恢复错误产生稳定失败原因。
 
-两个模型适配器内部都支持可选的 provider-neutral 文本流事件，以及首个 delta 前的结构化同步回退。**CLI 仍使用同步最终报告**：当前命令行不会逐 token 显示内容，也没有 SSE、WebSocket 或 GUI 事件传输层。部分输出仅驻留内存；中断后不会写入消息历史、JSONL 或 FinalReport。
+两个模型适配器内部都支持 provider-neutral 文本流事件，以及首个 delta 前的结构化同步回退。**CLI 仍使用同步最终报告**，不会逐 token 显示内容；Web GUI 通过经过认证的 fetch-SSE 投影安全事件。部分输出仅驻留内存；中断后不会写入消息历史、JSONL 或 FinalReport。
 
 ## 五个本地工具
 
@@ -137,6 +158,14 @@ Chat 连续 Agent 循环合同位于 `tests/integration/test_chat_completions_ag
 
 这些 pytest 命令不会调用真实模型 API。
 
+GUI 的确定性视觉 fixture 不读取凭据或调用模型：
+
+```powershell
+.\.venv\Scripts\python.exe tests\manual_web_fixture.py
+```
+
+它只打印一个 `127.0.0.1` URL，用于人工检查宽屏、窄屏、长文本、代码块、紧凑 Skill 选择器和各运行状态；按 Ctrl+C 停止。
+
 ## 常见错误与排查
 
 - `OPENAI_API_KEY is not configured`：只在当前会话配置环境变量，不要打印其值。
@@ -151,7 +180,7 @@ Chat 连续 Agent 循环合同位于 `tests/integration/test_chat_completions_ag
 
 ## 停止运行与清理
 
-按 `Ctrl+C` 请求停止。正常中断应返回 `130` 和 `interrupted` 报告；强制关闭终端可能阻止最终报告写出。
+一次性 CLI 中按 `Ctrl+C` 请求停止，正常中断应返回 `130` 和 `interrupted` 报告；强制关闭终端可能阻止最终报告写出。Web 服务中按 Ctrl+C 会停止接收新请求，等待已接纳的运行协作式结束并关闭资源；关闭浏览器不会取消运行。
 
 进程停止后，用户可以自行删除工作区内 `.coding-agent` 目录来清理本地日志。Agent 没有删除工具，也不会自动清理、提交或上传这些文件。
 
@@ -163,4 +192,4 @@ Chat 连续 Agent 循环合同位于 `tests/integration/test_chat_completions_ag
 
 这不是操作系统级沙箱。被允许执行的工作区脚本、pytest 配置和测试会作为可信代码运行，仍可能访问操作系统资源；策略也不能消除所有检查与使用之间的 TOCTOU 风险。请只处理可信项目，并使用可丢弃、已备份的工作区副本。
 
-当前没有会话持久化、SSE/GUI、异步模型客户端、可执行 Skill 管理或 MCP。`RunInstructionBuilder` 只提供受限的纯文本 Skill 指令输入边界；生命周期控制器、会话管理和动态 Skill/MCP 集成属于后续任务。
+当前已有本地会话持久化、认证 REST/fetch-SSE 和静态 GUI。`RunInstructionBuilder` 只提供受限的声明式纯文本 Skill 指令输入边界；没有可执行 Skill、动态安装或 MCP。项目也不提供账户、远程服务器、多用户、多活动运行、操作系统级沙箱或通用异步模型 API。

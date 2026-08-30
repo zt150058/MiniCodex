@@ -3,7 +3,6 @@ from __future__ import annotations
 from io import StringIO
 from pathlib import Path
 import socket
-from typing import Callable
 
 import pytest
 
@@ -174,10 +173,14 @@ class RecordingServer:
         self._events = events
         self._outcome = outcome
         self.sockets: list[object] | None = None
+        self.ready_callback = None
 
     def run(self, *, sockets: list[object]) -> None:
-        self._events.append("server:run")
         self.sockets = sockets
+        self._events.append("server:ready")
+        if self.ready_callback is not None:
+            self.ready_callback()
+        self._events.append("server:run")
         if self._outcome is not None:
             raise self._outcome
 
@@ -197,6 +200,7 @@ def _patch_composition(
     *,
     shutdown_results: list[bool] | None = None,
     server_outcome: BaseException | None = None,
+    browser_outcome: BaseException | bool | None = None,
 ) -> tuple[RecordingSocket, RecordingController, RecordingServer, dict[str, object]]:
     listener = RecordingSocket(events)
     controller = RecordingController(events, shutdown_results)
@@ -238,12 +242,21 @@ def _patch_composition(
         observed["uvicorn_config"] = (app, options)
         return object()
 
-    def server_factory(_config: object) -> RecordingServer:
+    def server_factory(
+        _config: object,
+        *,
+        on_ready=None,
+    ) -> RecordingServer:
         events.append("server:create")
+        server.ready_callback = on_ready
         return server
 
-    def forbidden_browser_open(_url: str) -> bool:
-        raise AssertionError("Task 22 must not open a browser")
+    def browser_open(url: str) -> bool:
+        events.append(f"browser:open:{url}")
+        observed.setdefault("browser_urls", []).append(url)  # type: ignore[union-attr]
+        if isinstance(browser_outcome, BaseException):
+            raise browser_outcome
+        return True if browser_outcome is None else browser_outcome
 
     monkeypatch.setattr(web_cli, "_socket_factory", socket_factory, raising=False)
     monkeypatch.setattr(web_cli, "_policy_factory", policy_factory, raising=False)
@@ -270,7 +283,7 @@ def _patch_composition(
     monkeypatch.setattr(
         web_cli,
         "_browser_open",
-        forbidden_browser_open,
+        browser_open,
         raising=False,
     )
     return listener, controller, server, observed
@@ -305,6 +318,8 @@ def test_web_application_uses_prebound_loopback_socket_and_reverse_cleanup(
         "controller:open",
         "app:create",
         "server:create",
+        "server:ready",
+        "browser:open:http://127.0.0.1:43123/",
         "server:run",
         "controller:shutdown:5.0",
         "socket:close",
@@ -328,6 +343,81 @@ def test_web_application_uses_prebound_loopback_socket_and_reverse_cleanup(
     assert stderr.getvalue() == ""
     assert listener.closed == 1
     assert controller is not None
+
+
+def test_web_application_browser_opens_only_local_url_after_server_is_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _listener, _controller, _server, observed = _patch_composition(
+        monkeypatch,
+        events,
+    )
+
+    result = web_cli.run_web_application(
+        _run_config(tmp_path),
+        port=0,
+        open_browser=True,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert result == 0
+    assert observed["browser_urls"] == ["http://127.0.0.1:43123/"]
+    assert "web-access-secret" not in observed["browser_urls"][0]  # type: ignore[index]
+    assert events.index("server:ready") < events.index(
+        "browser:open:http://127.0.0.1:43123/"
+    )
+    assert events.index("browser:open:http://127.0.0.1:43123/") < events.index(
+        "server:run"
+    )
+
+
+def test_web_application_no_open_browser_makes_no_browser_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _patch_composition(monkeypatch, events)
+
+    result = web_cli.run_web_application(
+        _run_config(tmp_path),
+        port=0,
+        open_browser=False,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    assert result == 0
+    assert not any(event.startswith("browser:open:") for event in events)
+
+
+def test_web_application_browser_failure_is_nonfatal_and_sanitized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    private_detail = "browser failed at C:/private/path"
+    _patch_composition(
+        monkeypatch,
+        events,
+        browser_outcome=OSError(private_detail),
+    )
+    stderr = StringIO()
+
+    result = web_cli.run_web_application(
+        _run_config(tmp_path),
+        port=0,
+        open_browser=True,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert result == 0
+    assert "server:run" in events
+    assert stderr.getvalue() == "warning: unable to open local browser\n"
+    assert private_detail not in stderr.getvalue()
 
 
 def test_web_application_uses_exclusive_windows_address_option_when_available(

@@ -212,7 +212,47 @@ def test_model_instructions_and_streaming_are_documented_accurately() -> None:
     assert "首个 delta 前" in api_guide
     assert "delta 后不重试" in api_guide
     assert "CLI 仍使用同步最终报告" in usage
-    assert "SSE" in unsupported_or_deferred_section
+    assert "SSE / GUI" not in unsupported_or_deferred_section
+    assert "coding-agent-web" in usage
+
+
+def test_local_web_gui_is_documented_with_its_real_security_boundary() -> None:
+    readme = _read_utf8(ROOT / "README.md")
+    submission = _read_utf8(ROOT / "README.txt")
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+    api_guide = _read_utf8(ROOT / "docs" / "OPENAI_API.md")
+    combined = "\n".join((readme, submission, usage, api_guide))
+
+    for required in (
+        "coding-agent-web --workspace <path>",
+        "--no-open-browser",
+        "127.0.0.1",
+        "随机端口",
+        "Bearer",
+        "Host",
+        "Origin",
+        "会话持久化",
+        "一次只运行一个",
+        "follow-up",
+        "取消",
+        "Skill",
+        "关闭浏览器不会取消",
+        "Responses",
+        "Chat Completions",
+    ):
+        assert required in combined
+
+    for limitation in (
+        "不是远程服务",
+        "不提供账户",
+        "不支持 MCP",
+        "不执行 Skill",
+        "不支持并行运行",
+    ):
+        assert limitation in usage
+
+    assert "安全诊断" not in usage
+    assert "Skill 诊断" not in usage
 
 
 def test_api_guide_matches_both_adapters_and_declares_unsupported_features() -> None:
@@ -293,8 +333,6 @@ def test_api_guide_matches_both_adapters_and_declares_unsupported_features() -> 
         "Azure-specific API",
         "proxy 配置",
         "server conversation",
-        "session persistence",
-        "SSE / GUI",
         "async API",
         "automatic endpoint detection",
         "executable Skills",
