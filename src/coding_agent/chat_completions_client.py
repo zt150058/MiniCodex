@@ -451,6 +451,8 @@ def _stable_fragment(
 ) -> str | None:
     if incoming is None:
         return current
+    if current is not None and incoming == "":
+        return current
     if not isinstance(incoming, str) or not incoming.strip():
         raise _invalid_response(f"tool {field_name} is invalid")
     normalized = incoming.strip()

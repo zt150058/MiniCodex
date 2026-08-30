@@ -593,6 +593,325 @@ def _model_pair(
     )
 
 
+def _java_pair(
+    *,
+    purpose: str = "verification",
+    phase: str = "complete",
+    exit_code: int | None = 0,
+    timed_out: bool = False,
+    truncated: bool = False,
+    safe_error_code: str | None = None,
+    case_count: int = 2,
+    passed_count: int = 2,
+    failed_case: str | None = None,
+    status: str = "ok",
+) -> tuple[ToolCall, ToolResult]:
+    arguments = {
+        "source_root": "src",
+        "main_class": "Main",
+        "tests_directory": "tests",
+        "purpose": purpose,
+    }
+    call = ToolCall("java-verify", "run_java_tests", arguments)
+    output = json.dumps(
+        {
+            "case_count": case_count,
+            "failed_case": failed_case,
+            "passed_count": passed_count,
+            "phase": phase,
+            "purpose": purpose,
+            "safe_error_code": safe_error_code,
+            "source_count": 3,
+            "stderr": "",
+            "stdout": "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return call, ToolResult(
+        call_id=call.call_id,
+        tool_name=call.name,
+        status=status,  # type: ignore[arg-type]
+        output=output if status == "ok" else None,
+        error=None if status == "ok" else "tool failed",
+        metadata=ToolResultMetadata(
+            exit_code=exit_code,
+            timed_out=timed_out,
+            truncated=truncated,
+            duration_ms=25,
+        ),
+    )
+
+
+def test_java_verification_records_fresh_passed_evidence(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    state = _candidate_state(tmp_path)
+    call, result = _java_pair()
+    assert gate.observe_tool_result(state, call, result) is True
+    assert state.verification_attempt_count == 1
+    assert state.verification_status is VerificationStatus.PASSED
+    assert state.validation_index == state.mutation_index == 2
+    assert state.last_verification is not None
+    assert state.last_verification.command == (
+        "run_java_tests source_root=src main_class=Main tests_directory=tests"
+    )
+    assert state.last_verification.source is CommandSource.MODEL
+    assert gate.evaluate(state).outcome is VerificationOutcome.SUCCESS
+
+
+def test_java_test_purpose_does_not_create_final_evidence(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    state = _candidate_state(tmp_path)
+    call, result = _java_pair(purpose="test")
+    assert gate.observe_tool_result(state, call, result) is False
+    assert state.last_verification is None
+    assert state.verification_attempt_count == 0
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_status"),
+    (
+        (
+            {
+                "phase": "compile",
+                "exit_code": 2,
+                "safe_error_code": "compile_failed",
+                "passed_count": 0,
+                "failed_case": None,
+            },
+            VerificationStatus.FAILED,
+        ),
+        (
+            {
+                "phase": "case",
+                "exit_code": 3,
+                "safe_error_code": "program_failed",
+                "passed_count": 0,
+                "failed_case": "tests/case",
+            },
+            VerificationStatus.FAILED,
+        ),
+        (
+            {
+                "phase": "case",
+                "exit_code": 1,
+                "safe_error_code": "output_mismatch",
+                "passed_count": 0,
+                "failed_case": "tests/case",
+            },
+            VerificationStatus.FAILED,
+        ),
+        (
+            {
+                "phase": "case",
+                "exit_code": 1,
+                "safe_error_code": "output_truncated",
+                "passed_count": 0,
+                "failed_case": "tests/case",
+                "truncated": True,
+            },
+            VerificationStatus.FAILED,
+        ),
+        (
+            {
+                "phase": "cleanup",
+                "exit_code": 1,
+                "safe_error_code": "cleanup_failed",
+                "passed_count": 2,
+                "failed_case": None,
+            },
+            VerificationStatus.FAILED,
+        ),
+        (
+            {
+                "phase": "case",
+                "exit_code": None,
+                "safe_error_code": "suite_timed_out",
+                "passed_count": 0,
+                "failed_case": "tests/case",
+                "timed_out": True,
+            },
+            VerificationStatus.TIMED_OUT,
+        ),
+    ),
+)
+def test_java_failure_evidence_never_becomes_passed(
+    tmp_path: Path,
+    changes: dict[str, object],
+    expected_status: VerificationStatus,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    state = _candidate_state(tmp_path)
+    call, result = _java_pair(**changes)  # type: ignore[arg-type]
+    assert gate.observe_tool_result(state, call, result) is True
+    assert state.verification_status is expected_status
+    assert state.verification_status is not VerificationStatus.PASSED
+    assert state.validation_index == state.mutation_index
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "extra_key",
+        "missing_key",
+        "purpose_mismatch",
+        "zero_sources",
+        "zero_cases",
+        "passed_over_case_count",
+        "complete_with_failed_case",
+        "complete_with_safe_error",
+        "exit_zero_failed_phase",
+        "nonzero_complete_phase",
+        "timeout_with_exit_code",
+        "truncated_claimed_pass",
+        "cleanup_partial_without_failed_case",
+    ),
+)
+def test_java_invalid_execution_is_stable_and_does_not_mutate_state(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    call, original = _java_pair()
+    payload = json.loads(original.output or "")
+    metadata = original.metadata
+    if case == "extra_key":
+        payload["extra"] = True
+    elif case == "missing_key":
+        payload.pop("stdout")
+    elif case == "purpose_mismatch":
+        payload["purpose"] = "test"
+    elif case == "zero_sources":
+        payload["source_count"] = 0
+    elif case == "zero_cases":
+        payload["case_count"] = 0
+        payload["passed_count"] = 0
+    elif case == "passed_over_case_count":
+        payload["passed_count"] = 3
+    elif case == "complete_with_failed_case":
+        payload["failed_case"] = "tests/case"
+    elif case == "complete_with_safe_error":
+        payload["safe_error_code"] = "compile_failed"
+    elif case == "exit_zero_failed_phase":
+        payload.update(
+            phase="compile",
+            safe_error_code="compile_failed",
+            passed_count=0,
+        )
+    elif case == "nonzero_complete_phase":
+        metadata = ToolResultMetadata(exit_code=1, duration_ms=25)
+    elif case == "timeout_with_exit_code":
+        payload.update(
+            phase="case",
+            safe_error_code="suite_timed_out",
+            passed_count=0,
+            failed_case="tests/case",
+        )
+        metadata = ToolResultMetadata(
+            exit_code=1,
+            timed_out=True,
+            duration_ms=25,
+        )
+    elif case == "truncated_claimed_pass":
+        metadata = ToolResultMetadata(
+            exit_code=0,
+            truncated=True,
+            duration_ms=25,
+        )
+    else:
+        payload.update(
+            phase="cleanup",
+            safe_error_code="cleanup_failed",
+            passed_count=1,
+            failed_case=None,
+        )
+        metadata = ToolResultMetadata(exit_code=1, duration_ms=25)
+    result = ToolResult(
+        call_id=original.call_id,
+        tool_name=original.tool_name,
+        status="ok",
+        output=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        metadata=metadata,
+    )
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    state = _candidate_state(tmp_path)
+    with pytest.raises(
+        VerificationError,
+        match="invalid Java verification execution",
+    ):
+        gate.observe_tool_result(state, call, result)
+    assert state.verification_attempt_count == 0
+    assert state.last_verification is None
+
+
+def test_java_invalid_absolute_argument_is_ignored(tmp_path: Path) -> None:
+    call, result = _java_pair()
+    call = ToolCall(
+        call.call_id,
+        call.name,
+        {**call.arguments, "source_root": str(tmp_path.resolve())},
+    )
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    state = _candidate_state(tmp_path)
+    assert gate.observe_tool_result(state, call, result) is False
+    assert state.verification_attempt_count == 0
+
+
+def test_new_mutation_makes_java_evidence_stale(tmp_path: Path) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    state = _candidate_state(tmp_path)
+    call, result = _java_pair()
+    assert gate.observe_tool_result(state, call, result) is True
+    state.mutation_index += 1
+    state.verification_status = VerificationStatus.STALE
+    assert gate.evaluate(state).outcome is VerificationOutcome.CONTINUE
+    assert state.validation_index == 2
+    assert state.mutation_index == 3
+
+
+def test_required_command_still_executes_after_fresh_java_evidence(
+    tmp_path: Path,
+) -> None:
+    model_gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    state = _candidate_state(tmp_path)
+    call, result = _java_pair()
+    assert model_gate.observe_tool_result(state, call, result) is True
+    executor = FakeVerificationExecutor(_execution())
+    required_gate = VerificationGate(
+        required_command=_authorized(),
+        execution_context=ExecutionContext(tmp_path),
+        executor=executor,
+    )
+    decision = required_gate.evaluate(state)
+    assert decision.outcome is VerificationOutcome.SUCCESS
+    assert decision.command_executed is True
+    assert len(executor.calls) == 1
+
+
 def test_model_verification_records_ordered_result_at_current_mutation(
     tmp_path: Path,
 ) -> None:

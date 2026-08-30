@@ -379,6 +379,50 @@ def test_chat_stream_assembles_ordered_interleaved_tools_with_text_and_usage() -
     ] == ["working"]
 
 
+def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> None:
+    stream = FakeStream(
+        (
+            chunk(
+                delta=delta(
+                    role="assistant",
+                    tool_calls=[
+                        tool_fragment(
+                            0,
+                            call_id="call-a",
+                            call_type="function",
+                            name="inspect_workspace",
+                            arguments='{"path":"',
+                        )
+                    ],
+                )
+            ),
+            chunk(
+                delta=delta(
+                    tool_calls=[
+                        tool_fragment(0, call_id="", arguments='."}')
+                    ]
+                ),
+                finish_reason="stop",
+            ),
+        )
+    )
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=FakeSDK(stream),
+    )
+
+    response = client.stream(
+        ModelRequest(messages=(UserMessage("task"),)),
+        lambda event: None,
+    )
+
+    assert response.tool_calls == (
+        ToolCall("call-a", "inspect_workspace", {"path": "."}),
+    )
+
+
 @pytest.mark.parametrize(
     ("chunks", "reason"),
     [

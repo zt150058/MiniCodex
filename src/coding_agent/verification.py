@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import re
 import subprocess
 import sys
 from typing import Protocol
@@ -186,6 +187,34 @@ class VerificationExecutor(Protocol):
 _SHELL_OUTPUT_KEYS = frozenset(
     {"argv", "cleanup_error", "purpose", "stderr", "stdout"}
 )
+_JAVA_OUTPUT_KEYS = frozenset(
+    {
+        "case_count",
+        "failed_case",
+        "passed_count",
+        "phase",
+        "purpose",
+        "safe_error_code",
+        "source_count",
+        "stderr",
+        "stdout",
+    }
+)
+_JAVA_ARGUMENT_KEYS = frozenset(
+    {"source_root", "main_class", "tests_directory", "purpose"}
+)
+_JAVA_MAIN_CLASS = re.compile(
+    r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*"
+)
+_JAVA_FAILURE_CODES = frozenset(
+    {
+        "compile_failed",
+        "program_failed",
+        "output_mismatch",
+        "output_truncated",
+        "cleanup_failed",
+    }
+)
 
 
 def _decode_execution(
@@ -245,6 +274,178 @@ def _decode_execution(
         )
     except (json.JSONDecodeError, TypeError, ValueError):
         raise VerificationError("invalid verification execution") from None
+
+
+def _safe_java_relative(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return False
+    path = PureWindowsPath(value)
+    return not path.drive and not path.root and ".." not in path.parts
+
+
+def _java_command_description(arguments: JSONObject) -> str:
+    return (
+        "run_java_tests "
+        f"source_root={arguments['source_root']} "
+        f"main_class={arguments['main_class']} "
+        f"tests_directory={arguments['tests_directory']}"
+    )
+
+
+def _decode_java_execution(
+    execution: ToolExecution,
+    *,
+    arguments: JSONObject,
+    validation_index: int,
+    workspace: Path,
+) -> VerificationResult:
+    try:
+        if (
+            not isinstance(execution, ToolExecution)
+            or not isinstance(execution.output, str)
+            or set(arguments) != _JAVA_ARGUMENT_KEYS
+            or arguments.get("purpose") != "verification"
+            or not _safe_java_relative(arguments.get("source_root"))
+            or not _safe_java_relative(arguments.get("tests_directory"))
+            or not isinstance(arguments.get("main_class"), str)
+            or _JAVA_MAIN_CLASS.fullmatch(arguments["main_class"]) is None
+        ):
+            raise ValueError
+        payload = json.loads(execution.output)
+        if not isinstance(payload, dict) or set(payload) != _JAVA_OUTPUT_KEYS:
+            raise ValueError
+        if payload["purpose"] != "verification":
+            raise ValueError
+        source_count = payload["source_count"]
+        case_count = payload["case_count"]
+        passed_count = payload["passed_count"]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (source_count, case_count, passed_count)
+        ):
+            raise ValueError
+        if (
+            not 1 <= source_count <= 500
+            or not 1 <= case_count <= 200
+            or not 0 <= passed_count <= case_count
+        ):
+            raise ValueError
+        failed_case = payload["failed_case"]
+        if failed_case is not None and not _safe_java_relative(failed_case):
+            raise ValueError
+        safe_error = payload["safe_error_code"]
+        if safe_error is not None and not isinstance(safe_error, str):
+            raise ValueError
+        phase = payload["phase"]
+        stdout = payload["stdout"]
+        stderr = payload["stderr"]
+        if (
+            phase not in {"compile", "case", "cleanup", "complete"}
+            or not isinstance(stdout, str)
+            or not isinstance(stderr, str)
+            or len(stdout.encode("utf-8")) > 8_192
+            or len(stderr.encode("utf-8")) > 8_192
+        ):
+            raise ValueError
+        canonical = str(Path(workspace).resolve(strict=True))
+        diagnostics = (stdout + "\n" + stderr).casefold()
+        if (
+            canonical.casefold() in diagnostics
+            or canonical.replace("\\", "/").casefold() in diagnostics
+        ):
+            raise ValueError
+
+        metadata = execution.metadata
+        if (
+            phase == "complete"
+            and safe_error is None
+            and failed_case is None
+            and passed_count == case_count
+            and metadata.exit_code == 0
+            and not metadata.timed_out
+            and not metadata.truncated
+        ):
+            status = VerificationStatus.PASSED
+            error = None
+        elif (
+            safe_error == "suite_timed_out"
+            and phase in {"compile", "case"}
+            and metadata.exit_code is None
+            and metadata.timed_out
+            and not metadata.truncated
+            and (
+                (phase == "compile" and failed_case is None and passed_count == 0)
+                or (phase == "case" and failed_case is not None)
+            )
+        ):
+            status = VerificationStatus.TIMED_OUT
+            error = "suite_timed_out"
+        elif (
+            safe_error in _JAVA_FAILURE_CODES
+            and metadata.exit_code is not None
+            and metadata.exit_code != 0
+            and not metadata.timed_out
+        ):
+            valid_failure = False
+            if safe_error == "compile_failed":
+                valid_failure = (
+                    phase == "compile"
+                    and failed_case is None
+                    and passed_count == 0
+                    and not metadata.truncated
+                )
+            elif safe_error in {"program_failed", "output_mismatch"}:
+                valid_failure = (
+                    phase == "case"
+                    and failed_case is not None
+                    and passed_count < case_count
+                    and not metadata.truncated
+                )
+            elif safe_error == "output_truncated":
+                valid_failure = (
+                    phase in {"compile", "case"}
+                    and metadata.truncated
+                    and (
+                        (phase == "compile" and failed_case is None)
+                        or (phase == "case" and failed_case is not None)
+                    )
+                )
+            else:
+                valid_failure = phase == "cleanup" and (
+                    (
+                        failed_case is None
+                        and passed_count in {0, case_count}
+                    )
+                    or (
+                        failed_case is not None
+                        and _safe_java_relative(failed_case)
+                        and passed_count < case_count
+                    )
+                )
+            if not valid_failure:
+                raise ValueError
+            status = VerificationStatus.FAILED
+            error = None
+        else:
+            raise ValueError
+
+        return VerificationResult(
+            status=status,
+            validation_index=validation_index,
+            command=_java_command_description(arguments),
+            source=CommandSource.MODEL,
+            exit_code=metadata.exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=metadata.timed_out,
+            truncated=metadata.truncated,
+            duration_ms=metadata.duration_ms,
+            error=error,
+        )
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        raise VerificationError(
+            "invalid Java verification execution"
+        ) from None
 
 
 def _feedback(result: VerificationResult | None, mutation_index: int) -> AssistantMessage:
@@ -323,10 +524,36 @@ class VerificationGate:
             not isinstance(state, AgentState)
             or not isinstance(call, ToolCall)
             or not isinstance(result, ToolResult)
-            or call.name != "run_command"
             or result.call_id != call.call_id
             or result.tool_name != call.name
             or result.status != "ok"
+        ):
+            return False
+        if call.name == "run_java_tests":
+            if (
+                set(call.arguments) != _JAVA_ARGUMENT_KEYS
+                or call.arguments.get("purpose") != "verification"
+                or not _safe_java_relative(call.arguments.get("source_root"))
+                or not _safe_java_relative(
+                    call.arguments.get("tests_directory")
+                )
+                or not isinstance(call.arguments.get("main_class"), str)
+                or _JAVA_MAIN_CLASS.fullmatch(call.arguments["main_class"])
+                is None
+            ):
+                return False
+            evidence = _decode_java_execution(
+                ToolExecution(output=result.output, metadata=result.metadata),
+                arguments=call.arguments,
+                validation_index=state.mutation_index,
+                workspace=self._execution_context.workspace,
+            )
+            state.verification_attempt_count += 1
+            state.last_verification = evidence
+            state.verification_status = evidence.status
+            return True
+        if (
+            call.name != "run_command"
             or set(call.arguments) != {"command", "purpose"}
             or call.arguments.get("purpose") != "verification"
             or not isinstance(call.arguments.get("command"), str)

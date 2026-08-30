@@ -803,6 +803,34 @@ def test_authorized_executor_runs_exact_capability_without_policy(
     assert result.metadata.exit_code == 0
 
 
+def test_authorized_executor_passes_file_backed_stdin(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "read-stdin.py"
+    script.write_text(
+        "import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    input_path = tmp_path / "case.in"
+    input_path.write_bytes("输入\n".encode("utf-8"))
+    argv = (sys.executable, str(script))
+    command = AuthorizedCommand(
+        argv=argv,
+        normalized_command=subprocess.list2cmdline(argv),
+        purpose="test",
+        source=CommandSource.MODEL,
+    )
+    with input_path.open("rb") as stdin_stream:
+        result = AuthorizedCommandExecutor().execute(
+            command,
+            ExecutionContext(tmp_path),
+            stdin_stream=stdin_stream,
+        )
+    payload = json.loads(result.output or "")
+    assert result.metadata.exit_code == 0
+    assert payload["stdout"] == "输入\n"
+
+
 def test_run_command_delegates_to_authorized_executor_once(
     tmp_path: Path,
 ) -> None:
@@ -923,6 +951,47 @@ def test_run_command_security_rejection_does_not_start_process(tmp_path: Path) -
         )
     assert exc_info.value.code is SafetyCode.EXECUTABLE_DENIED
     assert started is False
+
+
+def test_child_environment_removes_java_injection_variables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "CLASSPATH",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "JDK_JAVAC_OPTIONS",
+    ):
+        monkeypatch.setenv(name, "workspace-injection-secret")
+    observed: dict[str, object] = {}
+
+    def recording_factory(
+        argv: tuple[str, ...],
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes]:
+        observed.update(kwargs)
+        return subprocess.Popen(argv, **kwargs)  # type: ignore[arg-type]
+
+    _execute_script(
+        tmp_path,
+        "print('ok')\n",
+        tool=RunCommandTool(process_factory=recording_factory),
+    )
+    environment = observed["env"]
+    assert isinstance(environment, dict)
+    folded = {key.casefold() for key in environment}
+    assert folded.isdisjoint(
+        {
+            "classpath",
+            "java_tool_options",
+            "_java_options",
+            "jdk_java_options",
+            "jdk_javac_options",
+        }
+    )
+    assert "workspace-injection-secret" not in repr(environment)
 
 
 def test_child_environment_removes_policy_widening_values(

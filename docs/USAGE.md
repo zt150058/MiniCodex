@@ -4,7 +4,7 @@ MiniCodex 是本地 Coding Agent，提供一次性 CLI 和同源 Web GUI。它�
 
 ## 功能与适用场景
 
-适合在可信、可丢弃的 Python 项目副本中检查代码、进行确定性文本修改、运行测试并根据失败结果继续修复。Agent 主循环、消息历史、上下文压缩、工具分派、路径与命令策略、终止条件、验证新鲜度、JSONL 日志和 FinalReport 都由本项目本地实现。
+适合在可信、可丢弃的 Python 或简单 Java 项目副本中检查代码、进行确定性文本修改、运行测试并根据失败结果继续修复。Agent 主循环、消息历史、上下文压缩、工具分派、路径与命令策略、终止条件、验证新鲜度、JSONL 日志和 FinalReport 都由本项目本地实现。
 
 Web GUI 提供本地会话持久化、会话切换、follow-up、声明式 Skill 选择、运行状态、流式文本、安全活动卡和协作式取消。首版不提供多 Agent、任意 Shell、网络下载、包安装、文件删除、Git 写入或自动推送。
 
@@ -12,6 +12,7 @@ Web GUI 提供本地会话持久化、会话切换、follow-up、声明式 Skill
 
 - Windows 优先；当前版本不承诺 Linux 或 macOS 支持。
 - Python 3.11+。
+- Java 黑盒验证需要 Windows PATH 中可用的可信 `javac.exe` 和 `java.exe`；工具不会下载 JDK。
 - 生产依赖为官方 `openai` Python 包、FastAPI 和 Uvicorn；测试依赖为 pytest 与 HTTPX。
 - 默认自动测试完全离线，不需要真实 API key，也不会探测 endpoint。
 
@@ -63,7 +64,15 @@ coding-agent "修复失败测试" --workspace . --api-mode responses --model '<o
 coding-agent "修复失败测试" --workspace . --api-mode chat-completions --base-url '<https-provider-base-url-with-api-prefix>' --model '<compatible-model-id>' --verify "pytest -q"
 ```
 
-`responses` 可省略 `--api-mode`。未提供 `--verify` 时，模型必须通过 `run_command` 选择经过本地安全策略允许且 `purpose="verification"` 的可信命令。目录查看、echo 和 `git status` 不能成为成功证据。
+`responses` 可省略 `--api-mode`。未提供 `--verify` 时，模型必须通过 `run_command` 产生可信验证证据，或通过 `run_java_tests` 产生新鲜且内部一致的 Java verification 证据。目录查看、echo 和 `git status` 不能成为成功证据。
+
+简单 Java 标准输入输出项目可省略 Python 验证命令：
+
+```powershell
+coding-agent "修复 Java 程序并运行 tests 中的输入输出用例" --workspace . --api-mode responses --model '<openai-model-id>'
+```
+
+Java 项目不要附加无关的 `--verify "pytest -q"`；用户一旦提供 `--verify`，该命令仍是不可替代的强制最终门槛。
 
 ## 本地 Web GUI
 
@@ -107,7 +116,7 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 
 两个模型适配器内部都支持 provider-neutral 文本流事件，以及首个 delta 前的结构化同步回退。**CLI 仍使用同步最终报告**，不会逐 token 显示内容；Web GUI 通过经过认证的 fetch-SSE 投影安全事件。部分输出仅驻留内存；中断后不会写入消息历史、JSONL 或 FinalReport。
 
-## 五个本地工具
+## 六个本地工具
 
 | 工具 | 能力与主要限制 |
 | --- | --- |
@@ -116,12 +125,19 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 | `replace_text` | 仅在实际匹配数等于 expected count 时执行精确替换。 |
 | `write_file` | 只创建不存在的新 UTF-8 文件，不覆盖且不创建父目录。 |
 | `run_command` | 参数数组、`shell=False`、固定 cwd、超时与双流 64 KiB 上限。 |
+| `run_java_tests` | 使用可信本机 JDK 编译源码并运行成对 `.in`/`.out` 黑盒用例。 |
 
-文件工具不能访问 `.git/` 或 `.coding-agent/`。命令仅允许策略明确支持的 Python/pytest/unittest、受限 ruff/mypy 和只读 Git 形式；最终是否允许以运行时安全策略为准。
+`run_java_tests` 的 strict schema 是 `source_root`、`main_class`、`tests_directory` 和 `purpose`；`purpose` 只能是 `test` 或 `verification`。源码与 fixture 根目录都必须是工作区相对路径。最多发现 500 个 `.java` 文件和 200 对用例；单个 `.in` 原始输入最多 262,144 字节，单个 `.out` 期望输出最多 65,536 字节。用例按大小写折叠后的 POSIX 相对路径稳定排序，实际输出与期望输出只归一化 CRLF/CR/LF，除此之外精确比较。
+
+`purpose="test"` 只提供局部测试结果，不能形成最终成功证据。只有新鲜的 Java verification 结果，即 `purpose="verification"` 且全部用例通过、`validation_index == mutation_index`，才可满足没有用户 `--verify` 的验证门。编译和全部用例共享最多 60 秒的截止时间；输出、超时、首个失败 case 和安全错误使用有界结构化结果。
+
+文件工具不能访问 `.git/` 或 `.coding-agent/`。`run_command` 仍不能执行 Java 命令字符串，只允许策略明确支持的 Python/pytest/unittest、受限 ruff/mypy 和只读 Git 形式。Java 编译器与运行时只由专用工具从净化 PATH 解析成工作区外的可信绝对路径；不支持 Maven、Gradle 或 JUnit。
 
 ## 成功、验证与退出码
 
 SUCCESS 不由模型文字决定。最新验证必须在最后一次文件修改后运行、退出码为 0，并满足 `validation_index == mutation_index`。
+
+用户提供 `--verify` 时，即使已有新鲜 Java 证据，也必须执行用户命令并以其结果为最终门槛；未提供时才允许可信 `run_command` 或完整通过的 Java verification 证据。
 
 | 退出码 | FinalReport 状态 | 含义 |
 | --- | --- | --- |
@@ -150,6 +166,8 @@ Chat 连续 Agent 循环合同位于 `tests/integration/test_chat_completions_ag
 .\.venv\Scripts\python.exe -m pytest tests\integration\test_chat_completions_agent.py -q -p no:cacheprovider
 ```
 
+Java headless Agent 合同位于 `tests/integration/test_java_agent.py`；真实本机 JDK 冒烟位于 `tests/tools/test_java_tool.py`。前者完全离线使用 fake executor，后者在临时工作区真实编译并运行一个 `.in`/`.out` 用例。
+
 完整离线测试：
 
 ```powershell
@@ -175,6 +193,7 @@ GUI 的确定性视觉 fixture 不读取凭据或调用模型：
 - `model is not configured`：设置 `OPENAI_MODEL` 或传 `--model`。
 - `workspace rejected`：确认目录存在，且路径没有非法设备名、受保护组件或 reparse point。
 - `--verify rejected`：命令不在安全白名单、包含控制符，或不是可信验证命令。
+- `trusted Java runtime is unavailable`：确认 Windows PATH 中存在工作区外的 `javac.exe` 与 `java.exe`。
 - 退出 `1`：读取 FinalReport 的 termination reason、验证证据和 `.coding-agent/logs/<run_id>.jsonl` 中的脱敏事件。
 - 测试超时：命令执行器会终止 Windows 子进程树并保留受限的 stdout/stderr；检查 `timed_out` 和 `cleanup_error`。
 
@@ -192,4 +211,4 @@ GUI 的确定性视觉 fixture 不读取凭据或调用模型：
 
 这不是操作系统级沙箱。被允许执行的工作区脚本、pytest 配置和测试会作为可信代码运行，仍可能访问操作系统资源；策略也不能消除所有检查与使用之间的 TOCTOU 风险。请只处理可信项目，并使用可丢弃、已备份的工作区副本。
 
-当前已有本地会话持久化、认证 REST/fetch-SSE 和静态 GUI。`RunInstructionBuilder` 只提供受限的声明式纯文本 Skill 指令输入边界；没有可执行 Skill、动态安装或 MCP。项目也不提供账户、远程服务器、多用户、多活动运行、操作系统级沙箱或通用异步模型 API。
+当前已有本地会话持久化、认证 REST/fetch-SSE 和静态 GUI。`RunInstructionBuilder` 只提供受限的声明式纯文本 Skill 指令输入边界；没有可执行 Skill、动态安装或 MCP。专用 Java 工具会执行可信工作区代码，不是操作系统级沙箱；它不支持 Maven、Gradle 或 JUnit，也不会下载依赖或 JDK。项目也不提供账户、远程服务器、多用户、多活动运行、操作系统级沙箱或通用异步模型 API。

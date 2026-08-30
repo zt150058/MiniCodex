@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import StringIO
 import json
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
@@ -39,6 +40,8 @@ class RecordingExecutor:
         self,
         command: AuthorizedCommand,
         context: ExecutionContext,
+        *,
+        stdin_stream: BinaryIO | None = None,
     ) -> ToolExecution:
         self.calls.append((command, context))
         return ToolExecution(
@@ -382,6 +385,7 @@ def test_composition_uses_fixed_tools_and_shared_executor(tmp_path: Path) -> Non
         "replace_text",
         "write_file",
         "run_command",
+        "run_java_tests",
     ]
 
 

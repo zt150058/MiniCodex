@@ -423,11 +423,15 @@ class ContextManager:
                 summary_source=SummarySource.NONE,
             )
         initial, prefix, turns = _partition_complete_turns(state.messages)
-        removable_turn_count = len(turns) - self._limits.recent_turns
-        if removable_turn_count <= 0:
+        maximum_removable = len(turns) - 1
+        if maximum_removable <= 0:
             raise ContextPreparationError(
                 TerminationReason.CONTEXT_BUDGET_EXHAUSTED
             )
+        removable_turn_count = min(
+            maximum_removable,
+            max(1, len(turns) - self._limits.recent_turns),
+        )
         removed_messages = prefix + tuple(
             message
             for turn in turns[:removable_turn_count]
@@ -465,29 +469,58 @@ class ContextManager:
             summary = _fallback_summary(state, removed_messages)
             summary_source = SummarySource.FALLBACK
             summary_model_failed = True
-        if len(summary.to_json()) > self._limits.max_summary_chars:
-            raise ContextPreparationError(
-                TerminationReason.CONTEXT_BUDGET_EXHAUSTED
-            )
-        retained_messages = tuple(
-            message
-            for turn in turns[removable_turn_count:]
-            for message in turn
-        )
-        messages = (initial, _render_summary_message(summary), *retained_messages)
-        prepared_size = self.measure(messages)
-        if (
-            prepared_size.serialized_chars > self._limits.max_serialized_chars
-            or prepared_size.history_items > self._limits.max_history_items
+        for candidate_count in range(
+            removable_turn_count,
+            maximum_removable + 1,
         ):
-            raise ContextPreparationError(
-                TerminationReason.CONTEXT_BUDGET_EXHAUSTED
+            candidate_removed = prefix + tuple(
+                message
+                for turn in turns[:candidate_count]
+                for message in turn
             )
-        return PreparedContext(
-            messages=messages,
-            continuation_items=(),
-            size=prepared_size,
-            compressed=True,
-            summary_source=summary_source,
-            summary_model_failed=summary_model_failed,
+            if candidate_count == removable_turn_count:
+                candidate_summary = summary
+                candidate_source = summary_source
+                candidate_model_failed = summary_model_failed
+            else:
+                candidate_summary = _fallback_summary(
+                    state,
+                    candidate_removed,
+                )
+                candidate_source = SummarySource.FALLBACK
+                candidate_model_failed = summary_model_failed
+            if (
+                len(candidate_summary.to_json())
+                > self._limits.max_summary_chars
+            ):
+                raise ContextPreparationError(
+                    TerminationReason.CONTEXT_BUDGET_EXHAUSTED
+                )
+            retained_messages = tuple(
+                message
+                for turn in turns[candidate_count:]
+                for message in turn
+            )
+            messages = (
+                initial,
+                _render_summary_message(candidate_summary),
+                *retained_messages,
+            )
+            prepared_size = self.measure(messages)
+            if (
+                prepared_size.serialized_chars
+                <= self._limits.max_serialized_chars
+                and prepared_size.history_items
+                <= self._limits.max_history_items
+            ):
+                return PreparedContext(
+                    messages=messages,
+                    continuation_items=(),
+                    size=prepared_size,
+                    compressed=True,
+                    summary_source=candidate_source,
+                    summary_model_failed=candidate_model_failed,
+                )
+        raise ContextPreparationError(
+            TerminationReason.CONTEXT_BUDGET_EXHAUSTED
         )

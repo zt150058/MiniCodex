@@ -334,6 +334,98 @@ class AuthorizedCommand:
 ExecutableLocator = Callable[[str], str | None]
 
 
+def _locate_from_sanitized_path(workspace: Path, name: str) -> str | None:
+    runtime_directory = Path(sys.executable).resolve(strict=True).parent
+    accepted_entries: list[str] = []
+    for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not raw_entry:
+            continue
+        entry = Path(raw_entry)
+        if not entry.is_absolute():
+            continue
+        try:
+            resolved = entry.resolve(strict=True)
+        except OSError:
+            continue
+        try:
+            common = os.path.commonpath((str(workspace), str(resolved)))
+        except ValueError:
+            common = ""
+        inside_workspace = os.path.normcase(common) == os.path.normcase(
+            str(workspace)
+        )
+        if inside_workspace and os.path.normcase(
+            str(resolved)
+        ) != os.path.normcase(str(runtime_directory)):
+            continue
+        accepted_entries.append(str(resolved))
+    return shutil.which(name, path=os.pathsep.join(accepted_entries))
+
+
+@dataclass(frozen=True, slots=True)
+class JavaRuntime:
+    javac: Path
+    java: Path
+
+
+class JavaRuntimePolicy:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        executable_locator: ExecutableLocator | None = None,
+    ) -> None:
+        self._paths = PathGuard(workspace)
+        self._executable_locator = (
+            self._locate_from_sanitized_path
+            if executable_locator is None
+            else executable_locator
+        )
+
+    @property
+    def workspace(self) -> Path:
+        return self._paths.workspace
+
+    def _locate_from_sanitized_path(self, name: str) -> str | None:
+        return _locate_from_sanitized_path(self.workspace, name)
+
+    def _trusted(self, name: str) -> Path:
+        located = self._executable_locator(name)
+        if located is None:
+            raise SafetyViolation(
+                SafetyCode.EXECUTABLE_DENIED,
+                "trusted Java runtime is unavailable",
+            )
+        try:
+            resolved = Path(located).resolve(strict=True)
+        except OSError:
+            raise SafetyViolation(
+                SafetyCode.EXECUTABLE_DENIED,
+                "trusted Java runtime is unavailable",
+            ) from None
+        try:
+            common = os.path.commonpath((str(self.workspace), str(resolved)))
+        except ValueError:
+            common = ""
+        if (
+            not resolved.is_file()
+            or resolved.name.casefold() != name.casefold()
+            or os.path.normcase(common)
+            == os.path.normcase(str(self.workspace))
+        ):
+            raise SafetyViolation(
+                SafetyCode.EXECUTABLE_DENIED,
+                "trusted Java runtime is unavailable",
+            )
+        return resolved
+
+    def resolve(self) -> JavaRuntime:
+        return JavaRuntime(
+            javac=self._trusted("javac.exe"),
+            java=self._trusted("java.exe"),
+        )
+
+
 class CommandPolicy:
     def __init__(
         self,
@@ -629,27 +721,7 @@ class CommandPolicy:
         return tuple(rendered)
 
     def _locate_from_sanitized_path(self, name: str) -> str | None:
-        runtime_directory = Path(sys.executable).resolve(strict=True).parent
-        accepted_entries: list[str] = []
-        for raw_entry in os.environ.get("PATH", "").split(os.pathsep):
-            if not raw_entry:
-                continue
-            entry = Path(raw_entry)
-            if not entry.is_absolute():
-                continue
-            try:
-                resolved = entry.resolve(strict=True)
-            except OSError:
-                continue
-            try:
-                common = os.path.commonpath((str(self.workspace), str(resolved)))
-            except ValueError:
-                common = ""
-            inside_workspace = os.path.normcase(common) == os.path.normcase(str(self.workspace))
-            if inside_workspace and os.path.normcase(str(resolved)) != os.path.normcase(str(runtime_directory)):
-                continue
-            accepted_entries.append(str(resolved))
-        return shutil.which(name, path=os.pathsep.join(accepted_entries))
+        return _locate_from_sanitized_path(self.workspace, name)
 
     def _trusted_launcher(
         self,

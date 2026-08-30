@@ -933,6 +933,47 @@
 
 **当前状态**
 
+`已完成`
+
+## 24. Run 投影、自适应上下文与 Java 黑盒验证
+
+**任务目标**
+
+按批准设计只显示每个 Run 的最终助手回复，使上下文压缩在硬预算下动态缩减保留 turn，并新增受控 `run_java_tests` Java 编译与输入输出验证工具。
+
+**涉及模块**
+
+- `src/coding_agent/web_static/app.js`
+- `src/coding_agent/context.py`
+- `src/coding_agent/safety.py`
+- `src/coding_agent/tools/shell.py`
+- `src/coding_agent/tools/java.py`
+- `src/coding_agent/verification.py`
+- `src/coding_agent/app.py`
+- 对应 Python、Node、集成和文档测试
+
+**验收标准**
+
+- 活跃 Run 只有一张临时状态卡，成功 Run 只显示最后回复，失败或中断 Run 不显示过程叙述。
+- 超过硬预算时动态移除最旧完整 turn，至少保留最新完整 turn，最多调用一次摘要模型，并在压缩后清空 continuation。
+- `run_java_tests` 使用 strict schema、PathGuard、可信系统 JDK、`shell=False`、固定工作区、受限环境、稳定发现、全局超时和有界输出。
+- Java 黑盒用例按 `.in`/`.out` 成对执行，只归一化换行后精确比较；完整通过可形成当前 mutation 的可信验证证据。
+- `run_command` 白名单、用户强制 `--verify`、现有 Python 验证、provider、会话、安全、日志和最终报告行为保持兼容。
+- 默认测试完全离线，不读取真实密钥；真实 JDK 冒烟在本机实际执行并单独报告。
+
+**需要编写的测试**
+
+- GUI run_id 投影、实时状态、成功、失败、中断和重载测试。
+- 上下文硬项数回归、扩展删除、工具配对、单次摘要、fallback 和 continuation 测试。
+- Java schema、路径、runtime、发现、编译、用例、输出、超时、清理和环境隔离测试。
+- Java 验证新鲜度、强制命令优先级、Agent 集成和完整回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: add adaptive context and java verification`
+
+**当前状态**
+
 `进行中`
 
 ## 任务完成规则

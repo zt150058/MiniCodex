@@ -12,6 +12,7 @@ from coding_agent.safety import (
     AuthorizedCommand,
     CommandPolicy,
     CommandSource,
+    JavaRuntimePolicy,
     SafetyCode,
     SafetyViolation,
     parse_windows_command_line,
@@ -28,6 +29,75 @@ def _assert_command_violation(
     assert exc_info.value.code is code
     assert str(exc_info.value).startswith(f"{code.value}: ")
     return exc_info.value
+
+
+def _fake_java_runtime(tmp_path: Path) -> tuple[Path, Path, Path]:
+    workspace = tmp_path / "workspace"
+    runtime = tmp_path / "runtime"
+    workspace.mkdir()
+    runtime.mkdir()
+    javac = runtime / "javac.exe"
+    java = runtime / "java.exe"
+    javac.write_bytes(b"trusted compiler")
+    java.write_bytes(b"trusted runtime")
+    return workspace, javac, java
+
+
+def test_java_runtime_policy_returns_only_resolved_external_executables(
+    tmp_path: Path,
+) -> None:
+    workspace, javac, java = _fake_java_runtime(tmp_path)
+    located = {"javac.exe": str(javac), "java.exe": str(java)}
+    resolved = JavaRuntimePolicy(
+        workspace,
+        executable_locator=located.get,
+    ).resolve()
+    assert resolved.javac == javac.resolve(strict=True)
+    assert resolved.java == java.resolve(strict=True)
+
+
+def test_java_runtime_policy_rejects_workspace_shadow_executables(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for name in ("javac.exe", "java.exe"):
+        (workspace / name).write_bytes(b"shadow")
+    located = {
+        "javac.exe": str(workspace / "javac.exe"),
+        "java.exe": str(workspace / "java.exe"),
+    }
+    with pytest.raises(SafetyViolation) as caught:
+        JavaRuntimePolicy(workspace, executable_locator=located.get).resolve()
+    assert caught.value.code is SafetyCode.EXECUTABLE_DENIED
+
+
+@pytest.mark.parametrize("missing", ["javac.exe", "java.exe"])
+def test_java_runtime_policy_rejects_missing_runtime_component(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    workspace, javac, java = _fake_java_runtime(tmp_path)
+    located: dict[str, str | None] = {
+        "javac.exe": str(javac),
+        "java.exe": str(java),
+    }
+    located[missing] = None
+    with pytest.raises(SafetyViolation) as caught:
+        JavaRuntimePolicy(workspace, executable_locator=located.get).resolve()
+    assert caught.value.code is SafetyCode.EXECUTABLE_DENIED
+    assert caught.value.public_message == "trusted Java runtime is unavailable"
+
+
+def test_model_command_policy_still_rejects_java_strings(tmp_path: Path) -> None:
+    for command in ("java.exe Main", "javac.exe src\\Main.java"):
+        with pytest.raises(SafetyViolation) as caught:
+            CommandPolicy(tmp_path).authorize(
+                command,
+                purpose="test",
+                source=CommandSource.MODEL,
+            )
+        assert caught.value.code is SafetyCode.EXECUTABLE_DENIED
 
 
 @pytest.mark.parametrize(

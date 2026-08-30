@@ -13,6 +13,7 @@ from coding_agent.tools.filesystem import (
     WriteFileTool,
 )
 from coding_agent.tools.shell import RunCommandTool
+from coding_agent.tools.java import RunJavaTestsTool
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,7 +132,7 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         "## 最小运行示例",
         "## 推荐的安全运行示例",
         "## Agent 运行流程",
-        "## 五个本地工具",
+        "## 六个本地工具",
         "## 成功、验证与退出码",
         "## JSONL 日志与 FinalReport",
         "## 离线演示与完整测试",
@@ -156,7 +157,7 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         assert name in help_text
         assert f"`{name}`" in text
 
-    tools_section = _section(text, "## 五个本地工具")
+    tools_section = _section(text, "## 六个本地工具")
     documented_tools = re.findall(r"^\| `([^`]+)` \|", tools_section, flags=re.MULTILINE)
     actual_tools = [
         ListDirectoryTool.name,
@@ -164,6 +165,7 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         ReplaceTextTool.name,
         WriteFileTool.name,
         RunCommandTool.name,
+        RunJavaTestsTool.name,
     ]
     assert documented_tools == actual_tools
 
@@ -192,6 +194,24 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         "validation_index == mutation_index",
         "Ctrl+C",
         "tests/integration/test_agent_repair.py",
+    ):
+        assert required in text
+
+    for required in (
+        "`run_java_tests`",
+        "`source_root`",
+        "`main_class`",
+        "`tests_directory`",
+        '`purpose="verification"`',
+        "`.in`",
+        "`.out`",
+        "65,536",
+        "262,144",
+        "不支持 Maven、Gradle 或 JUnit",
+        "不是操作系统级沙箱",
+        'Java 项目不要附加无关的 `--verify "pytest -q"`',
+        "只有新鲜的 Java verification 结果",
+        "`run_command` 仍不能执行 Java 命令字符串",
     ):
         assert required in text
 

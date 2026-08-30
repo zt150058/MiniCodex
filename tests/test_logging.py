@@ -20,6 +20,8 @@ from coding_agent.messages import (
 from coding_agent.model import (
     FakeModelClient,
     ModelCallBudget,
+    ModelObservation,
+    ModelObservationKind,
     ModelCallPurpose,
     invoke_model,
 )
@@ -306,6 +308,45 @@ def test_model_observations_map_to_jsonl_and_aggregate_usage(tmp_path: Path) -> 
     assert "main output stays private" not in raw
     assert "summary output stays private" not in raw
     assert "raw-provider-id-main" not in raw
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "invalid_model_response",
+        "streaming_unsupported",
+        "stream_interrupted",
+        "model_client_error",
+        "transient_model_error",
+        "fatal_model_error",
+    ],
+)
+def test_adapter_provider_error_codes_are_logged_without_audit_failure(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="5" * 32)
+
+    logger.observe_model(
+        ModelObservation(
+            kind=ModelObservationKind.PROVIDER_FAILED,
+            purpose=ModelCallPurpose.MAIN,
+            logical_call_index=1,
+            provider_attempt_index=1,
+            error_code=error_code,
+            retry_scheduled=False,
+            retry_delay_ms=None,
+        )
+    )
+    logger.close()
+
+    raw = (
+        tmp_path / ".coding-agent" / "logs" / ("5" * 32 + ".jsonl")
+    ).read_text(encoding="utf-8")
+    event = json.loads(raw)
+    assert event["event_type"] == "provider_attempt_failed"
+    assert event["data"]["error_code"] == error_code
+    assert "audit_log_failure" not in raw
 
 
 @pytest.mark.parametrize(

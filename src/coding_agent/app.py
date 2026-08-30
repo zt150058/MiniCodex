@@ -30,6 +30,7 @@ from coding_agent.tools.filesystem import (
     WriteFileTool,
 )
 from coding_agent.tools.registry import ToolRegistry
+from coding_agent.tools.java import RunJavaTestsTool
 from coding_agent.tools.shell import AuthorizedCommandExecutor, RunCommandTool
 from coding_agent.verification import VerificationGate
 
@@ -141,6 +142,7 @@ def execute_agent_run(
                 ReplaceTextTool(),
                 WriteFileTool(),
                 RunCommandTool(authorized_executor=executor),
+                RunJavaTestsTool(executor=executor),
             )
         )
         model_client = selected.model_client(config)

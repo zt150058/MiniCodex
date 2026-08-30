@@ -423,6 +423,125 @@ test("controller submits follow-up for a selected idle session", async () => {
 });
 
 
+test("controller renders an accepted follow-up immediately from durable state", async () => {
+  const { document, elements } = controllerFixture();
+  let loads = 0;
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Existing", status: "idle", last_run_id: "r0" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async (sessionId) => {
+      loads += 1;
+      if (loads === 1) {
+        return {
+          session: { session_id: sessionId, title: "Existing", status: "idle", last_run_id: "r0" },
+          runs: [{ run_id: "r0", status: "failed", started_at_utc: null }],
+          events: [{ sequence: 1, kind: "user_message", data: { content: "Initial" } }],
+          skill_ids: [],
+        };
+      }
+      return {
+        session: { session_id: sessionId, title: "Existing", status: "running", last_run_id: "r1" },
+        runs: [
+          { run_id: "r0", status: "failed", started_at_utc: null },
+          { run_id: "r1", status: "running", started_at_utc: null },
+        ],
+        events: [
+          { sequence: 1, kind: "user_message", data: { content: "Initial" } },
+          { sequence: 2, kind: "user_message", data: { content: "Continue" } },
+        ],
+        skill_ids: [],
+      };
+    },
+    submitFollowUp: async (sessionId) => ({ session_id: sessionId, run_id: "r1" }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer: async () => "terminal",
+  });
+  await controller.initialize();
+  const sessionButton = findElements(elements.sessionList, "button")[0];
+  elements.sessionList.dispatchEvent({ type: "click", target: sessionButton });
+  await controller.whenIdle();
+
+  elements.messageInput.value = "Continue";
+  elements.messageComposer.dispatchEvent(submitEvent());
+  await controller.whenIdle();
+
+  const renderedFollowUp = elements.conversationLog.textContent.includes("Continue");
+  controller.destroy();
+  assert.equal(loads, 2);
+  assert.equal(renderedFollowUp, true);
+});
+
+
+test("controller starts each new run with clean transient state", async () => {
+  const { document, elements } = controllerFixture();
+  let loads = 0;
+  const streamStarts = [];
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Existing", status: "idle", last_run_id: "r0" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async (sessionId) => {
+      loads += 1;
+      return {
+        session: {
+          session_id: sessionId,
+          title: "Existing",
+          status: loads === 1 ? "idle" : "running",
+          last_run_id: loads === 1 ? "r0" : "r1",
+        },
+        runs: loads === 1
+          ? [{ run_id: "r0", status: "failed", started_at_utc: null }]
+          : [{ run_id: "r1", status: "running", started_at_utc: null }],
+        events: [],
+        skill_ids: [],
+      };
+    },
+    submitFollowUp: async (sessionId) => ({ session_id: sessionId, run_id: "r1" }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer: async ({ state }) => {
+      streamStarts.push({
+        lastSequence: state.lastSequence,
+        activities: state.activities,
+        provisionalText: state.provisionalText,
+      });
+      return "terminal";
+    },
+  });
+  await controller.initialize();
+  const sessionButton = findElements(elements.sessionList, "button")[0];
+  elements.sessionList.dispatchEvent({ type: "click", target: sessionButton });
+  await controller.whenIdle();
+  controller.getState().lastSequence = 9;
+  controller.getState().activities = [{
+    kind: "tool_finished",
+    data: { tool_name: "old_tool", status: "ok", duration_ms: 1 },
+  }];
+  controller.getState().provisionalText = "old partial answer";
+
+  elements.messageInput.value = "Continue";
+  elements.messageComposer.dispatchEvent(submitEvent());
+  await controller.whenIdle();
+
+  controller.destroy();
+  assert.deepEqual(streamStarts, [{
+    lastSequence: 0,
+    activities: [],
+    provisionalText: "",
+  }]);
+});
+
+
 test("an active session locks mutations but keeps history navigation enabled", async () => {
   const { document, elements } = controllerFixture();
   const api = {
@@ -454,6 +573,244 @@ test("an active session locks mutations but keeps history navigation enabled", a
   assert.equal(controller.getState().selectedSessionId, "idle");
   assert.equal(elements.sendButton.disabled, true);
   controller.destroy();
+});
+
+
+test("controller selects a session from nested session content", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Existing", status: "idle", last_run_id: "r0" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async (sessionId) => ({
+      session: { session_id: sessionId, title: "Existing", status: "idle", last_run_id: "r0" },
+      runs: [{ run_id: "r0", status: "succeeded", started_at_utc: null }],
+      events: [],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  const nestedStatus = findElements(elements.sessionList, "span")[0];
+
+  elements.sessionList.dispatchEvent({ type: "click", target: nestedStatus });
+  await controller.whenIdle();
+
+  const selectedSessionId = controller.getState().selectedSessionId;
+  controller.destroy();
+  assert.equal(selectedSessionId, "s1");
+});
+
+
+test("controller renders only the safe terminal reason for a failed run", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Failed", status: "failed", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async (sessionId) => ({
+      session: { session_id: sessionId, title: "Failed", status: "failed", last_run_id: "r1" },
+      runs: [{
+        run_id: "r1",
+        status: "failed",
+        started_at_utc: null,
+        termination_reason: "invalid_model_response",
+        private: "must-not-render",
+      }],
+      events: [],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  const sessionButton = findElements(elements.sessionList, "button")[0];
+
+  elements.sessionList.dispatchEvent({ type: "click", target: sessionButton });
+  await controller.whenIdle();
+
+  const rendered = elements.conversationLog.textContent;
+  controller.destroy();
+  assert.equal(rendered.includes("运行失败"), true);
+  assert.equal(rendered.includes("invalid_model_response"), true);
+  assert.equal(rendered.includes("must-not-render"), false);
+});
+
+
+test("controller keeps a failure card when the safe reason is unavailable", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Failed", status: "failed", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async (sessionId) => ({
+      session: { session_id: sessionId, title: "Failed", status: "failed", last_run_id: "r1" },
+      runs: [{
+        run_id: "r1",
+        status: "failed",
+        started_at_utc: null,
+        termination_reason: null,
+      }],
+      events: [
+        {
+          kind: "tool_activity",
+          data: { tool_name: "read_file", status: "rejected", duration_ms: 0 },
+        },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  const sessionButton = findElements(elements.sessionList, "button")[0];
+
+  elements.sessionList.dispatchEvent({ type: "click", target: sessionButton });
+  await controller.whenIdle();
+
+  const rendered = elements.conversationLog.textContent;
+  const activityCount = findElements(elements.conversationLog, "div").filter(
+    (element) => element.classList.contains("activity-card"),
+  ).length;
+  controller.destroy();
+
+  assert.equal(activityCount, 1);
+  assert.equal(rendered.includes("运行失败"), true);
+  assert.equal(rendered.includes("read_file"), false);
+});
+
+
+test("controller renders one safe terminal card for an interrupted run", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Interrupted", status: "interrupted", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async (sessionId) => ({
+      session: {
+        session_id: sessionId,
+        title: "Interrupted",
+        status: "interrupted",
+        last_run_id: "r1",
+      },
+      runs: [{
+        run_id: "r1",
+        status: "interrupted",
+        started_at_utc: null,
+        termination_reason: "user_interrupted",
+      }],
+      events: [
+        { kind: "user_message", data: { content: "Stop this run" } },
+        {
+          kind: "tool_activity",
+          data: { tool_name: "read_file", status: "ok", duration_ms: 4 },
+        },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  const sessionButton = findElements(elements.sessionList, "button")[0];
+
+  elements.sessionList.dispatchEvent({ type: "click", target: sessionButton });
+  await controller.whenIdle();
+
+  const rendered = elements.conversationLog.textContent;
+  const activityCount = findElements(elements.conversationLog, "div").filter(
+    (element) => element.classList.contains("activity-card"),
+  ).length;
+  controller.destroy();
+
+  assert.equal(activityCount, 1);
+  assert.equal(rendered.includes("运行已中断"), true);
+  assert.equal(rendered.includes("user_interrupted"), true);
+  assert.equal(rendered.includes("read_file"), false);
+});
+
+
+test("successful runs render only their last confirmed assistant text", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Done", status: "succeeded", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Done", status: "succeeded", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "succeeded", termination_reason: "completed" }],
+      events: [
+        { run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Create README" } },
+        { run_id: "r1", sequence: 2, kind: "assistant_text_committed", data: { content: "I will inspect more files" } },
+        { run_id: "r1", sequence: 3, kind: "assistant_text_committed", data: { content: "README created and verified" } },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+
+  assert.equal(elements.conversationLog.textContent.includes("I will inspect"), false);
+  assert.equal(elements.conversationLog.textContent.includes("README created and verified"), true);
+  assert.equal(findElements(elements.conversationLog, "article").length, 2);
+  controller.destroy();
+});
+
+
+function terminalProjectionApi(status, text) {
+  const terminationReason = status === "failed"
+    ? "model_error_limit"
+    : "user_interrupted";
+  return {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Terminal", status, last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Terminal", status, last_run_id: "r1" },
+      runs: [{ run_id: "r1", status, termination_reason: terminationReason }],
+      events: [
+        { run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Do work" } },
+        { run_id: "r1", sequence: 2, kind: "assistant_text_committed", data: { content: text } },
+        { run_id: "r1", sequence: 3, kind: "assistant_text_committed", data: { content: `${text} again` } },
+      ],
+      skill_ids: [],
+    }),
+  };
+}
+
+
+test("failed and interrupted runs hide committed process narration", async () => {
+  for (const status of ["failed", "interrupted"]) {
+    const { document, elements } = controllerFixture();
+    const api = terminalProjectionApi(status, "process text must disappear");
+    const controller = gui.createUiController({ document, elements, api });
+    await controller.initialize();
+    elements.sessionList.dispatchEvent({
+      type: "click",
+      target: findElements(elements.sessionList, "button")[0],
+    });
+    await controller.whenIdle();
+
+    assert.equal(
+      elements.conversationLog.textContent.includes("process text must disappear"),
+      false,
+    );
+    assert.equal(
+      findElements(elements.conversationLog, "div").filter(
+        (element) => element.classList.contains("activity-card"),
+      ).length,
+      1,
+    );
+    controller.destroy();
+  }
 });
 
 
@@ -565,6 +922,23 @@ function updateFrame(id, kind, data) {
 }
 
 
+function reducerFrame(id, kind, data, runId = "r1") {
+  return {
+    id,
+    event: kind,
+    data: {
+      schema_version: 1,
+      session_id: "s1",
+      run_id: runId,
+      sequence: id,
+      kind,
+      created_at_utc: "2026-08-30T00:00:00.000000Z",
+      data,
+    },
+  };
+}
+
+
 function chunkedResponse(chunks, init = {}) {
   const encoder = new TextEncoder();
   return new Response(
@@ -627,7 +1001,7 @@ test("SSE reducer handles provisional confirmed discarded activity and terminal 
   gui.reduceSessionUpdate(state, { id: 2, event: "assistant_text_delta", data: { data: { content: "lo" } } });
   assert.equal(state.provisionalText, "hello");
   gui.reduceSessionUpdate(state, { id: 3, event: "assistant_text_committed", data: { data: { content: "hello" } } });
-  assert.equal(state.provisionalText, "");
+  assert.equal(state.provisionalText, "hello");
   assert.equal(state.selectedSession.events.at(-1).data.content, "hello");
 
   gui.reduceSessionUpdate(state, { id: 4, event: "assistant_text_delta", data: { data: { content: "discard" } } });
@@ -643,6 +1017,119 @@ test("SSE reducer handles provisional confirmed discarded activity and terminal 
   assert.equal(state.selectedSession.runs[0].status, "succeeded");
   assert.equal(state.activeRunId, null);
   assert.equal(state.lastSequence, 7);
+});
+
+
+test("live narration and tool activity replace one another in one card", () => {
+  const state = gui.createInitialUiState();
+  state.activeRunId = "r1";
+  state.selectedSession = {
+    session: { session_id: "s1", status: "running", last_run_id: "r1" },
+    runs: [{ run_id: "r1", status: "running" }],
+    events: [],
+  };
+  gui.reduceSessionUpdate(
+    state,
+    reducerFrame(1, "assistant_text_delta", { content: "Inspecting" }),
+  );
+  assert.equal(state.provisionalText, "Inspecting");
+  assert.deepEqual(state.activities, []);
+  gui.reduceSessionUpdate(
+    state,
+    reducerFrame(2, "assistant_text_committed", { content: "Inspecting" }),
+  );
+  assert.equal(state.provisionalText, "Inspecting");
+  assert.equal(state.selectedSession.events[0].run_id, "r1");
+  gui.reduceSessionUpdate(
+    state,
+    reducerFrame(3, "tool_started", { tool_name: "read_file", ordinal: 1 }),
+  );
+  assert.equal(state.provisionalText, "");
+  assert.equal(state.activities[0].kind, "tool_started");
+  gui.reduceSessionUpdate(
+    state,
+    reducerFrame(4, "assistant_text_delta", { content: "Writing final answer" }),
+  );
+  assert.deepEqual(state.activities, []);
+  assert.equal(state.provisionalText, "Writing final answer");
+});
+
+
+test("SSE reducer keeps only the current activity and clears it at success", () => {
+  const state = gui.createInitialUiState();
+  state.selectedSession = {
+    session: { session_id: "s1", status: "running", last_run_id: "r1" },
+    runs: [{ run_id: "r1", status: "running" }],
+    events: [],
+    skill_ids: [],
+  };
+  state.activeRunId = "r1";
+
+  gui.reduceSessionUpdate(state, {
+    id: 1,
+    event: "tool_started",
+    data: { data: { tool_name: "list_directory", ordinal: 1 } },
+  });
+  gui.reduceSessionUpdate(state, {
+    id: 2,
+    event: "tool_finished",
+    data: {
+      data: {
+        tool_name: "list_directory",
+        status: "ok",
+        duration_ms: 3,
+      },
+    },
+  });
+
+  assert.deepEqual(state.activities, [{
+    kind: "tool_finished",
+    data: {
+      tool_name: "list_directory",
+      status: "ok",
+      duration_ms: 3,
+    },
+  }]);
+
+  gui.reduceSessionUpdate(state, {
+    id: 3,
+    event: "run_finished",
+    data: { data: { status: "succeeded" } },
+  });
+
+  assert.deepEqual(state.activities, []);
+});
+
+
+test("SSE reducer keeps the stable terminal reason and drops private fields", () => {
+  const state = gui.createInitialUiState();
+  state.selectedSession = {
+    session: { session_id: "s1", status: "running", last_run_id: "r1" },
+    runs: [{ run_id: "r1", status: "running" }],
+    events: [],
+    skill_ids: [],
+  };
+  state.activeRunId = "r1";
+
+  gui.reduceSessionUpdate(state, {
+    id: 1,
+    event: "run_finished",
+    data: {
+      run_id: "r1",
+      data: {
+        status: "failed",
+        termination_reason: "invalid_model_response",
+        private: "must-not-store",
+      },
+    },
+  });
+
+  assert.deepEqual(state.selectedSession.runs[0], {
+    run_id: "r1",
+    status: "failed",
+    termination_reason: "invalid_model_response",
+  });
+  assert.equal(JSON.stringify(state).includes("must-not-store"), false);
 });
 
 
@@ -877,17 +1364,18 @@ test("browser startup consumes bootstrap and initializes the real controller", a
 });
 
 
-test("durable tool and verification activity render through safe cards", async () => {
+test("conversation hides durable activity and shows one live card before the reply", async () => {
   const { document, elements } = controllerFixture();
   const api = {
     listSessions: async () => ({
-      sessions: [{ session_id: "s1", title: "History", status: "idle", last_run_id: "r1" }],
+      sessions: [{ session_id: "s1", title: "Active", status: "running", last_run_id: "r1" }],
     }),
     listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
     loadSession: async () => ({
-      session: { session_id: "s1", title: "History", status: "idle", last_run_id: "r1" },
-      runs: [{ run_id: "r1", status: "succeeded", started_at_utc: null }],
+      session: { session_id: "s1", title: "Active", status: "running", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "running", started_at_utc: null }],
       events: [
+        { kind: "user_message", data: { content: "Inspect" } },
         {
           kind: "tool_activity",
           data: { tool_name: "read_file", status: "ok", duration_ms: 12, private: "secret" },
@@ -900,7 +1388,38 @@ test("durable tool and verification activity render through safe cards", async (
       skill_ids: [],
     }),
   };
-  const controller = gui.createUiController({ document, elements, api });
+  const streamConsumer = ({ state, signal, onState }) => {
+    gui.reduceSessionUpdate(state, {
+      id: 3,
+      event: "tool_started",
+      data: { data: { tool_name: "list_directory", ordinal: 2 } },
+    });
+    gui.reduceSessionUpdate(state, {
+      id: 4,
+      event: "tool_finished",
+      data: {
+        data: {
+          tool_name: "list_directory",
+          status: "ok",
+          duration_ms: 7,
+        },
+      },
+    });
+    gui.reduceSessionUpdate(
+      state,
+      reducerFrame(5, "assistant_text_delta", { content: "Writing the answer" }),
+    );
+    onState(state);
+    return new Promise((resolve) => {
+      signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+    });
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer,
+  });
   await controller.initialize();
   elements.sessionList.dispatchEvent({
     type: "click",
@@ -908,8 +1427,26 @@ test("durable tool and verification activity render through safe cards", async (
   });
   await controller.whenIdle();
 
-  assert.equal(elements.conversationLog.textContent.includes("read_file"), true);
-  assert.equal(elements.conversationLog.textContent.includes("passed"), true);
-  assert.equal(elements.conversationLog.textContent.includes("secret"), false);
+  const rendered = elements.conversationLog.textContent;
+  const activityCount = findElements(elements.conversationLog, "div").filter(
+    (element) => element.classList.contains("activity-card"),
+  ).length;
+  const childClasses = elements.conversationLog.childNodes.map(
+    (element) => element.className,
+  );
   controller.destroy();
+
+  assert.equal(rendered.includes("read_file"), false);
+  assert.equal(rendered.includes("user_verify"), false);
+  assert.equal(activityCount, 1);
+  assert.deepEqual(
+    childClasses,
+    [
+      "message message--user",
+      "activity-card",
+    ],
+  );
+  assert.equal(rendered.includes("list_directory"), false);
+  assert.equal(rendered.includes("Writing the answer"), true);
+  assert.equal(rendered.includes("secret"), false);
 });

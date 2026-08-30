@@ -252,7 +252,9 @@ _PROVIDER_ERROR_CODES = {
     "not_found",
     "request_rejected",
     "provider_error",
-}
+    "streaming_unsupported",
+    "stream_interrupted",
+} | _MODEL_ERROR_CODES
 _VERIFICATION_ERROR_CODES = {
     "verification_command_start_failed",
     "verification_internal_error",

@@ -44,6 +44,11 @@ def _validated_arguments(arguments: object) -> tuple[str, str]:
 _REMOVED_ENVIRONMENT_KEYS = {
     "openai_api_key",
     "chat_completions_api_key",
+    "classpath",
+    "java_tool_options",
+    "_java_options",
+    "jdk_java_options",
+    "jdk_javac_options",
     "pythonpath", "pythonhome", "pytest_addopts",
     "pytest_plugins", "mypypath", "mypy_config_file", "git_dir",
     "git_work_tree", "git_object_directory",
@@ -203,6 +208,8 @@ class AuthorizedCommandExecutor:
         self,
         command: AuthorizedCommand,
         context: ExecutionContext,
+        *,
+        stdin_stream: BinaryIO | None = None,
     ) -> ToolExecution:
         if not isinstance(command, AuthorizedCommand):
             raise TypeError("command must be AuthorizedCommand")
@@ -219,7 +226,11 @@ class AuthorizedCommandExecutor:
                 shell=False,
                 cwd=workspace,
                 env=_child_environment(),
-                stdin=subprocess.DEVNULL,
+                stdin=(
+                    subprocess.DEVNULL
+                    if stdin_stream is None
+                    else stdin_stream
+                ),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW,

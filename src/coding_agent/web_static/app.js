@@ -17,11 +17,14 @@ const PHASE_LABELS = Object.freeze({
 });
 
 const ACTIVITY_LABELS = Object.freeze({
+  model_progress: "Agent 正在处理",
   tool_started: "工具开始",
   tool_finished: "工具完成",
   verification_started: "验证开始",
   verification_finished: "验证完成",
   controller_error: "控制器错误",
+  run_failed: "运行失败",
+  run_interrupted: "运行已中断",
 });
 
 
@@ -80,6 +83,9 @@ export function appendMessage(document, container, role, text) {
 
 
 function safeActivityDetails(kind, data) {
+  if (kind === "model_progress") {
+    return [data.content];
+  }
   if (kind === "tool_started") {
     return [data.tool_name, `#${data.ordinal}`];
   }
@@ -94,6 +100,9 @@ function safeActivityDetails(kind, data) {
   }
   if (kind === "controller_error") {
     return [data.code];
+  }
+  if (kind === "run_failed" || kind === "run_interrupted") {
+    return [data.termination_reason];
   }
   return [];
 }
@@ -348,12 +357,14 @@ export function reduceSessionUpdate(state, frame) {
   const payload = frame.data?.data ?? {};
   if (frame.id !== null) state.lastSequence = frame.id;
   if (frame.event === "assistant_text_delta" && typeof payload.content === "string") {
+    state.activities = [];
     state.provisionalText += payload.content;
     return state;
   }
   if (frame.event === "assistant_text_committed" && typeof payload.content === "string") {
-    state.provisionalText = "";
+    state.provisionalText = payload.content;
     state.selectedSession?.events?.push({
+      run_id: frame.data?.run_id ?? state.activeRunId,
       sequence: frame.id,
       kind: frame.event,
       data: { content: payload.content },
@@ -365,10 +376,11 @@ export function reduceSessionUpdate(state, frame) {
     return state;
   }
   if (Object.hasOwn(ACTIVITY_LABELS, frame.event)) {
-    state.activities.push({
+    state.provisionalText = "";
+    state.activities = [{
       kind: frame.event,
       data: safeActivityData(frame.event, payload),
-    });
+    }];
     return state;
   }
   const lifecycleStatus = {
@@ -382,9 +394,21 @@ export function reduceSessionUpdate(state, frame) {
     const runId = frame.data?.run_id ?? state.activeRunId;
     const run = state.selectedSession?.runs?.find((item) => item.run_id === runId);
     if (session) session.status = lifecycleStatus;
-    if (run) run.status = lifecycleStatus;
+    if (run) {
+      run.status = lifecycleStatus;
+      if (frame.event === "run_finished") {
+        run.termination_reason =
+          typeof payload.termination_reason === "string" && payload.termination_reason
+            ? payload.termination_reason
+            : null;
+      }
+    }
     state.phase = frame.event === "run_finished" ? "finished" : "model";
-    if (TERMINAL_RUN_STATUSES.has(lifecycleStatus)) state.activeRunId = null;
+    if (TERMINAL_RUN_STATUSES.has(lifecycleStatus)) {
+      state.activeRunId = null;
+      state.provisionalText = "";
+      state.activities = [];
+    }
   }
   return state;
 }
@@ -517,6 +541,20 @@ export function createUiController({
     return runs.find((run) => run.run_id === lastRunId) ?? runs.at(-1) ?? null;
   }
 
+  function runProjectionFacts(detail) {
+    const runsById = new Map((detail?.runs ?? []).map((run) => [run.run_id, run]));
+    const lastAssistantSequence = new Map();
+    const lastEventSequence = new Map();
+    for (const event of detail?.events ?? []) {
+      if (typeof event.run_id !== "string") continue;
+      lastEventSequence.set(event.run_id, event.sequence);
+      if (event.kind === "assistant_text_committed") {
+        lastAssistantSequence.set(event.run_id, event.sequence);
+      }
+    }
+    return { runsById, lastAssistantSequence, lastEventSequence };
+  }
+
   function renderControls() {
     const mutationLocked = anySessionActive();
     elements.sendButton.disabled = mutationLocked;
@@ -586,43 +624,65 @@ export function createUiController({
 
   function renderConversation() {
     elements.conversationLog.replaceChildren();
-    for (const event of state.selectedSession?.events ?? []) {
+    const detail = state.selectedSession;
+    const projection = runProjectionFacts(detail);
+    const renderedTerminalRuns = new Set();
+
+    function appendTerminalRun(run) {
+      appendActivity(
+        document,
+        elements.conversationLog,
+        run.status === "failed" ? "run_failed" : "run_interrupted",
+        {
+          termination_reason:
+            typeof run.termination_reason === "string"
+              ? run.termination_reason
+              : null,
+        },
+      );
+      renderedTerminalRuns.add(run.run_id);
+    }
+
+    for (const event of detail?.events ?? []) {
       if (event.kind === "user_message" && typeof event.data?.content === "string") {
         appendMessage(document, elements.conversationLog, "user", event.data.content);
       } else if (
         event.kind === "assistant_text_committed" &&
-        typeof event.data?.content === "string"
+        typeof event.data?.content === "string" &&
+        projection.runsById.get(event.run_id)?.status === "succeeded" &&
+        projection.lastAssistantSequence.get(event.run_id) === event.sequence
       ) {
         appendMessage(document, elements.conversationLog, "assistant", event.data.content);
-      } else if (event.kind === "tool_activity") {
-        appendActivity(document, elements.conversationLog, "tool_finished", event.data);
-      } else if (event.kind === "verification_activity") {
-        appendActivity(
-          document,
-          elements.conversationLog,
-          "verification_finished",
-          event.data,
-        );
-      } else if (Object.hasOwn(ACTIVITY_LABELS, event.kind)) {
-        appendActivity(document, elements.conversationLog, event.kind, event.data);
+      }
+
+      const eventRun = projection.runsById.get(event.run_id);
+      if (
+        (eventRun?.status === "failed" || eventRun?.status === "interrupted") &&
+        projection.lastEventSequence.get(event.run_id) === event.sequence
+      ) {
+        appendTerminalRun(eventRun);
       }
     }
-    for (const activity of state.activities) {
+    for (const run of detail?.runs ?? []) {
+      if (
+        (run.status === "failed" || run.status === "interrupted") &&
+        !renderedTerminalRuns.has(run.run_id)
+      ) {
+        appendTerminalRun(run);
+      }
+    }
+    const currentActivity = state.activeRunId ? state.activities.at(-1) : null;
+    if (currentActivity) {
       appendActivity(
         document,
         elements.conversationLog,
-        activity.kind,
-        activity.data,
+        currentActivity.kind,
+        currentActivity.data,
       );
-    }
-    if (state.provisionalText) {
-      const provisional = appendMessage(
-        document,
-        elements.conversationLog,
-        "assistant",
-        state.provisionalText,
-      );
-      provisional.classList.add("message--provisional");
+    } else if (state.activeRunId && state.provisionalText) {
+      appendActivity(document, elements.conversationLog, "model_progress", {
+        content: state.provisionalText,
+      });
     }
   }
 
@@ -717,6 +777,7 @@ export function createUiController({
 
   async function selectSession(sessionId) {
     if (state.selectedSessionId !== sessionId) stopActiveStream();
+    const previousRunId = state.activeRunId;
     const detail = await api.loadSession(sessionId);
     state.selectedSessionId = sessionId;
     state.selectedSession = detail;
@@ -724,6 +785,12 @@ export function createUiController({
     const run = selectedRun();
     state.activeRunId =
       run && ACTIVE_SESSION_STATUSES.has(run.status) ? run.run_id : null;
+    if (state.activeRunId !== previousRunId) {
+      state.lastSequence = 0;
+      state.activities = [];
+      state.provisionalText = "";
+    }
+    synchronizeSelectedSummary();
     renderSkills();
     renderSelectedSession();
     if (state.activeRunId) startActiveStream(state.activeRunId);
@@ -741,8 +808,15 @@ export function createUiController({
   }
 
   elements.sessionList.addEventListener("click", (event) => {
-    const sessionId = event.target?.dataset?.sessionId;
-    if (sessionId) track(() => selectSession(sessionId));
+    let target = event.target;
+    while (target && target !== elements.sessionList) {
+      const sessionId = target.nodeType === 1 ? target.dataset?.sessionId : null;
+      if (sessionId) {
+        track(() => selectSession(sessionId));
+        return;
+      }
+      target = target.parentNode;
+    }
   });
 
   elements.skillList.addEventListener("change", (event) => {
@@ -779,23 +853,7 @@ export function createUiController({
       let handle;
       if (state.selectedSessionId) {
         handle = await api.submitFollowUp(state.selectedSessionId, message);
-        const selectedSummary = state.sessions.find(
-          (session) => session.session_id === state.selectedSessionId,
-        );
-        if (selectedSummary) {
-          selectedSummary.status = "running";
-          selectedSummary.last_run_id = handle.run_id;
-        }
-        if (state.selectedSession?.session) {
-          state.selectedSession.session.status = "running";
-          state.selectedSession.session.last_run_id = handle.run_id;
-          state.selectedSession.runs.push({
-            run_id: handle.run_id,
-            status: "running",
-            started_at_utc: null,
-            finished_at_utc: null,
-          });
-        }
+        await selectSession(handle.session_id);
       } else {
         handle = await api.createSession(message, state.selectedSkillIds);
         await selectSession(handle.session_id);

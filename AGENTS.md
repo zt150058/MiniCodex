@@ -103,22 +103,26 @@ Before completing a task, verify:
   use server-side conversation state as a substitute for local context logic.
 - Use strict function-tool schemas, but validate every argument again locally.
 - Execute tool calls sequentially in the first version.
-- The first version exposes only `list_directory`, `read_file`,
-  `replace_text`, `write_file`, and `run_command`.
+- The model-facing tool set exposes `list_directory`, `read_file`,
+  `replace_text`, `write_file`, `run_command`, and the dedicated
+  `run_java_tests` black-box verification tool.
 - `write_file` may create a file but may not overwrite one. `replace_text`
   must require an exact expected match count. Do not add deletion or move
   tools in the first version.
 - Parse commands into argument arrays and execute with `shell=False`.
 - Do not expose PowerShell, `cmd.exe`, Bash, WSL, network commands, package
   installation, system administration, or destructive Git commands.
-- Allow only the Python verification commands, workspace-local Python scripts,
-  and read-only Git subcommands documented in `DESIGN.md`.
+- `run_command` retains its Python and read-only Git allowlist. Java compiler
+  and runtime commands are constructed only inside `run_java_tests`; model
+  command strings cannot invoke them.
 - Treat `.git/` and `.coding-agent/` as protected internal paths.
 - Any successful file mutation must invalidate earlier verification evidence.
 - If `--verify` is supplied, the agent may report success only after that exact
   command runs after the latest mutation and exits with code 0.
-- Without `--verify`, require a safe, credible `purpose="verification"`
-  command after the latest mutation; inspection-only commands are not proof.
+- Without `--verify`, require fresh evidence after the latest mutation from
+  either a safe, credible `run_command` with `purpose="verification"` or an
+  internally consistent `run_java_tests` call with `purpose="verification"`;
+  inspection-only commands and Java calls with `purpose="test"` are not proof.
 - Keep default limits aligned with `DESIGN.md`: 12 model calls, 40 tool calls,
   10 minutes total runtime, and a threshold of 3 for no-progress repetition,
   consecutive failures, or consecutive safety rejections.
@@ -129,9 +133,9 @@ Before completing a task, verify:
 
 ## Dependency policy
 
-- The only planned production dependency is the official `openai` Python
-  package.
-- The planned test dependency is `pytest`.
+- The approved production dependencies are `openai`, `fastapi`, and `uvicorn`.
+- The approved test dependencies are `pytest` and `httpx`.
+- `run_java_tests` introduces no new dependency and may not download a JDK.
 - Any additional dependency requires an explicit design discussion and user
   approval before it is introduced.
 - Never install a dependency merely to avoid implementing required core agent

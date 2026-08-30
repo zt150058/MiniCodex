@@ -44,8 +44,8 @@ coding-agent "修复当前项目中的失败测试" --workspace <path> --verify 
 - Endpoint 配置：`responses` 禁止 `--base-url` 并继续使用官方默认地址；`chat-completions` 必须显式提供合法的 HTTPS `--base-url`，项目不硬编码或自动探测供应商。
 - 模型配置：通过 `--model` 或 `OPENAI_MODEL` 指定；两者都不存在时以配置错误退出。
 - 凭据：Responses 只读取 `OPENAI_API_KEY`，Chat Completions 只读取 `CHAT_COMPLETIONS_API_KEY`；两者不互相回退，也不提供 API Key CLI 参数。
-- 运行依赖：生产环境只引入官方 `openai` Python 包，其余功能优先使用标准库。
-- 测试依赖：使用 `pytest`。
+- 运行依赖：使用已批准的 `openai`、`fastapi` 和 `uvicorn`，其余功能优先使用标准库。
+- 测试依赖：使用已批准的 `pytest` 和 `httpx`。
 - 包布局：生产代码放在 `src/coding_agent/`，测试放在 `tests/`。
 
 ## 4. 整体架构
@@ -102,6 +102,7 @@ AgentState -> JSONL EventLogger -> FinalReport
 | `tools/registry.py` | 工具注册、分派、校验、授权和执行流水线 | `tools/base.py` |
 | `tools/filesystem.py` | 目录列举、文件读取、精确替换和新文件创建 | `safety.py` |
 | `tools/shell.py` | Windows 命令解析、受控执行、超时和输出截断 | `safety.py` |
+| `tools/java.py` | 严格发现 Java 源码和黑盒用例，编译、运行、比较并产生安全结构化结果 | `safety.py`, `tools/shell.py` |
 | `logging.py` | 脱敏 JSONL 事件日志 | `state.py`, `messages.py` |
 | `report.py` | 生成面向用户的最终证据摘要 | `state.py` |
 
@@ -269,6 +270,17 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - 命令字符串先按 Windows 命令行规则解析为参数数组，再以 `shell=False` 执行。
 - 捕获命令、工作目录、退出码、stdout、stderr、耗时、超时和截断状态。
 
+### `run_java_tests`
+
+- 参数：`source_root`、`main_class`、`tests_directory`、`purpose`。
+- `purpose` 只能是 `test` 或 `verification`；只有后者可形成最终验证证据。
+- 最多稳定发现 500 个 `.java` 源文件和 200 对 `.in`/`.out` 黑盒用例。
+- 输入上限为 256 KiB，期望输出上限为 64 KiB；期望输出只接受 UTF-8。
+- 使用可信系统 `javac.exe`/`java.exe`、`shell=False`、显式 classpath 和 `-proc:none`，不允许模型提供可执行文件或 Java 命令字符串。
+- 编译和全部用例共享最长 60 秒单调时钟期限；实际输出沿用每流 64 KiB 上限。
+- 期望与实际输出只归一化换行，然后精确比较。
+- 该工具适用于可信工作区，不是操作系统沙箱，也不是 Maven、Gradle 或 JUnit runner。
+
 统一执行流水线是：`Dispatch -> Validate -> Authorize -> Execute -> Observe`。任何阶段失败都产生统一 `ToolResult`，不会抛出未处理异常退出主循环。
 
 ## 10. 数据流
@@ -292,7 +304,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - 序列化字符数超过 60,000。
 - 历史项数量超过 24。
 
-压缩以完整 turn 为边界，绝不拆开 assistant tool call 与对应 tool results。压缩后保留最近 8 个完整 turn。
+压缩以完整 turn 为边界，绝不拆开 assistant tool call 与对应 tool results。最近 8 个完整 turn 是优先保留后缀，最新 1 个完整 turn 是硬下限。首次候选最多调用一次摘要模型；若仍超限，则逐个扩大被移除的最旧完整 turn，后续候选只使用确定性本地摘要，不再次调用模型。成功压缩会原子清空活动 continuation；若摘要加最新完整 turn 仍无法满足硬预算，则以 `context_budget_exhausted` 安全终止。
 
 结构化摘要包含：
 
@@ -350,6 +362,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - 使用 `shell=False`，拒绝 `&`、`|`、`>`、`<` 等控制运算符。
 - 拒绝父级跳转和指向工作区外的可疑绝对路径参数。
 - 首版允许 `pytest`、`python -m pytest`、`python -m unittest`、`ruff`、`mypy`、工作区内 Python 脚本，以及只读 Git 命令。
+- `run_command` 不允许 Java；`run_java_tests` 在独立边界内选择工作区外的可信系统 JDK，并复用相同的固定 cwd、受限环境、输出和进程树约束。
 - Git 只允许 `status`、`diff`、`log`、`show` 和 `ls-files`。
 - 禁止 PowerShell、`cmd.exe`、Bash、WSL、网络下载、包安装、系统管理、进程管理和破坏性命令。
 - 用户提供的 `--verify` 同样经过命令策略；启动时无法通过策略则以配置错误退出。
@@ -380,9 +393,10 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 
 ### 无 `--verify`
 
-- Agent 必须通过 `run_command` 执行 `purpose="verification"` 的命令。
-- 命令必须通过安全策略和可信验证检查。
+- Agent 必须产生最新的可信验证证据：通过 `run_command` 执行 `purpose="verification"` 的命令，或通过 `run_java_tests` 执行完整 Java 黑盒套件并使用 `purpose="verification"`。
+- 命令或 Java 工具调用必须通过安全策略和可信验证检查。
 - `echo`、目录查看、`git status` 等纯检查命令不能作为验证证据。
+- Java `purpose="test"`、不完整用例、编译失败、程序失败、输出不匹配、截断、超时或清理失败均不能形成通过证据。
 - 最新可信验证必须在最后修改之后执行且退出码为 `0`。
 
 模型文本中的“完成”“通过”或类似声明都不是验证证据。

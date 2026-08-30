@@ -148,11 +148,86 @@ def append_tool_turn(
     return calls
 
 
+def make_eight_multi_tool_turns(
+    tmp_path: Path,
+    calls_per_turn: int,
+) -> AgentState:
+    state = AgentState.start("task", tmp_path, 0.0)
+    for turn_number in range(8):
+        append_tool_turn(
+            state,
+            turn_number=turn_number,
+            call_count=calls_per_turn,
+        )
+    return state
+
+
 def manager(client: FakeModelClient, **changes: int) -> ContextManager:
     return ContextManager(
         model_client=client,
         limits=ContextLimits(**changes),
     )
+
+
+def test_item_limit_compresses_even_with_only_eight_complete_turns(
+    tmp_path: Path,
+) -> None:
+    state = make_eight_multi_tool_turns(tmp_path, calls_per_turn=2)
+    assert len(state.messages) == 25
+    client = FakeModelClient((valid_summary_response(),))
+    prepared = manager(
+        client,
+        max_serialized_chars=1_000_000,
+        max_history_items=24,
+        recent_turns=8,
+    ).prepare(state, ModelCallBudget())
+    assert prepared.compressed is True
+    assert prepared.summary_source is SummarySource.MODEL
+    assert len(client.requests) == 1
+    assert prepared.size.history_items <= 24
+    assert prepared.messages[2:] == state.messages[4:]
+
+
+def test_still_oversized_first_candidate_expands_with_local_fallback(
+    tmp_path: Path,
+) -> None:
+    state = make_eight_multi_tool_turns(tmp_path, calls_per_turn=3)
+    client = FakeModelClient((valid_summary_response(),))
+    prepared = manager(
+        client,
+        max_serialized_chars=1_000_000,
+        max_history_items=24,
+        recent_turns=8,
+    ).prepare(state, ModelCallBudget())
+    assert len(client.requests) == 1
+    assert prepared.compressed is True
+    assert prepared.summary_source is SummarySource.FALLBACK
+    assert prepared.summary_model_failed is False
+    assert prepared.size.history_items <= 24
+    initial, summary, *retained = prepared.messages
+    assert initial is state.messages[0]
+    assert isinstance(summary, UserMessage)
+    assert tuple(retained) == state.messages[13:]
+
+
+def test_expanded_compression_preserves_every_retained_tool_pair(
+    tmp_path: Path,
+) -> None:
+    state = make_eight_multi_tool_turns(tmp_path, calls_per_turn=3)
+    prepared = manager(
+        FakeModelClient((valid_summary_response(),)),
+        max_serialized_chars=1_000_000,
+        max_history_items=24,
+        recent_turns=8,
+    ).prepare(state, ModelCallBudget())
+    _, _, turns = _partition_complete_turns(prepared.messages)
+    assert len(turns) == 5
+    for turn in turns:
+        assistant = turn[0]
+        assert isinstance(assistant, AssistantMessage)
+        assert [result.call_id for result in turn[1:]] == [
+            call.call_id for call in assistant.tool_calls
+        ]
 
 
 def test_context_at_exact_threshold_is_not_compressed(tmp_path: Path) -> None:
