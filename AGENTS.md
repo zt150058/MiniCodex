@@ -103,9 +103,16 @@ Before completing a task, verify:
   use server-side conversation state as a substitute for local context logic.
 - Use strict function-tool schemas, but validate every argument again locally.
 - Execute tool calls sequentially in the first version.
-- The model-facing tool set exposes `list_directory`, `read_file`,
-  `replace_text`, `write_file`, `run_command`, and the dedicated
-  `run_java_tests` black-box verification tool.
+- Every run has an explicit immutable `RunMode`; never infer authority from
+  prompt text. `modify` remains the backward-compatible default.
+- A `modify` run exposes exactly `list_directory`, `read_file`, `replace_text`,
+  `write_file`, `run_command`, and `run_java_tests`.
+- A `read_only` run exposes exactly `list_directory`, `read_file`, and the
+  dedicated `inspect_git` tool. It must not construct mutation, generic
+  command, Java, or verification tools.
+- `ANSWERED` is valid only for a read-only run with non-empty final text, zero
+  mutations, and no verification evidence. `SUCCESS` remains exclusive to a
+  modification-capable run with fresh passing verification evidence.
 - `write_file` may create a file but may not overwrite one. `replace_text`
   must require an exact expected match count. Do not add deletion or move
   tools in the first version.

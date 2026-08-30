@@ -723,6 +723,22 @@ class CommandPolicy:
     def _locate_from_sanitized_path(self, name: str) -> str | None:
         return _locate_from_sanitized_path(self.workspace, name)
 
+    def _parse_authorized_input(self, command: object) -> tuple[str, ...]:
+        if isinstance(command, str) and any(
+            character in command for character in _CONTROL_CHARACTERS
+        ):
+            raise SafetyViolation(
+                SafetyCode.SHELL_SYNTAX_DENIED,
+                "shell control syntax is not allowed",
+            )
+        argv = parse_windows_command_line(command)
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
+            raise SafetyViolation(
+                SafetyCode.ARGUMENT_DENIED,
+                "environment assignment prefixes are not allowed",
+            )
+        return argv
+
     def _trusted_launcher(
         self,
         supplied: str,
@@ -789,19 +805,7 @@ class CommandPolicy:
             )
         if not isinstance(source, CommandSource):
             raise ToolArgumentError("source must be model or user_verify")
-        if isinstance(command, str) and any(
-            character in command for character in _CONTROL_CHARACTERS
-        ):
-            raise SafetyViolation(
-                SafetyCode.SHELL_SYNTAX_DENIED,
-                "shell control syntax is not allowed",
-            )
-        argv = parse_windows_command_line(command)
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[0]):
-            raise SafetyViolation(
-                SafetyCode.ARGUMENT_DENIED,
-                "environment assignment prefixes are not allowed",
-            )
+        argv = self._parse_authorized_input(command)
         python = self._current_python(argv[0])
         if python is not None:
             if len(argv) >= 3 and argv[1:3] == ("-m", "pytest"):
@@ -876,3 +880,34 @@ class CommandPolicy:
             )
 
         raise SafetyViolation(SafetyCode.EXECUTABLE_DENIED, "executable is not allowed")
+
+    def authorize_git_inspection(
+        self,
+        command: object,
+        *,
+        source: CommandSource,
+    ) -> AuthorizedCommand:
+        if not isinstance(source, CommandSource):
+            raise ToolArgumentError("source must be model or user_verify")
+        argv = self._parse_authorized_input(command)
+        executable = self._trusted_launcher(
+            argv[0],
+            {"git", "git.exe"},
+            allow_runtime=False,
+        )
+        git_arguments = self._authorize_git(argv[1:])
+        final = (
+            str(executable),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.external=",
+            "--no-pager",
+            *git_arguments,
+        )
+        return AuthorizedCommand(
+            argv=final,
+            normalized_command=subprocess.list2cmdline(final),
+            purpose="inspect",
+            source=source,
+        )

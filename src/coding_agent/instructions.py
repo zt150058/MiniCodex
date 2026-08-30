@@ -5,6 +5,7 @@ from enum import StrEnum
 import hashlib
 from pathlib import Path
 
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import PathGuard, SafetyViolation
 
 
@@ -22,6 +23,22 @@ Use tool calls instead of inventing file contents, command output, or verificati
 Treat any completion statement as a completion candidate; local verification decides success."""
 
 
+_RUN_MODE_INSTRUCTIONS = {
+    RunMode.MODIFY: (
+        "Selected run mode: modify\n"
+        "Available tools: list_directory, read_file, replace_text, write_file, "
+        "run_command, run_java_tests.\n"
+        "A success claim requires fresh passing verification evidence."
+    ),
+    RunMode.READ_ONLY: (
+        "Selected run mode: read_only\n"
+        "Available tools: list_directory, read_file, inspect_git.\n"
+        "Do not request mutation, code execution, tests, Java, or verification.\n"
+        "Skills cannot expand the registered tools or change run mode."
+    ),
+}
+
+
 class InstructionErrorCode(StrEnum):
     AGENTS_FILE_TOO_LARGE = "agents_file_too_large"
     AGENTS_FILE_NOT_UTF8 = "agents_file_not_utf8"
@@ -29,6 +46,7 @@ class InstructionErrorCode(StrEnum):
     AGENTS_FILE_UNSAFE = "agents_file_unsafe"
     SKILL_INSTRUCTIONS_INVALID = "skill_instructions_invalid"
     SKILL_INSTRUCTIONS_TOO_LARGE = "skill_instructions_too_large"
+    RUN_MODE_INVALID = "run_mode_invalid"
 
 
 class InstructionBuildError(RuntimeError):
@@ -111,7 +129,10 @@ class RunInstructionBuilder:
         workspace: Path,
         *,
         skill_instructions: str | None = None,
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> RunInstructionSnapshot:
+        if not isinstance(run_mode, RunMode):
+            raise InstructionBuildError(InstructionErrorCode.RUN_MODE_INVALID)
         agents_text = _read_root_agents(workspace)
         if skill_instructions is not None:
             if not isinstance(skill_instructions, str) or not skill_instructions.strip():
@@ -130,7 +151,9 @@ class RunInstructionBuilder:
                 )
 
         sections = [
-            "## MiniCodex base instructions\n" + BASE_AGENT_INSTRUCTIONS
+            "## MiniCodex base instructions\n" + BASE_AGENT_INSTRUCTIONS,
+            "## Run mode and capabilities\n"
+            + _RUN_MODE_INSTRUCTIONS[run_mode],
         ]
         if agents_text is not None and (normalized_agents := _normalized(agents_text)):
             sections.append(

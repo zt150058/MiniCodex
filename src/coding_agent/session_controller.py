@@ -48,6 +48,7 @@ from coding_agent.skills import (
     SkillCatalogView,
 )
 from coding_agent.logging import EventType, RunEvent
+from coding_agent.run_mode import RunMode
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 
 
@@ -87,6 +88,7 @@ def default_thread_factory(
 class RunHandle:
     session_id: str
     run_id: str
+    run_mode: RunMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,7 +290,10 @@ class SessionController:
         message: str,
         *,
         skill_ids: tuple[str, ...] = (),
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> RunHandle:
+        if type(run_mode) is not RunMode:
+            raise TypeError("run_mode must be RunMode")
         try:
             initial = self._narrative_renderer.render((), message)
         except (SessionError, TypeError, ValueError) as exc:
@@ -309,6 +314,7 @@ class SessionController:
                 submission = self._store.create_session(
                     message,
                     selected_skills=selected_skills,
+                    run_mode=run_mode,
                 )
             except SessionStoreError as exc:
                 raise self._translate_store_error(exc) from None
@@ -318,6 +324,7 @@ class SessionController:
                 current_message=message,
                 initial_user_message=initial,
                 skill_bundle=bundle,
+                run_mode=run_mode,
             )
             handle = self._start_worker(request, admission)
             admission = None
@@ -326,7 +333,15 @@ class SessionController:
             if admission is not None:
                 self._release_admission(admission)
 
-    def submit_message(self, session_id: str, message: str) -> RunHandle:
+    def submit_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        run_mode: RunMode = RunMode.MODIFY,
+    ) -> RunHandle:
+        if type(run_mode) is not RunMode:
+            raise TypeError("run_mode must be RunMode")
         admission = self._reserve_admission()
         try:
             try:
@@ -358,6 +373,7 @@ class SessionController:
                     session_id,
                     message,
                     selected_skills=selected_skills,
+                    run_mode=run_mode,
                 )
             except SessionStoreError as exc:
                 raise self._translate_store_error(exc) from None
@@ -367,6 +383,7 @@ class SessionController:
                 current_message=message,
                 initial_user_message=initial,
                 skill_bundle=bundle,
+                run_mode=run_mode,
             )
             handle = self._start_worker(request, admission)
             admission = None
@@ -412,7 +429,10 @@ class SessionController:
                 terminal = self._store.finish_run(failure)
                 self._event_hub.publish(
                     SessionUpdateKind.RUN_FINISHED,
-                    {"status": terminal.status.value},
+                    {
+                        "status": terminal.status.value,
+                        "agent_status": terminal.agent_status,
+                    },
                 )
             except Exception:
                 self._degrade(active)
@@ -430,7 +450,7 @@ class SessionController:
             if isinstance(exc, Exception):
                 raise SessionControllerError("thread_start_failed") from None
             raise
-        return RunHandle(request.session_id, request.run_id)
+        return RunHandle(request.session_id, request.run_id, request.run_mode)
 
     def _controller_failure(self, run_id: str) -> SessionRunResult:
         return SessionRunResult(
@@ -725,7 +745,10 @@ class SessionController:
             terminal = self._store.finish_run(result)
             self._event_hub.publish(
                 SessionUpdateKind.RUN_FINISHED,
-                {"status": terminal.status.value},
+                {
+                    "status": terminal.status.value,
+                    "agent_status": terminal.agent_status,
+                },
             )
         except Exception:
             self._degraded = True

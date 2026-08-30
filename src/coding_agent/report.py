@@ -5,6 +5,7 @@ import json
 
 from coding_agent.logging import RunMetadata, TokenUsageTotals, scrub_text
 from coding_agent.messages import JSONObject
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import CommandSource
 from coding_agent.state import (
     AgentState,
@@ -14,7 +15,7 @@ from coding_agent.state import (
 )
 
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 MAX_REPORT_COMPLETION_CHARS = 4096
 MAX_REPORT_COMMAND_CHARS = 4096
 MAX_REPORT_STREAM_CHARS = 8192
@@ -87,6 +88,7 @@ def _excerpt(
 class FinalReport:
     schema_version: int
     run_id: str
+    run_mode: RunMode
     status: AgentStatus
     exit_code: int
     completion: EvidenceExcerpt | None
@@ -138,6 +140,21 @@ class FinalReport:
                 or evidence.validation_index != state.mutation_index
             ):
                 raise ReportInvariantError("success lacks fresh passing verification")
+            exit_code = 0
+        elif state.status is AgentStatus.ANSWERED:
+            if (
+                state.run_mode is not RunMode.READ_ONLY
+                or not isinstance(state.completion_text, str)
+                or not state.completion_text.strip()
+                or state.termination_reason is not None
+                or state.failure_reason is not None
+                or state.mutation_index != 0
+                or state.modified_paths
+                or state.verification_status is not VerificationStatus.NOT_RUN
+                or state.verification_attempt_count != 0
+                or state.last_verification is not None
+            ):
+                raise ReportInvariantError("answered state has invalid facts")
             exit_code = 0
         elif state.status is AgentStatus.INTERRUPTED:
             if state.termination_reason is not TerminationReason.USER_INTERRUPTED:
@@ -197,6 +214,7 @@ class FinalReport:
         return cls(
             schema_version=REPORT_SCHEMA_VERSION,
             run_id=metadata.run_id,
+            run_mode=state.run_mode,
             status=state.status,
             exit_code=exit_code,
             completion=_excerpt(
@@ -237,6 +255,7 @@ class FinalReport:
         return {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
+            "run_mode": self.run_mode.value,
             "status": self.status.value,
             "exit_code": self.exit_code,
             "completion": None if self.completion is None else self.completion.to_dict(),

@@ -19,6 +19,7 @@ from coding_agent.logging import RunEventLogger, RunEventObserver, RunLogError
 from coding_agent.model import ModelClient
 from coding_agent.openai_client import OpenAIResponsesClient
 from coding_agent.report import FinalReport
+from coding_agent.run_mode import RunMode
 from coding_agent.state import AgentState, AgentStatus, TerminationReason
 from coding_agent.streaming import ModelStreamHandler
 from coding_agent.termination import TerminationPolicy
@@ -31,7 +32,11 @@ from coding_agent.tools.filesystem import (
 )
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.tools.java import RunJavaTestsTool
-from coding_agent.tools.shell import AuthorizedCommandExecutor, RunCommandTool
+from coding_agent.tools.shell import (
+    AuthorizedCommandExecutor,
+    InspectGitTool,
+    RunCommandTool,
+)
 from coding_agent.verification import VerificationGate
 
 
@@ -135,8 +140,15 @@ def execute_agent_run(
             logger.set_event_observer(event_observer)
         execution_context = ExecutionContext(config.workspace)
         executor = selected.command_executor()
-        registry = ToolRegistry(
-            (
+        if config.run_mode is RunMode.READ_ONLY:
+            tools = (
+                ListDirectoryTool(),
+                ReadFileTool(),
+                InspectGitTool(authorized_executor=executor),
+            )
+            verification_gate = None
+        else:
+            tools = (
                 ListDirectoryTool(),
                 ReadFileTool(),
                 ReplaceTextTool(),
@@ -144,18 +156,19 @@ def execute_agent_run(
                 RunCommandTool(authorized_executor=executor),
                 RunJavaTestsTool(executor=executor),
             )
-        )
+            verification_gate = VerificationGate(
+                required_command=config.verify_command,
+                execution_context=execution_context,
+                executor=executor,
+            )
+        registry = ToolRegistry(tools)
         model_client = selected.model_client(config)
         context_manager = ContextManager(model_client=model_client)
         termination_policy = TerminationPolicy()
-        verification_gate = VerificationGate(
-            required_command=config.verify_command,
-            execution_context=execution_context,
-            executor=executor,
-        )
         instruction_snapshot = RunInstructionBuilder().build(
             config.workspace,
             skill_instructions=skill_instructions,
+            run_mode=config.run_mode,
         )
         runner = AgentRunner(
             model_client=model_client,
@@ -171,6 +184,7 @@ def execute_agent_run(
             confirmed_text_handler=confirmed_text_handler,
             cancellation_requested=cancellation_requested,
             initial_user_message=initial_user_message,
+            run_mode=config.run_mode,
         )
     except KeyboardInterrupt:
         _close_after_failed_setup(logger)

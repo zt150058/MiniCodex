@@ -7,11 +7,58 @@ from threading import Event, Thread
 
 import pytest
 
-from coding_agent.session_events import SessionEventHub, SessionUpdateKind
+from coding_agent.session_events import (
+    SESSION_UPDATE_SCHEMA_VERSION,
+    SessionEventHub,
+    SessionUpdate,
+    SessionUpdateKind,
+)
 
 SESSION_ID = "1" * 32
 RUN_ID = "2" * 32
 NOW = datetime(2026, 8, 29, 8, 0, tzinfo=timezone.utc)
+
+
+def test_run_finished_schema_v2_carries_session_and_agent_status() -> None:
+    assert SESSION_UPDATE_SCHEMA_VERSION == 2
+    update = SessionUpdate(
+        schema_version=2,
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        sequence=1,
+        timestamp_utc="2026-08-29T08:00:00.000000Z",
+        kind=SessionUpdateKind.RUN_FINISHED,
+        data={"status": "succeeded", "agent_status": "answered"},
+    )
+    assert update.to_dict()["data"] == {
+        "status": "succeeded",
+        "agent_status": "answered",
+    }
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"status": "succeeded"},
+        {"status": "succeeded", "agent_status": "unknown"},
+        {"status": "failed", "agent_status": "success"},
+        {"status": "interrupted", "agent_status": "failed"},
+        {"status": "succeeded", "agent_status": "answered", "extra": 1},
+    ],
+)
+def test_run_finished_rejects_incomplete_or_invalid_v2_data(
+    data: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        SessionUpdate(
+            schema_version=2,
+            session_id=SESSION_ID,
+            run_id=RUN_ID,
+            sequence=1,
+            timestamp_utc="2026-08-29T08:00:00.000000Z",
+            kind=SessionUpdateKind.RUN_FINISHED,
+            data=data,  # type: ignore[arg-type]
+        )
 
 
 def test_update_schema_is_ordered_and_repr_hides_data() -> None:
@@ -118,7 +165,10 @@ def test_wait_wakes_for_new_event_without_polling_sleep() -> None:
 def test_begin_run_replaces_previous_replay_window() -> None:
     hub = SessionEventHub(utc_clock=lambda: NOW)
     hub.begin_run(SESSION_ID, RUN_ID)
-    hub.publish(SessionUpdateKind.RUN_FINISHED, {"status": "failed"})
+    hub.publish(
+        SessionUpdateKind.RUN_FINISHED,
+        {"status": "failed", "agent_status": "failed"},
+    )
     hub.begin_run("3" * 32, "4" * 32)
     assert hub.read().events == ()
     assert hub.read().last_sequence == 0

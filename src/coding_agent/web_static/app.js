@@ -26,6 +26,11 @@ const ACTIVITY_LABELS = Object.freeze({
   run_failed: "运行失败",
   run_interrupted: "运行已中断",
 });
+const RUN_MODES = new Set(["modify", "read_only"]);
+const RUN_MODE_LABELS = Object.freeze({
+  modify: "可修改",
+  read_only: "只读",
+});
 
 
 export function appendPlainText(document, parent, text) {
@@ -67,12 +72,18 @@ function appendFencedText(document, parent, text) {
 }
 
 
-export function appendMessage(document, container, role, text) {
+export function appendMessage(document, container, role, text, runMode = null) {
   const message = document.createElement("article");
   message.className = `message message--${role === "user" ? "user" : "assistant"}`;
   const label = document.createElement("div");
   label.className = "message__label";
   appendPlainText(document, label, role === "user" ? "你" : "Agent");
+  if (role === "user" && Object.hasOwn(RUN_MODE_LABELS, runMode)) {
+    const badge = document.createElement("span");
+    badge.className = "run-mode-badge";
+    appendPlainText(document, badge, RUN_MODE_LABELS[runMode]);
+    label.append(badge);
+  }
   const body = document.createElement("div");
   body.className = "message__body";
   appendFencedText(document, body, String(text));
@@ -127,11 +138,12 @@ export function appendActivity(document, container, kind, data) {
 
 export function renderRunHeader(document, elements, run, phase) {
   const status = run?.status;
-  const label = STATUS_LABELS[status] ?? "状态未知";
+  const answered = status === "succeeded" && run?.agent_status === "answered";
+  const label = answered ? "已回答" : STATUS_LABELS[status] ?? "状态未知";
   elements.runStatus.replaceChildren(document.createTextNode(label));
   elements.runStatus.className = `status-pill status-pill--${
     status === "succeeded"
-      ? "success"
+      ? answered ? "answered" : "success"
       : status === "failed" || status === "interrupted"
         ? "failure"
         : status === "running" || status === "cancelling" || status === "queued"
@@ -177,6 +189,7 @@ export function createInitialUiState() {
     skills: [],
     skillDiagnostics: [],
     selectedSkillIds: [],
+    selectedRunMode: "modify",
     activeRunId: null,
     lastSequence: 0,
     provisionalText: "",
@@ -227,15 +240,15 @@ export function createApiClient({
     loadSession: (sessionId) =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`),
     listSkills: () => request("/api/v1/skills"),
-    createSession: (message, skillIds) =>
+    createSession: (message, skillIds, runMode = "modify") =>
       request("/api/v1/sessions", {
         method: "POST",
-        body: { message, skill_ids: skillIds },
+        body: { message, skill_ids: skillIds, run_mode: runMode },
       }),
-    submitFollowUp: (sessionId, message) =>
+    submitFollowUp: (sessionId, message, runMode = "modify") =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: "POST",
-        body: { message },
+        body: { message, run_mode: runMode },
       }),
     saveSkillSelection: (sessionId, skillIds) =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/skills`, {
@@ -397,6 +410,14 @@ export function reduceSessionUpdate(state, frame) {
     if (run) {
       run.status = lifecycleStatus;
       if (frame.event === "run_finished") {
+        if ([
+          "success",
+          "answered",
+          "failed",
+          "interrupted",
+        ].includes(payload.agent_status)) {
+          run.agent_status = payload.agent_status;
+        }
         run.termination_reason =
           typeof payload.termination_reason === "string" && payload.termination_reason
             ? payload.termination_reason
@@ -570,6 +591,16 @@ export function createUiController({
   function renderControls() {
     const mutationLocked = anySessionActive();
     elements.sendButton.disabled = mutationLocked;
+    for (const button of [
+      elements.runModeModifyButton,
+      elements.runModeReadOnlyButton,
+    ]) {
+      button.disabled = mutationLocked;
+      button.setAttribute(
+        "aria-pressed",
+        String(button.dataset.runMode === state.selectedRunMode),
+      );
+    }
     for (const input of findInputs(elements.skillList)) {
       input.disabled = mutationLocked;
     }
@@ -662,8 +693,15 @@ export function createUiController({
     }
 
     for (const event of detail?.events ?? []) {
+      const eventRun = projection.runsById.get(event.run_id);
       if (event.kind === "user_message" && typeof event.data?.content === "string") {
-        appendMessage(document, elements.conversationLog, "user", event.data.content);
+        appendMessage(
+          document,
+          elements.conversationLog,
+          "user",
+          event.data.content,
+          eventRun?.run_mode,
+        );
       } else if (
         event.kind === "assistant_text_committed" &&
         typeof event.data?.content === "string" &&
@@ -673,7 +711,6 @@ export function createUiController({
         appendMessage(document, elements.conversationLog, "assistant", event.data.content);
       }
 
-      const eventRun = projection.runsById.get(event.run_id);
       if (
         (eventRun?.status === "failed" || eventRun?.status === "interrupted") &&
         projection.lastEventSequence.get(event.run_id) === event.sequence
@@ -859,16 +896,42 @@ export function createUiController({
     }
   });
 
+  elements.runModeControl.addEventListener("click", (event) => {
+    if (anySessionActive()) {
+      renderControls();
+      return;
+    }
+    let target = event.target;
+    while (target && target !== elements.runModeControl) {
+      const runMode = target.nodeType === 1 ? target.dataset?.runMode : null;
+      if (RUN_MODES.has(runMode)) {
+        state.selectedRunMode = runMode;
+        renderControls();
+        return;
+      }
+      target = target.parentNode;
+    }
+  });
+
   function submitComposer() {
     const message = elements.messageInput.value.trim();
     if (!message || anySessionActive()) return;
+    const runMode = state.selectedRunMode;
     track(async () => {
       let handle;
       if (state.selectedSessionId) {
-        handle = await api.submitFollowUp(state.selectedSessionId, message);
+        handle = await api.submitFollowUp(
+          state.selectedSessionId,
+          message,
+          runMode,
+        );
         await selectSession(handle.session_id);
       } else {
-        handle = await api.createSession(message, state.selectedSkillIds);
+        handle = await api.createSession(
+          message,
+          state.selectedSkillIds,
+          runMode,
+        );
         await selectSession(handle.session_id);
         if (!state.sessions.some((session) => session.session_id === handle.session_id)) {
           state.sessions.unshift(state.selectedSession.session);
@@ -987,6 +1050,9 @@ export function collectGuiElements(document) {
     sendButton: "send-message-button",
     connectionStatus: "connection-status",
     newSessionButton: "new-session-button",
+    runModeControl: "run-mode-control",
+    runModeModifyButton: "run-mode-modify",
+    runModeReadOnlyButton: "run-mode-read-only",
     emptyState: "empty-state",
   };
   const elements = Object.fromEntries(

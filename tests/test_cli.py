@@ -12,6 +12,7 @@ import pytest
 
 from coding_agent.cli import build_parser, main
 from coding_agent.config import ApiMode, ConfigError, RunConfig, load_run_config
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import (
     AuthorizedCommand,
     CommandSource,
@@ -38,6 +39,44 @@ def valid_chat_environ() -> dict[str, str]:
     }
 
 
+def test_config_defaults_to_modify(tmp_path: Path) -> None:
+    config = load_run_config(
+        task="inspect",
+        workspace=tmp_path,
+        model=None,
+        verify_command=None,
+        environ=valid_environ(),
+    )
+
+    assert config.run_mode is RunMode.MODIFY
+
+
+def test_config_accepts_read_only(tmp_path: Path) -> None:
+    config = load_run_config(
+        task="inspect",
+        workspace=tmp_path,
+        model=None,
+        verify_command=None,
+        environ=valid_environ(),
+        run_mode=RunMode.READ_ONLY,
+    )
+
+    assert config.run_mode is RunMode.READ_ONLY
+
+
+@pytest.mark.parametrize("value", ["auto", "READ_ONLY", "", 1, True, None])
+def test_config_rejects_invalid_run_mode(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ConfigError, match="run mode"):
+        load_run_config(
+            task="inspect",
+            workspace=tmp_path,
+            model=None,
+            verify_command=None,
+            environ=valid_environ(),
+            run_mode=value,  # type: ignore[arg-type]
+        )
+
+
 def test_help_describes_local_agent_execution_and_verification() -> None:
     help_text = " ".join(build_parser().format_help().split())
 
@@ -48,6 +87,11 @@ def test_help_describes_local_agent_execution_and_verification() -> None:
     assert "--base-url" in help_text
     assert "responses" in help_text
     assert "chat-completions" in help_text
+    assert "--read-only" in help_text
+    assert (
+        "Inspect and answer without file mutation or verification tools"
+        in help_text
+    )
     for stale_text in (
         "Validate configuration",
         "Task to validate",
@@ -56,6 +100,65 @@ def test_help_describes_local_agent_execution_and_verification() -> None:
         "Task1",
     ):
         assert stale_text not in help_text
+
+
+def test_cli_read_only_flag_maps_to_config(tmp_path: Path) -> None:
+    captured: list[RunConfig] = []
+
+    exit_code = main(
+        ["inspect", "--workspace", str(tmp_path), "--read-only"],
+        environ=valid_environ(),
+        application=lambda config, **streams: captured.append(config) or 0,
+    )
+
+    assert exit_code == 0
+    assert captured[0].run_mode is RunMode.READ_ONLY
+
+
+def test_cli_without_read_only_flag_remains_modify(tmp_path: Path) -> None:
+    captured: list[RunConfig] = []
+
+    exit_code = main(
+        ["change", "--workspace", str(tmp_path)],
+        environ=valid_environ(),
+        application=lambda config, **streams: captured.append(config) or 0,
+    )
+
+    assert exit_code == 0
+    assert captured[0].run_mode is RunMode.MODIFY
+
+
+def test_cli_read_only_with_verify_exits_two_before_application(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    def application(*args: object, **kwargs: object) -> int:
+        nonlocal called
+        del args, kwargs
+        called = True
+        return 0
+
+    stderr = StringIO()
+    exit_code = main(
+        [
+            "inspect",
+            "--workspace",
+            str(tmp_path),
+            "--read-only",
+            "--verify",
+            "pytest -q",
+        ],
+        environ=valid_environ(),
+        application=application,
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert called is False
+    assert stderr.getvalue() == (
+        "error: --read-only cannot be combined with --verify\n"
+    )
 
 
 def test_config_normalizes_workspace(tmp_path: Path) -> None:

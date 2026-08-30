@@ -131,8 +131,8 @@ Agent 使用同步、显式的 `while` 循环。每轮按以下顺序执行：
    - 执行本地工具并捕获统一结果；
    - 将 `ToolResult` 加入历史、日志和状态。
 6. 文件工具成功修改内容时增加 `mutation_index`，记录文件，并把现有验证标记为 `STALE`。
-7. 如果模型返回完成文本且没有工具调用，将其视为完成候选并进入 `VerificationGate`。
-8. 验证通过时进入 `SUCCESS`；验证失败或缺少证据时，把真实证据加入上下文并继续运行。
+7. 如果模型返回完成文本且没有工具调用，按显式运行模式处理：`modify` 将其视为完成候选并进入 `VerificationGate`；`read_only` 在零修改且未运行验证的不变量成立时进入 `ANSWERED`。
+8. `modify` 验证通过时进入 `SUCCESS`；验证失败或缺少证据时，把真实证据加入上下文并继续运行。`ANSWERED` 不等同于验证成功。
 9. 任何预算耗尽或不可恢复错误都进入带原因的 `FAILED`，不得死循环。
 
 工具调用首版顺序执行，不实现并行。`AgentState` 保存简短的 `current_goal` 和 `open_issues`，但不引入独立 Planner。
@@ -492,7 +492,15 @@ Task22–Task23 按 `docs/superpowers/specs/2026-08-30-local-web-gui-design.md` 
 
 REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果仍需人工 checkpoint。远程访问、WebSocket、账户、多用户、多活动运行、MCP、可执行 Skill 和前端框架仍不在范围内。
 
-## 19. 首版不实现的功能
+## 19. 显式运行模式
+
+每个 run 携带不可变、供应商无关的 `RunMode`，只接受 `modify` 与 `read_only`，默认值为 `modify`。模式由 CLI 或 Web 用户显式选择，不能根据提示词推断，也不固定在整个会话上；同一会话的后续消息可以重新选择。
+
+`modify` 保留现有六个工具和新鲜验证门槛。`read_only` 只注册 `list_directory`、`read_file` 与专用 `inspect_git`；后者只能执行既有安全策略批准的本地 Git `status`、`diff`、`log`、`show` 和 `ls-files`。只读模式不注册文件修改、通用命令、Java 或验证工具。
+
+只读 run 的非空、无工具最终文本在零修改、零验证的不变量成立时进入 `ANSWERED`，退出码为 `0`；`SUCCESS` 仍只表示修改能力运行获得了最后一次修改后的新鲜通过证据。模式随 run 写入 SQLite、REST/SSE、审计和最终报告；历史数据库迁移时保守标记为 `modify`。
+
+## 20. 首版不实现的功能
 
 - 多智能体、子 Agent 和独立 Planner。
 - 向量数据库、长期记忆和语义检索。
@@ -511,7 +519,7 @@ REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果�
 - Git 写操作、自动提交、自动推送或远程仓库操作。
 - 对恶意工作区代码的操作系统级隔离保证。
 
-## 20. 当前方案的局限性
+## 21. 当前方案的局限性
 
 - 有限命令白名单只覆盖 Python 演示场景，不是通用 Coding Agent 的完整命令生态。
 - `replace_text` 不适合大规模重构或重复片段复杂编辑。

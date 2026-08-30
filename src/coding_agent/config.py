@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import (
     AuthorizedCommand,
     CommandPolicy,
@@ -36,8 +37,11 @@ class RunConfig:
     api_mode: ApiMode = ApiMode.RESPONSES
     base_url: str | None = field(default=None, repr=False)
     verify_command: AuthorizedCommand | None = field(default=None, repr=False)
+    run_mode: RunMode = RunMode.MODIFY
 
     def __post_init__(self) -> None:
+        if not isinstance(self.run_mode, RunMode):
+            raise ConfigError("run mode must be 'modify' or 'read_only'")
         if not isinstance(self.api_mode, ApiMode):
             raise ConfigError(
                 "api mode must be one of: responses, chat-completions"
@@ -106,8 +110,16 @@ def load_run_config(
     api_mode: ApiMode | str = ApiMode.RESPONSES,
     base_url: str | None = None,
     environ: Mapping[str, str] | None = None,
+    run_mode: RunMode | str = RunMode.MODIFY,
 ) -> RunConfig:
     source = os.environ if environ is None else environ
+
+    if isinstance(run_mode, bool):
+        raise ConfigError("run mode must be 'modify' or 'read_only'")
+    try:
+        selected_run_mode = RunMode(run_mode)
+    except (TypeError, ValueError):
+        raise ConfigError("run mode must be 'modify' or 'read_only'") from None
 
     try:
         selected_mode = ApiMode(api_mode)
@@ -182,4 +194,5 @@ def load_run_config(
         api_mode=selected_mode,
         base_url=normalized_base_url,
         verify_command=authorized_verify,
+        run_mode=selected_run_mode,
     )

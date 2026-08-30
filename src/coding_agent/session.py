@@ -11,6 +11,7 @@ import re
 import uuid
 
 from coding_agent.messages import JSONObject, JSONValue
+from coding_agent.run_mode import RunMode
 
 
 MAX_USER_MESSAGE_BYTES = 65_536
@@ -357,7 +358,7 @@ _SAFE_SUMMARY_FIELDS = {
 
 def _validate_safe_summary_data(data: JSONObject) -> None:
     _require_exact_keys(data, _SAFE_SUMMARY_FIELDS, "run_finished")
-    if data["status"] not in {"success", "failed", "interrupted"}:
+    if data["status"] not in {"success", "answered", "failed", "interrupted"}:
         raise ValueError("run summary status is invalid")
     _require_optional_integer(data["exit_code"], "exit_code")
     _require_optional_safe_code(data["termination_reason"], "termination_reason")
@@ -418,6 +419,7 @@ class SessionRunRecord:
     session_id: str
     ordinal: int
     status: SessionRunStatus
+    run_mode: RunMode
     user_event_sequence: int
     started_at_utc: str | None
     finished_at_utc: str | None
@@ -431,6 +433,7 @@ class SessionRunRecord:
         _require_id(self.session_id, "session_id")
         _require_positive_int(self.ordinal, "ordinal")
         _require_enum(self.status, SessionRunStatus, "status")
+        _require_enum(self.run_mode, RunMode, "run_mode")
         _require_positive_int(self.user_event_sequence, "user_event_sequence")
         _require_optional_timestamp(self.started_at_utc, "started_at_utc")
         _require_optional_timestamp(self.finished_at_utc, "finished_at_utc")
@@ -681,6 +684,7 @@ _PERSISTED_REPORT_FIELDS = frozenset(
     {
         "schema_version",
         "run_id",
+        "run_mode",
         "status",
         "exit_code",
         "termination_reason",
@@ -798,11 +802,14 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
     _require_fields(normalized, _PERSISTED_REPORT_FIELDS, "report")
 
     schema_version = normalized["schema_version"]
-    if schema_version != 1 or isinstance(schema_version, bool):
-        raise ValueError("schema_version must be 1")
+    if schema_version != 2 or isinstance(schema_version, bool):
+        raise ValueError("schema_version must be 2")
     run_id = _require_id(normalized["run_id"], "run_id")
+    run_mode = normalized["run_mode"]
+    if run_mode not in {"modify", "read_only"}:
+        raise ValueError("run_mode must be modify or read_only")
     status = normalized["status"]
-    if status not in {"success", "failed", "interrupted"}:
+    if status not in {"success", "answered", "failed", "interrupted"}:
         raise ValueError("status must be terminal")
     exit_code = normalized["exit_code"]
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
@@ -810,12 +817,17 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
     termination_reason = _require_optional_text(
         normalized["termination_reason"], "termination_reason"
     )
-    expected_exit_code = {"success": 0, "failed": 1, "interrupted": 130}[status]
+    expected_exit_code = {
+        "success": 0,
+        "answered": 0,
+        "failed": 1,
+        "interrupted": 130,
+    }[status]
     if exit_code != expected_exit_code:
         raise ValueError("status and exit_code are inconsistent")
-    if status == "success" and termination_reason is not None:
+    if status in {"success", "answered"} and termination_reason is not None:
         raise ValueError("successful report cannot have a termination reason")
-    if status != "success" and termination_reason is None:
+    if status in {"failed", "interrupted"} and termination_reason is None:
         raise ValueError("unsuccessful report requires a termination reason")
 
     changed_paths = [
@@ -829,6 +841,40 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
         normalized["validation_index"], "validation_index"
     )
     verification = _project_verification(normalized["verification"])
+    verification_attempts = _require_non_negative_int(
+        normalized["verification_attempts"], "verification_attempts"
+    )
+    if status == "success":
+        if run_mode != "modify":
+            raise ValueError("successful report requires modify mode")
+        if (
+            verification["status"] != "passed"
+            or verification["exit_code"] != 0
+            or validation_index != mutation_index
+            or verification["validation_index"] != mutation_index
+            or verification_attempts == 0
+        ):
+            raise ValueError("successful report lacks fresh verification")
+    elif status == "answered":
+        if (
+            run_mode != "read_only"
+            or changed_paths
+            or mutation_index != 0
+            or validation_index is not None
+            or verification_attempts != 0
+            or verification
+            != {
+                "status": "not_run",
+                "source": None,
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "duration_ms": None,
+                "validation_index": None,
+                "error_code": None,
+            }
+        ):
+            raise ValueError("answered report has invalid facts")
     token_usage = _project_token_usage(normalized["token_usage"])
     log_failure_code = _require_optional_text(
         normalized["log_failure_code"], "log_failure_code"
@@ -840,6 +886,7 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
     persisted: JSONObject = {
         "schema_version": schema_version,
         "run_id": run_id,
+        "run_mode": run_mode,
         "status": status,
         "exit_code": exit_code,
         "termination_reason": termination_reason,
@@ -854,9 +901,7 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
             normalized["provider_attempts"], "provider_attempts"
         ),
         "tool_calls": _require_non_negative_int(normalized["tool_calls"], "tool_calls"),
-        "verification_attempts": _require_non_negative_int(
-            normalized["verification_attempts"], "verification_attempts"
-        ),
+        "verification_attempts": verification_attempts,
         "context_compressions": _require_non_negative_int(
             normalized["context_compressions"], "context_compressions"
         ),

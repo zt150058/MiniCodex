@@ -5,6 +5,7 @@ import sys
 from typing import TYPE_CHECKING, Mapping, NoReturn, Sequence, TextIO
 
 from coding_agent.config import ConfigError, load_run_config
+from coding_agent.run_mode import RunMode
 
 if TYPE_CHECKING:
     from coding_agent.app import Application
@@ -31,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
             "User-specified required final verification command; authorized "
             "before the agent starts and run after the latest file modification."
         ),
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Inspect and answer without file mutation or verification tools",
     )
     parser.add_argument(
         "--model",
@@ -62,6 +68,12 @@ def main(
     output = sys.stdout if stdout is None else stdout
     errors = sys.stderr if stderr is None else stderr
     args = build_parser().parse_args(argv)
+    if args.read_only and args.verify is not None:
+        print(
+            "error: --read-only cannot be combined with --verify",
+            file=errors,
+        )
+        return 2
     try:
         config = load_run_config(
             task=args.task,
@@ -71,6 +83,9 @@ def main(
             api_mode=args.api_mode,
             base_url=args.base_url,
             environ=environ,
+            run_mode=(
+                RunMode.READ_ONLY if args.read_only else RunMode.MODIFY
+            ),
         )
     except ConfigError as exc:
         print(f"error: {exc}", file=errors)

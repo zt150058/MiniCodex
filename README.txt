@@ -1,4 +1,4 @@
-MiniCodex 是 Windows 本地 Coding Agent；自主实现循环、会话、上下文、工具、安全、验证和日志，以 ModelClient 隔离 Responses 与 compatible Chat Completions。
+MiniCodex 是 Windows 本地 Coding Agent；实现循环、上下文、工具、安全、验证、会话和日志，以 ModelClient 隔离模型供应商。
 
 仓库：https://github.com/zt150058/MiniCodex
 环境：Windows，Python 3.11+。
@@ -8,13 +8,12 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[test]"
 
-配置：--api-mode responses 读取 OPENAI_API_KEY；chat-completions 读取 CHAT_COMPLETIONS_API_KEY 和 --base-url。模型用 OPENAI_MODEL 或 --model，密钥不得进入代码、日志或子进程。
+配置：--api-mode responses 读取 OPENAI_API_KEY；chat-completions 读取 CHAT_COMPLETIONS_API_KEY 和 --base-url。模型用 OPENAI_MODEL 或 --model。
 
-CLI：coding-agent "修复失败测试" --workspace . --verify "pytest -q"
-GUI：coding-agent-web --workspace .；只监听本机随机端口，显示会话、Skill 和状态。
+允许修改（默认）：coding-agent "修复失败测试" --workspace . --verify "pytest -q"
+只读问答：coding-agent "介绍项目" --workspace . --read-only
+GUI：coding-agent-web --workspace .；每条消息可选择“允许修改”或“只读问答”。
 
---verify 是可选强制验证。支持 UTF-8 文本、精确替换、受控命令及本机 JDK Java .in/.out 黑盒验证；不支持删除、任意 Shell、下载、Git 写入或推送。
+只读模式仅列目录、读文件和检查本地 Git，答案为 ANSWERED；不修改或验证。允许修改支持 UTF-8 精确修改、受控命令和 JDK Java .in/.out 验证。--verify 是可选强制门槛；最后一次修改后验证为 0 且 validation_index == mutation_index 才可能成功。
 
-最后一次修改后验证为 0 且 validation_index == mutation_index 才可能成功。FinalReport 展示证据，JSONL 位于 .coding-agent/logs/<run_id>.jsonl。
-
-本项目不是操作系统级沙箱，请使用工作区副本。安装见 docs/USAGE.md；API、重试和隐私见 docs/OPENAI_API.md。
+不支持删除、任意 Shell、下载、Git 写入或推送。JSONL 位于 .coding-agent/logs/<run_id>.jsonl。项目不是操作系统级沙箱。安装见 docs/USAGE.md；API 与隐私见 docs/OPENAI_API.md。

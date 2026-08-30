@@ -11,6 +11,7 @@ from coding_agent.context import ContextLimits, ContextManager
 from coding_agent.logging import RunEventObserver
 from coding_agent.messages import JSONObject
 from coding_agent.messages import UserMessage
+from coding_agent.run_mode import RunMode
 from coding_agent.session import (
     SessionError,
     SessionNarrativeEntry,
@@ -124,8 +125,11 @@ class SessionRunRequest:
     current_message: str = field(repr=False)
     initial_user_message: str = field(repr=False)
     skill_bundle: SkillInstructionBundle | None = field(default=None, repr=False)
+    run_mode: RunMode = RunMode.MODIFY
 
     def __post_init__(self) -> None:
+        if type(self.run_mode) is not RunMode:
+            raise TypeError("run_mode must be RunMode")
         if self.skill_bundle is not None and type(self.skill_bundle) is not SkillInstructionBundle:
             raise TypeError("skill_bundle must be SkillInstructionBundle or None")
         for value, name in (
@@ -205,7 +209,11 @@ class AgentSessionRunExecutor:
             raise TypeError("request must be SessionRunRequest")
         from coding_agent.app import execute_agent_run
 
-        config = replace(self._base_config, task=request.current_message)
+        config = replace(
+            self._base_config,
+            task=request.current_message,
+            run_mode=request.run_mode,
+        )
         skill_instructions = (
             None if request.skill_bundle is None else request.skill_bundle.text
         )
@@ -228,6 +236,7 @@ class AgentSessionRunExecutor:
         )
         status = {
             "success": SessionRunStatus.SUCCEEDED,
+            "answered": SessionRunStatus.SUCCEEDED,
             "failed": SessionRunStatus.FAILED,
             "interrupted": SessionRunStatus.INTERRUPTED,
         }[agent_status]

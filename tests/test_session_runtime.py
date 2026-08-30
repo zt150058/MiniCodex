@@ -17,6 +17,7 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import FakeModelClient
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import AuthorizedCommand
 from coding_agent.session import (
     SessionError,
@@ -192,6 +193,153 @@ class PassingExecutor:
                 separators=(",", ":"),
             ),
             metadata=ToolResultMetadata(exit_code=0, duration_ms=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "agent_status", "session_status"),
+    [
+        (RunMode.MODIFY, "success", SessionRunStatus.SUCCEEDED),
+        (RunMode.READ_ONLY, "answered", SessionRunStatus.SUCCEEDED),
+    ],
+)
+def test_runtime_executes_with_request_mode_and_maps_terminal_status(
+    tmp_path: Path,
+    mode: RunMode,
+    agent_status: str,
+    session_status: SessionRunStatus,
+) -> None:
+    captured_configs: list[object] = []
+    base_config = load_run_config(
+        task="template task",
+        workspace=tmp_path,
+        model="fake-model",
+        verify_command="pytest -q",
+        environ={"OPENAI_API_KEY": "obviously-fake-session-key"},
+    )
+    factories = ApplicationFactories(
+        model_client=lambda selected: (
+            captured_configs.append(selected)
+            or FakeModelClient((ModelResponse(text="done"),))
+        ),
+        logger=lambda selected, clock: RunEventLogger.create(
+            selected.workspace,
+            run_id="9" * 32,
+            sensitive_values=(selected.api_key,),
+            monotonic_clock=clock,
+        ),
+        command_executor=PassingExecutor,
+        clock=lambda: 0.0,
+    )
+    request = SessionRunRequest(
+        session_id="1" * 32,
+        run_id="2" * 32,
+        current_message="inspect",
+        initial_user_message="inspect",
+        run_mode=mode,
+    )
+
+    outcome = AgentSessionRunExecutor(
+        base_config,
+        factories=factories,
+    ).execute(
+        request,
+        stream_handler=lambda event: None,
+        confirmed_text_handler=lambda text: None,
+        cancellation_requested=lambda: False,
+        run_event_handler=lambda event: None,
+    )
+
+    assert captured_configs[0].run_mode is mode
+    assert outcome.status is session_status
+    assert outcome.agent_status == agent_status
+
+
+def test_web_base_verify_runs_for_modify_but_not_read_only(tmp_path: Path) -> None:
+    class RecordingPassingExecutor(PassingExecutor):
+        def __init__(self) -> None:
+            self.calls: list[AuthorizedCommand] = []
+
+        def execute(
+            self,
+            command: AuthorizedCommand,
+            context: ExecutionContext,
+        ) -> ToolExecution:
+            self.calls.append(command)
+            return super().execute(command, context)
+
+    command_executor = RecordingPassingExecutor()
+    logger_ids = iter(("a" * 32, "b" * 32))
+    base_config = load_run_config(
+        task="template task",
+        workspace=tmp_path,
+        model="fake-model",
+        verify_command="pytest -q",
+        environ={"OPENAI_API_KEY": "obviously-fake-session-key"},
+    )
+    factories = ApplicationFactories(
+        model_client=lambda _: FakeModelClient((ModelResponse(text="done"),)),
+        logger=lambda selected, clock: RunEventLogger.create(
+            selected.workspace,
+            run_id=next(logger_ids),
+            sensitive_values=(selected.api_key,),
+            monotonic_clock=clock,
+        ),
+        command_executor=lambda: command_executor,  # type: ignore[arg-type]
+        clock=lambda: 0.0,
+    )
+    executor = AgentSessionRunExecutor(base_config, factories=factories)
+    handlers = {
+        "stream_handler": lambda event: None,
+        "confirmed_text_handler": lambda text: None,
+        "cancellation_requested": lambda: False,
+        "run_event_handler": lambda event: None,
+    }
+
+    modify = executor.execute(
+        SessionRunRequest(
+            session_id="1" * 32,
+            run_id="2" * 32,
+            current_message="change it",
+            initial_user_message="change it",
+            run_mode=RunMode.MODIFY,
+        ),
+        **handlers,  # type: ignore[arg-type]
+    )
+    read_only = executor.execute(
+        SessionRunRequest(
+            session_id="1" * 32,
+            run_id="3" * 32,
+            current_message="explain it",
+            initial_user_message="explain it",
+            run_mode=RunMode.READ_ONLY,
+        ),
+        **handlers,  # type: ignore[arg-type]
+    )
+
+    assert modify.agent_status == "success"
+    assert read_only.agent_status == "answered"
+    assert [call.purpose for call in command_executor.calls] == ["verification"]
+
+
+def test_session_run_request_mode_is_strict_and_sensitive_fields_stay_hidden() -> None:
+    request = SessionRunRequest(
+        session_id="1" * 32,
+        run_id="2" * 32,
+        current_message="private current message",
+        initial_user_message="private initial history",
+        run_mode=RunMode.READ_ONLY,
+    )
+    assert request.run_mode is RunMode.READ_ONLY
+    assert "private current message" not in repr(request)
+    assert "private initial history" not in repr(request)
+    with pytest.raises(TypeError, match="run_mode"):
+        SessionRunRequest(
+            session_id="1" * 32,
+            run_id="2" * 32,
+            current_message="inspect",
+            initial_user_message="inspect",
+            run_mode="read_only",  # type: ignore[arg-type]
         )
 
 

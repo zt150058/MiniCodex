@@ -20,6 +20,7 @@ from coding_agent.session import (
 )
 from coding_agent.session_controller import CancellationResult, SessionController
 from coding_agent.logging import EventType, RunEvent
+from coding_agent.run_mode import RunMode
 from coding_agent.session_events import SessionEventHub, SessionUpdateKind
 from coding_agent.session_runtime import SessionRunOutcome, SessionRunRequest
 from coding_agent.session_store import SQLiteSessionStore, WorkspaceSessionLease
@@ -270,6 +271,72 @@ def test_submit_message_resolves_persisted_selection_for_new_run(
     assert [item.skill_id for item in snapshots] == ["review"]
     executor.release.set()
     controller.wait_for_run(second.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_same_session_can_submit_independent_run_modes(tmp_path: Path) -> None:
+    executor = BlockingExecutor(
+        tmp_path,
+        (failed_outcome("inspection_finished"), failed_outcome("change_finished")),
+    )
+    controller = make_controller(tmp_path, executor)
+
+    first = controller.create_session(
+        "inspect",
+        run_mode=RunMode.READ_ONLY,
+    )
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(first.run_id, timeout_seconds=2.0)
+
+    executor.started.clear()
+    executor.release.clear()
+    second = controller.submit_message(
+        first.session_id,
+        "now change it",
+        run_mode=RunMode.MODIFY,
+    )
+    assert executor.started.wait(timeout=1.0)
+
+    assert first.run_mode is RunMode.READ_ONLY
+    assert second.run_mode is RunMode.MODIFY
+    assert executor.requests[0].run_mode is RunMode.READ_ONLY
+    assert executor.requests[1].run_mode is RunMode.MODIFY
+    assert controller.get_session(first.session_id).runs[0].run_mode is RunMode.READ_ONLY
+    assert controller.get_session(first.session_id).runs[1].run_mode is RunMode.MODIFY
+
+    executor.release.set()
+    controller.wait_for_run(second.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_controller_defaults_run_mode_to_modify(tmp_path: Path) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+    handle = controller.create_session("inspect")
+    assert executor.started.wait(timeout=1.0)
+
+    assert handle.run_mode is RunMode.MODIFY
+    assert executor.requests[0].run_mode is RunMode.MODIFY
+
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_controller_rejects_non_enum_mode_before_store(tmp_path: Path) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    store = SQLiteSessionStore(tmp_path)
+    controller = make_controller(tmp_path, executor, store=store)
+
+    with pytest.raises(TypeError, match="run_mode must be RunMode"):
+        controller.create_session(
+            "inspect",
+            run_mode="read_only",  # type: ignore[arg-type]
+        )
+
+    assert store.list_sessions() == ()
+    assert executor.requests == []
     assert controller.shutdown(timeout_seconds=1.0) is True
 
 
@@ -970,12 +1037,14 @@ def test_shutdown_timeout_includes_blocked_session_admission(tmp_path: Path) -> 
             message: str,
             *,
             selected_skills: tuple[SkillDescriptor, ...] = (),
+            run_mode: RunMode = RunMode.MODIFY,
         ):  # type: ignore[no-untyped-def]
             self.create_entered.set()
             assert self.release_create.wait(timeout=2.0)
             return super().create_session(
                 message,
                 selected_skills=selected_skills,
+                run_mode=run_mode,
             )
 
     store = BlockingCreateStore(tmp_path)
@@ -1023,6 +1092,7 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
             message: str,
             *,
             selected_skills: tuple[SkillDescriptor, ...] = (),
+            run_mode: RunMode = RunMode.MODIFY,
         ):  # type: ignore[no-untyped-def]
             self.submit_entered.set()
             assert self.release_submit.wait(timeout=2.0)
@@ -1030,6 +1100,7 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
                 session_id,
                 message,
                 selected_skills=selected_skills,
+                run_mode=run_mode,
             )
 
     store = BlockingSubmitStore(tmp_path)

@@ -21,6 +21,7 @@ from coding_agent.report import (
     FinalReport,
     ReportInvariantError,
 )
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import CommandSource
 from coding_agent.safety import AuthorizedCommand
 from coding_agent.state import (
@@ -77,6 +78,98 @@ def run_metadata() -> RunMetadata:
         ),
         finished_elapsed_ms=1250,
     )
+
+
+def answered_state(tmp_path: Path) -> AgentState:
+    state = AgentState.start(
+        "inspect",
+        tmp_path,
+        0.0,
+        run_mode=RunMode.READ_ONLY,
+    )
+    state.status = AgentStatus.ANSWERED
+    state.completion_text = "Project summary"
+    state.logical_model_call_count = 1
+    state.model_call_count = 1
+    return state
+
+
+def test_answered_report_is_successful_without_verification(
+    tmp_path: Path,
+) -> None:
+    report = FinalReport.from_state(answered_state(tmp_path), run_metadata())
+    payload = report.to_dict()
+
+    assert report.schema_version == 2
+    assert report.run_mode is RunMode.READ_ONLY
+    assert report.status is AgentStatus.ANSWERED
+    assert report.exit_code == 0
+    assert report.termination_reason is None
+    assert report.changed_paths == ()
+    assert report.verification.status is VerificationStatus.NOT_RUN
+    assert set(payload) == {
+        "schema_version",
+        "run_id",
+        "run_mode",
+        "status",
+        "exit_code",
+        "completion",
+        "termination_reason",
+        "failure_reason",
+        "changed_paths",
+        "mutation_index",
+        "validation_index",
+        "verification",
+        "logical_model_calls",
+        "provider_attempts",
+        "tool_calls",
+        "verification_attempts",
+        "context_compressions",
+        "token_usage",
+        "elapsed_ms",
+        "log_failure_code",
+        "log_path",
+    }
+    assert payload["run_mode"] == "read_only"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("run_mode", RunMode.MODIFY),
+        ("completion_text", ""),
+        ("mutation_index", 1),
+        ("modified_paths", ("x.py",)),
+        ("verification_status", VerificationStatus.STALE),
+        ("verification_attempt_count", 1),
+        ("failure_reason", "invalid"),
+        ("termination_reason", TerminationReason.INTERNAL_INVARIANT),
+    ],
+)
+def test_answered_report_rejects_each_broken_invariant(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    state = answered_state(tmp_path)
+    setattr(state, field_name, value)
+
+    with pytest.raises(
+        ReportInvariantError,
+        match="answered state has invalid facts",
+    ):
+        FinalReport.from_state(state, run_metadata())
+
+
+def test_answered_report_rejects_verification_evidence(tmp_path: Path) -> None:
+    state = answered_state(tmp_path)
+    state.last_verification = successful_state(tmp_path).last_verification
+
+    with pytest.raises(
+        ReportInvariantError,
+        match="answered state has invalid facts",
+    ):
+        FinalReport.from_state(state, run_metadata())
 
 
 def test_success_report_uses_state_and_metadata_without_reading_log(
@@ -156,9 +249,9 @@ def test_report_scrubs_before_exact_character_truncation_and_hides_repr(
     assert list(json.loads(rendered))[:5] == [
         "schema_version",
         "run_id",
+        "run_mode",
         "status",
         "exit_code",
-        "completion",
     ]
 
 

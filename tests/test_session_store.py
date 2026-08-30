@@ -11,6 +11,7 @@ from threading import Thread
 
 import pytest
 
+from coding_agent.run_mode import RunMode
 from coding_agent.session import (
     NewSessionEvent,
     PersistedSessionEventKind,
@@ -49,8 +50,9 @@ def persisted_failed_report(
     reason: str = "empty_model_response",
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": audit_run_id,
+        "run_mode": "modify",
         "status": "failed",
         "exit_code": 1,
         "termination_reason": reason,
@@ -85,6 +87,278 @@ def persisted_failed_report(
     }
 
 
+def _persisted_terminal_report(
+    audit_run_id: str,
+    mode: RunMode,
+) -> dict[str, object]:
+    report = persisted_failed_report(audit_run_id)
+    report["run_mode"] = mode.value
+    report.update(
+        status="answered" if mode is RunMode.READ_ONLY else "success",
+        exit_code=0,
+        termination_reason=None,
+    )
+    if mode is RunMode.MODIFY:
+        report.update(validation_index=0, verification_attempts=1)
+        report["verification"] = {
+            "status": "passed",
+            "source": "user_verify",
+            "exit_code": 0,
+            "timed_out": False,
+            "truncated": False,
+            "duration_ms": 1,
+            "validation_index": 0,
+            "error_code": None,
+        }
+    return report
+
+
+def _terminal_result(run_id: str, mode: RunMode) -> SessionRunResult:
+    audit_run_id = "f" * 32
+    report = _persisted_terminal_report(audit_run_id, mode)
+    agent_status = "answered" if mode is RunMode.READ_ONLY else "success"
+    return SessionRunResult(
+        run_id=run_id,
+        status=SessionRunStatus.SUCCEEDED,
+        agent_status=agent_status,
+        termination_reason=None,
+        audit_run_id=audit_run_id,
+        safe_summary=make_safe_run_summary(
+            report,
+            status=agent_status,
+            termination_reason=None,
+        ),
+        final_report=report,
+    )
+
+
+@pytest.mark.parametrize("mode", tuple(RunMode))
+def test_run_mode_survives_list_get_start_finish_and_reopen(
+    tmp_path: Path,
+    mode: RunMode,
+) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("message", run_mode=mode)
+    run_id = submission.run.run_id
+
+    assert submission.run.run_mode is mode
+    assert store.list_runs(submission.session.session_id)[0].run_mode is mode
+    assert store.get_run(run_id).run_mode is mode
+    assert store.start_run(run_id).run_mode is mode
+    terminal = store.finish_run(_terminal_result(run_id, mode))
+    assert terminal.run_mode is mode
+
+    reopened = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    reopened.initialize()
+    assert reopened.get_run(run_id).run_mode is mode
+
+
+def test_interrupted_read_only_recovery_preserves_mode(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("inspect", run_mode=RunMode.READ_ONLY)
+
+    recovered = store.recover_incomplete_runs()
+
+    assert len(recovered) == 1
+    assert recovered[0].run_id == submission.run.run_id
+    assert recovered[0].run_mode is RunMode.READ_ONLY
+    assert store.get_run(submission.run.run_id).run_mode is RunMode.READ_ONLY
+
+
+def _version_1_report(
+    audit_run_id: str,
+    *,
+    successful: bool,
+) -> dict[str, object]:
+    report = persisted_failed_report(audit_run_id)
+    report.pop("run_mode")
+    report["schema_version"] = 1
+    if successful:
+        report.update(
+            status="success",
+            exit_code=0,
+            termination_reason=None,
+            validation_index=0,
+            verification_attempts=1,
+        )
+        report["verification"] = {
+            "status": "passed",
+            "source": "user_verify",
+            "exit_code": 0,
+            "timed_out": False,
+            "truncated": False,
+            "duration_ms": 1,
+            "validation_index": 0,
+            "error_code": None,
+        }
+    return report
+
+
+def _database_path(tmp_path: Path) -> Path:
+    return tmp_path / ".coding-agent" / "sessions.sqlite3"
+
+
+def _database_user_version(tmp_path: Path) -> int:
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _session_run_columns(tmp_path: Path) -> tuple[str, ...]:
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        return tuple(
+            row[1]
+            for row in connection.execute("PRAGMA table_info(session_runs)")
+        )
+
+
+def _create_real_version_2_database(
+    tmp_path: Path,
+    *,
+    reports: tuple[dict[str, object], ...],
+) -> None:
+    internal = tmp_path / ".coding-agent"
+    internal.mkdir()
+    database = internal / "sessions.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY CHECK(length(session_id) > 0),
+                title TEXT NOT NULL CHECK(length(title) > 0),
+                status TEXT NOT NULL CHECK(status IN ('idle', 'running', 'cancelling')),
+                created_at_utc TEXT NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                last_run_id TEXT,
+                next_sequence INTEGER NOT NULL CHECK(next_sequence > 0)
+            );
+            CREATE TABLE session_runs (
+                run_id TEXT PRIMARY KEY CHECK(length(run_id) > 0),
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+                status TEXT NOT NULL CHECK(status IN (
+                    'queued', 'running', 'cancelling', 'succeeded', 'failed', 'interrupted'
+                )),
+                user_event_sequence INTEGER NOT NULL CHECK(user_event_sequence > 0),
+                started_at_utc TEXT,
+                finished_at_utc TEXT,
+                agent_status TEXT,
+                termination_reason TEXT,
+                audit_run_id TEXT,
+                final_report_json TEXT,
+                UNIQUE(session_id, ordinal)
+            );
+            """
+        )
+        session_id = "1" * 32
+        connection.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, "historical", "idle", "2026-08-29T08:00:00Z", "2026-08-29T08:00:00Z", None, 1),
+        )
+        for ordinal, report in enumerate(reports, start=1):
+            run_id = f"{ordinal + 1:x}" * 32
+            connection.execute(
+                "INSERT INTO session_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    session_id,
+                    ordinal,
+                    "failed",
+                    ordinal,
+                    "2026-08-29T08:00:00Z",
+                    "2026-08-29T08:00:01Z",
+                    report.get("status", "failed"),
+                    report.get("termination_reason", "model_error"),
+                    report.get("run_id"),
+                    json.dumps(report, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+
+
+def test_fresh_store_schema_v3_persists_each_run_mode(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    modify = store.create_session("modify", run_mode=RunMode.MODIFY)
+    store.recover_incomplete_runs()
+    readonly = store.submit_message(
+        modify.session.session_id,
+        "inspect",
+        run_mode=RunMode.READ_ONLY,
+    )
+
+    assert store.get_run(modify.run.run_id).run_mode is RunMode.MODIFY
+    assert store.get_run(readonly.run.run_id).run_mode is RunMode.READ_ONLY
+    assert _database_user_version(tmp_path) == 3
+
+
+def test_version_2_store_migrates_runs_and_reports_atomically(
+    tmp_path: Path,
+) -> None:
+    _create_real_version_2_database(
+        tmp_path,
+        reports=(
+            _version_1_report("a" * 32, successful=True),
+            _version_1_report("b" * 32, successful=False),
+        ),
+    )
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT run_mode, final_report_json FROM session_runs ORDER BY ordinal"
+        ).fetchall()
+    assert [row["run_mode"] for row in rows] == ["modify", "modify"]
+    reports = [json.loads(row["final_report_json"]) for row in rows]
+    assert all(report["schema_version"] == 2 for report in reports)
+    assert all(report["run_mode"] == "modify" for report in reports)
+    assert _database_user_version(tmp_path) == 3
+
+
+def test_invalid_historical_report_rolls_back_entire_migration(
+    tmp_path: Path,
+) -> None:
+    _create_real_version_2_database(
+        tmp_path,
+        reports=({"schema_version": 1},),
+    )
+    with pytest.raises(SessionStoreError) as captured:
+        SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW).initialize()
+    assert captured.value.code == "storage_unavailable"
+    assert _database_user_version(tmp_path) == 2
+    assert "run_mode" not in _session_run_columns(tmp_path)
+
+
+@pytest.mark.parametrize("value", ["auto", "READ_ONLY", None])
+def test_fresh_schema_v3_rejects_invalid_run_mode_values(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("modify")
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE session_runs SET run_mode = ? WHERE run_id = ?",
+                (value, submission.run.run_id),
+            )
+
+
+def test_schema_newer_than_v3_is_rejected(tmp_path: Path) -> None:
+    internal = tmp_path / ".coding-agent"
+    internal.mkdir()
+    with sqlite3.connect(internal / "sessions.sqlite3") as connection:
+        connection.execute("PRAGMA user_version = 4")
+    with pytest.raises(SessionStoreError) as captured:
+        SQLiteSessionStore(tmp_path).initialize()
+    assert captured.value.code == "schema_unsupported"
+
+
 def test_initialize_creates_versioned_wal_database(tmp_path: Path) -> None:
     store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
     assert store.workspace == tmp_path.resolve(strict=True)
@@ -92,7 +366,7 @@ def test_initialize_creates_versioned_wal_database(tmp_path: Path) -> None:
     database = tmp_path / ".coding-agent" / "sessions.sqlite3"
     assert database.is_file()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         names = {
             row[0]
             for row in connection.execute(
@@ -127,7 +401,7 @@ def test_initialize_migrates_v1_sessions_to_empty_skill_selection(
     assert migrated.get_skill_selection(submission.session.session_id) == ()
     assert migrated.get_run_skill_snapshots(submission.run.run_id) == ()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
 
 
 def test_skill_reads_distinguish_missing_parent_from_empty_children(
@@ -750,12 +1024,12 @@ def test_schema_unsupported_newer_version_is_not_replaced(tmp_path: Path) -> Non
     internal.mkdir()
     database = internal / "sessions.sqlite3"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 3")
+        connection.execute("PRAGMA user_version = 4")
     with pytest.raises(SessionStoreError) as captured:
         SQLiteSessionStore(tmp_path).initialize()
     assert captured.value.code == "schema_unsupported"
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
 
 
 def test_database_corrupt_non_database_bytes_are_not_replaced(

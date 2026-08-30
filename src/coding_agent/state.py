@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from coding_agent.messages import Message, UserMessage
+from coding_agent.run_mode import RunMode
 
 if TYPE_CHECKING:
     from coding_agent.verification import VerificationResult
@@ -18,6 +19,7 @@ class AgentStatus(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    ANSWERED = "answered"
 
 
 class TerminationReason(StrEnum):
@@ -54,6 +56,7 @@ class AgentState:
     messages: tuple[Message, ...]
     workspace: Path
     started_at_monotonic: float
+    run_mode: RunMode = RunMode.MODIFY
     open_issues: tuple[str, ...] = ()
     status: AgentStatus = AgentStatus.RUNNING
     logical_model_call_count: int = 0
@@ -89,7 +92,10 @@ class AgentState:
         started_at_monotonic: float,
         *,
         initial_user_message: str | None = None,
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> AgentState:
+        if not isinstance(run_mode, RunMode):
+            raise TypeError("run_mode must be RunMode")
         if (
             isinstance(started_at_monotonic, bool)
             or not isinstance(started_at_monotonic, (int, float))
@@ -111,4 +117,5 @@ class AgentState:
             messages=(user_message,),
             workspace=Path(workspace),
             started_at_monotonic=float(started_at_monotonic),
+            run_mode=run_mode,
         )

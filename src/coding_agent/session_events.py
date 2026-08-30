@@ -16,7 +16,7 @@ from coding_agent.messages import JSONObject, JSONValue
 from coding_agent.session import utc_now
 
 
-SESSION_UPDATE_SCHEMA_VERSION = 1
+SESSION_UPDATE_SCHEMA_VERSION = 2
 _ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _SAFE_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
@@ -286,9 +286,20 @@ def _validate_payload(kind: SessionUpdateKind, data: JSONObject) -> None:
         _require_optional_code(data["error_code"], "error_code")
         return
     if kind is SessionUpdateKind.RUN_FINISHED:
-        _require_exact(data, {"status"}, kind.value)
-        if data["status"] not in {"succeeded", "failed", "interrupted"}:
+        _require_exact(data, {"status", "agent_status"}, kind.value)
+        status = data["status"]
+        agent_status = data["agent_status"]
+        if status not in {"succeeded", "failed", "interrupted"}:
             raise ValueError("terminal status is invalid")
+        if agent_status not in {"success", "answered", "failed", "interrupted"}:
+            raise ValueError("terminal agent status is invalid")
+        if (status, agent_status) not in {
+            ("succeeded", "success"),
+            ("succeeded", "answered"),
+            ("failed", "failed"),
+            ("interrupted", "interrupted"),
+        }:
+            raise ValueError("terminal status pair is invalid")
         return
     if kind is SessionUpdateKind.CONTROLLER_ERROR:
         _require_exact(data, {"code"}, kind.value)

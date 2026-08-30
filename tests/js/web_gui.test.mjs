@@ -162,10 +162,13 @@ test("mutation API methods send exact paths and JSON bodies once", async () => {
   });
 
   assert.deepEqual(
-    await api.createSession("repair tests", ["workspace:review"]),
+    await api.createSession("repair tests", ["workspace:review"], "read_only"),
     responses[0],
   );
-  assert.deepEqual(await api.submitFollowUp("s1", "continue"), responses[1]);
+  assert.deepEqual(
+    await api.submitFollowUp("s1", "continue", "modify"),
+    responses[1],
+  );
   assert.deepEqual(
     await api.saveSkillSelection("s1", ["workspace:review"]),
     responses[2],
@@ -184,8 +187,8 @@ test("mutation API methods send exact paths and JSON bodies once", async () => {
   assert.deepEqual(
     await Promise.all(calls.map((request) => request.clone().json())),
     [
-      { message: "repair tests", skill_ids: ["workspace:review"] },
-      { message: "continue" },
+      { message: "repair tests", skill_ids: ["workspace:review"], run_mode: "read_only" },
+      { message: "continue", run_mode: "modify" },
       { skill_ids: ["workspace:review"] },
       {},
     ],
@@ -273,6 +276,7 @@ test("initial UI state is safe exact and independent", () => {
     skills: [],
     skillDiagnostics: [],
     selectedSkillIds: [],
+    selectedRunMode: "modify",
     activeRunId: null,
     lastSequence: 0,
     provisionalText: "",
@@ -321,6 +325,9 @@ function controllerFixture() {
     sendButton: ["button", "send-message-button"],
     connectionStatus: ["div", "connection-status"],
     newSessionButton: ["button", "new-session-button"],
+    runModeControl: ["div", "run-mode-control"],
+    runModeModifyButton: ["button", "run-mode-modify"],
+    runModeReadOnlyButton: ["button", "run-mode-read-only"],
   })) {
     elements[name] = document.createElement(tag);
     elements[name].setAttribute("id", id);
@@ -331,6 +338,8 @@ function controllerFixture() {
   elements.skillPanel.hidden = true;
   elements.connectionStatus.dataset.visible = "false";
   elements.connectionStatus.setAttribute("aria-hidden", "true");
+  elements.runModeModifyButton.dataset.runMode = "modify";
+  elements.runModeReadOnlyButton.dataset.runMode = "read_only";
   elements.emptyState = document.createElement("div");
   elements.emptyState.setAttribute("id", "empty-state");
   elements.emptyState.className = "empty-state";
@@ -473,6 +482,49 @@ test("controller creates a session with preselected ordered skills", async () =>
   assert.equal(controller.getState().selectedSessionId, "s1");
   assert.equal(controller.getState().activeRunId, "r1");
   assert.equal(elements.messageInput.value, "");
+  controller.destroy();
+});
+
+
+test("controller captures selected read-only mode and locks it during a run", async () => {
+  const { document, elements } = controllerFixture();
+  const calls = [];
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    createSession: async (message, skillIds, runMode) => {
+      calls.push({ message, skillIds, runMode });
+      return { session_id: "s1", run_id: "r1", run_mode: runMode };
+    },
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Inspect", status: "running", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "running", run_mode: "read_only", started_at_utc: null }],
+      events: [{ run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Inspect" } }],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer: async () => "terminal",
+  });
+  await controller.initialize();
+
+  elements.runModeControl.dispatchEvent({
+    type: "click",
+    target: elements.runModeReadOnlyButton,
+  });
+  assert.equal(controller.getState().selectedRunMode, "read_only");
+  assert.equal(elements.runModeReadOnlyButton.getAttribute("aria-pressed"), "true");
+
+  elements.messageInput.value = "Inspect";
+  elements.messageComposer.dispatchEvent(submitEvent());
+  await controller.whenIdle();
+
+  assert.deepEqual(calls, [{ message: "Inspect", skillIds: [], runMode: "read_only" }]);
+  assert.equal(elements.runModeModifyButton.disabled, true);
+  assert.equal(elements.runModeReadOnlyButton.disabled, true);
   controller.destroy();
 });
 
@@ -895,6 +947,107 @@ test("successful runs render only their last confirmed assistant text", async ()
   assert.equal(elements.conversationLog.textContent.includes("README created and verified"), true);
   assert.equal(findElements(elements.conversationLog, "article").length, 2);
   controller.destroy();
+});
+
+
+test("historical user messages show inline mode badges without activity cards", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "History", status: "idle", last_run_id: "r2" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "History", status: "idle", last_run_id: "r2" },
+      runs: [
+        { run_id: "r1", status: "succeeded", agent_status: "success", run_mode: "modify" },
+        { run_id: "r2", status: "succeeded", agent_status: "answered", run_mode: "read_only" },
+      ],
+      events: [
+        { run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Change it" } },
+        { run_id: "r2", sequence: 2, kind: "user_message", data: { content: "Explain it" } },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+
+  const badges = findElements(elements.conversationLog, "span")
+    .filter((element) => element.classList.contains("run-mode-badge"))
+    .map((element) => element.textContent);
+  const activityCards = findElements(elements.conversationLog, "div")
+    .filter((element) => element.classList.contains("activity-card"));
+
+  assert.deepEqual(badges, ["可修改", "只读"]);
+  assert.equal(activityCards.length, 0);
+  controller.destroy();
+});
+
+
+test("answered terminal renders 已回答 and keeps the final response", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Answer", status: "idle", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Answer", status: "idle", last_run_id: "r1" },
+      runs: [{
+        run_id: "r1",
+        status: "succeeded",
+        agent_status: "answered",
+        run_mode: "read_only",
+      }],
+      events: [
+        { run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Explain it" } },
+        { run_id: "r1", sequence: 2, kind: "assistant_text_committed", data: { content: "Explanation" } },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+
+  assert.equal(elements.runStatus.textContent, "已回答");
+  assert.equal(findElements(elements.conversationLog, "article").length, 2);
+  assert.equal(elements.conversationLog.textContent.includes("Explanation"), true);
+  assert.equal(elements.conversationLog.textContent.includes("验证成功"), false);
+  controller.destroy();
+});
+
+
+test("SSE answered terminal preserves agent status for immediate projection", () => {
+  const state = gui.createInitialUiState();
+  state.activeRunId = "r1";
+  state.selectedSession = {
+    session: { session_id: "s1", status: "running", last_run_id: "r1" },
+    runs: [{ run_id: "r1", status: "running", run_mode: "read_only" }],
+    events: [],
+  };
+
+  gui.reduceSessionUpdate(state, {
+    id: 1,
+    event: "run_finished",
+    data: {
+      run_id: "r1",
+      data: { status: "succeeded", agent_status: "answered" },
+    },
+  });
+
+  assert.equal(state.selectedSession.runs[0].status, "succeeded");
+  assert.equal(state.selectedSession.runs[0].agent_status, "answered");
 });
 
 

@@ -7,7 +7,8 @@ from collections import deque
 import pytest
 
 from coding_agent.session import SessionControllerError
-from coding_agent.session_controller import CancellationResult
+from coding_agent.session_controller import CancellationResult, RunHandle
+from coding_agent.run_mode import RunMode
 from coding_agent.web_auth import WebAccessPolicy
 from tests.web_support import (
     RUN_ID,
@@ -167,10 +168,11 @@ def test_create_session_accepts_exact_body_limit() -> None:
     assert response.json() == {
         "session_id": controller.create_handle.session_id,
         "run_id": controller.create_handle.run_id,
+        "run_mode": "modify",
     }
     assert controller.calls[0][0] == "create_session"
     assert len(controller.calls[0][1]) == 131_058
-    assert controller.calls[0][2] == ()
+    assert controller.calls[0][2:] == ((), RunMode.MODIFY)
 
 
 def test_create_session_rejects_first_byte_over_body_limit() -> None:
@@ -267,9 +269,18 @@ def test_create_session_delegates_message_and_ordered_skill_ids() -> None:
     )
 
     assert response.status_code == 201
-    assert response.json() == {"session_id": SESSION_ID, "run_id": RUN_ID}
+    assert response.json() == {
+        "session_id": SESSION_ID,
+        "run_id": RUN_ID,
+        "run_mode": "modify",
+    }
     assert controller.calls == [
-        ("create_session", "repair tests", ("python-testing",)),
+        (
+            "create_session",
+            "repair tests",
+            ("python-testing",),
+            RunMode.MODIFY,
+        ),
     ]
 
 
@@ -379,6 +390,7 @@ def test_session_detail_uses_allowlisted_projection_and_selected_skills() -> Non
                 "run_id": RUN_ID,
                 "ordinal": 1,
                 "status": "queued",
+                "run_mode": "modify",
                 "started_at_utc": None,
                 "finished_at_utc": None,
                 "agent_status": None,
@@ -439,8 +451,100 @@ def test_session_follow_up_delegates_and_returns_accepted_handle() -> None:
     )
 
     assert response.status_code == 202
-    assert response.json() == {"session_id": SESSION_ID, "run_id": SECOND_RUN_ID}
-    assert controller.calls == [("submit_message", SESSION_ID, "continue")]
+    assert response.json() == {
+        "session_id": SESSION_ID,
+        "run_id": SECOND_RUN_ID,
+        "run_mode": "modify",
+    }
+    assert controller.calls == [
+        ("submit_message", SESSION_ID, "continue", RunMode.MODIFY)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_status", "call_name"),
+    [
+        ("/api/v1/sessions", 201, "create_session"),
+        (f"/api/v1/sessions/{SESSION_ID}/messages", 202, "submit_message"),
+    ],
+)
+def test_run_mode_defaults_to_modify(
+    path: str,
+    expected_status: int,
+    call_name: str,
+) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            path,
+            json={"message": "hello"},
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["run_mode"] == "modify"
+    assert controller.calls[0][0] == call_name
+    assert controller.calls[0][-1] is RunMode.MODIFY
+
+
+@pytest.mark.parametrize("mode", tuple(RunMode))
+@pytest.mark.parametrize(
+    ("path", "expected_status"),
+    [
+        ("/api/v1/sessions", 201),
+        (f"/api/v1/sessions/{SESSION_ID}/messages", 202),
+    ],
+)
+def test_create_and_follow_up_accept_exact_run_modes(
+    mode: RunMode,
+    path: str,
+    expected_status: int,
+) -> None:
+    controller = RecordingController(
+        create_handle=RunHandle(SESSION_ID, RUN_ID, mode),
+        follow_up_handle=RunHandle(SESSION_ID, SECOND_RUN_ID, mode),
+    )
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            path,
+            json={"message": "hello", "run_mode": mode.value},
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["run_mode"] == mode.value
+    assert controller.calls[0][-1] is mode
+
+
+@pytest.mark.parametrize("value", ["auto", "READ_ONLY", "", 1, True, None, []])
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/sessions", f"/api/v1/sessions/{SESSION_ID}/messages"],
+)
+def test_rest_rejects_invalid_run_mode_without_controller_call(
+    value: object,
+    path: str,
+) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            path,
+            json={"message": "hello", "run_mode": value},
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "invalid_request"}}
+    assert controller.calls == []
 
 
 def test_skill_catalog_projects_only_public_metadata_in_order() -> None:

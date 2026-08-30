@@ -6,13 +6,14 @@ from pathlib import Path
 
 from coding_agent.cli import build_parser
 from coding_agent.report import FinalReport
+from coding_agent.run_mode import RunMode
 from coding_agent.tools.filesystem import (
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
     WriteFileTool,
 )
-from coding_agent.tools.shell import RunCommandTool
+from coding_agent.tools.shell import InspectGitTool, RunCommandTool
 from coding_agent.tools.java import RunJavaTestsTool
 
 
@@ -132,7 +133,7 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         "## 最小运行示例",
         "## 推荐的安全运行示例",
         "## Agent 运行流程",
-        "## 六个本地工具",
+        "## 按运行模式划分的本地工具",
         "## 成功、验证与退出码",
         "## JSONL 日志与 FinalReport",
         "## 离线演示与完整测试",
@@ -157,9 +158,16 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         assert name in help_text
         assert f"`{name}`" in text
 
-    tools_section = _section(text, "## 六个本地工具")
-    documented_tools = re.findall(r"^\| `([^`]+)` \|", tools_section, flags=re.MULTILINE)
-    actual_tools = [
+    tools_section = _section(text, "## 按运行模式划分的本地工具")
+    modify_section = tools_section.split("### 只读问答（`read_only`）", 1)[0]
+    read_only_section = tools_section.split("### 只读问答（`read_only`）", 1)[1]
+    documented_modify_tools = re.findall(
+        r"^\| `([^`]+)` \|", modify_section, flags=re.MULTILINE
+    )
+    documented_read_only_tools = re.findall(
+        r"^\| `([^`]+)` \|", read_only_section, flags=re.MULTILINE
+    )
+    actual_modify_tools = [
         ListDirectoryTool.name,
         ReadFileTool.name,
         ReplaceTextTool.name,
@@ -167,7 +175,13 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         RunCommandTool.name,
         RunJavaTestsTool.name,
     ]
-    assert documented_tools == actual_tools
+    actual_read_only_tools = [
+        ListDirectoryTool.name,
+        ReadFileTool.name,
+        InspectGitTool.name,
+    ]
+    assert documented_modify_tools == actual_modify_tools
+    assert documented_read_only_tools == actual_read_only_tools
 
     assert FinalReport.__name__ in text
     for required in (
@@ -214,6 +228,45 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
         "`run_command` 仍不能执行 Java 命令字符串",
     ):
         assert required in text
+
+
+def test_usage_documents_exact_run_modes_tools_and_terminal_meanings() -> None:
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+    help_text = build_parser().format_help()
+    assert "--read-only" in help_text
+    assert "`--read-only`" in usage
+    assert f"`{RunMode.MODIFY.value}`" in usage
+    assert f"`{RunMode.READ_ONLY.value}`" in usage
+    assert "`ANSWERED`" in usage
+    assert "已回答" in usage
+    assert "`SUCCESS`" in usage
+    assert "新鲜验证" in usage
+
+    modify_tools = (
+        ListDirectoryTool.name,
+        ReadFileTool.name,
+        ReplaceTextTool.name,
+        WriteFileTool.name,
+        RunCommandTool.name,
+        RunJavaTestsTool.name,
+    )
+    read_only_tools = (
+        ListDirectoryTool.name,
+        ReadFileTool.name,
+        InspectGitTool.name,
+    )
+    for tool in (*modify_tools, *read_only_tools):
+        assert f"`{tool}`" in usage
+    assert "只读模式不会运行 `--verify`" in usage
+    assert "同一会话的每条消息可以重新选择模式" in usage
+
+
+def test_readme_submission_stays_within_limit_and_names_read_only_mode() -> None:
+    text = _read_utf8(ROOT / "README.txt")
+    metrics = _readme_metrics(ROOT / "README.txt")
+    assert metrics.unicode_chars <= README_HARD_TOTAL
+    for value in ("--read-only", "只读问答", "允许修改", "ANSWERED"):
+        assert value in text
 
 
 def test_model_instructions_and_streaming_are_documented_accurately() -> None:

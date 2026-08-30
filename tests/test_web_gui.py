@@ -30,10 +30,26 @@ REQUIRED_IDS = {
     "message-composer",
     "message-input",
     "send-message-button",
+    "run-mode-control",
     "connection-status",
     "coding-agent-bootstrap",
     "workspace-name",
 }
+
+
+def test_gui_contains_compact_accessible_run_mode_control() -> None:
+    html = gui_source("index.html")
+    css = gui_source("styles.css")
+
+    assert 'id="run-mode-control"' in html
+    assert 'data-run-mode="modify"' in html
+    assert 'data-run-mode="read_only"' in html
+    assert "允许修改" in html
+    assert "只读问答" in html
+    assert "run-mode-badge" in css
+    assert "http://" not in html
+    assert "https://" not in html
+    assert "innerHTML" not in gui_source("app.js")
 
 
 class GuiMarkupParser(HTMLParser):

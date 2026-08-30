@@ -30,6 +30,7 @@ from coding_agent.session import (
     uuid4_hex,
 )
 from coding_agent.logging import scrub_text
+from coding_agent.run_mode import RunMode
 from coding_agent.skills import (
     RunSkillSnapshotMetadata,
     SkillDescriptor,
@@ -37,7 +38,7 @@ from coding_agent.skills import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _INTERNAL_DIRECTORY = ".coding-agent"
 _DATABASE_NAME = "sessions.sqlite3"
 _LOCK_NAME = "sessions.lock"
@@ -54,6 +55,7 @@ class SessionStore(Protocol):
         message: str,
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> SessionSubmission: ...
     def get_session(self, session_id: str) -> SessionRecord: ...
     def get_run(self, run_id: str) -> SessionRunRecord: ...
@@ -75,6 +77,7 @@ class SessionStore(Protocol):
         message: str,
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> SessionSubmission: ...
     def start_run(self, run_id: str) -> SessionRunRecord: ...
     def append_event(self, event: NewSessionEvent) -> SessionEvent: ...
@@ -227,6 +230,8 @@ CREATE TABLE IF NOT EXISTS session_runs (
     status TEXT NOT NULL CHECK(
         status IN ('queued', 'running', 'cancelling', 'succeeded', 'failed', 'interrupted')
     ),
+    run_mode TEXT NOT NULL DEFAULT 'modify'
+        CHECK(run_mode IN ('modify', 'read_only')),
     user_event_sequence INTEGER NOT NULL CHECK(user_event_sequence > 0),
     started_at_utc TEXT,
     finished_at_utc TEXT,
@@ -274,6 +279,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_active_workspace_run
 ON session_runs ((1))
 WHERE status IN ('queued', 'running', 'cancelling');
 """
+
+_VERSION_1_REPORT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "run_id",
+        "status",
+        "exit_code",
+        "termination_reason",
+        "changed_paths",
+        "mutation_index",
+        "validation_index",
+        "verification",
+        "logical_model_calls",
+        "provider_attempts",
+        "tool_calls",
+        "verification_attempts",
+        "context_compressions",
+        "token_usage",
+        "elapsed_ms",
+        "log_failure_code",
+        "log_path",
+    }
+)
 
 
 class SQLiteSessionStore:
@@ -333,15 +361,77 @@ class SQLiteSessionStore:
             if version > SCHEMA_VERSION:
                 raise SessionStoreError("schema_unsupported")
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(_SCHEMA)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            connection.commit()
+            if version == 0:
+                connection.executescript(_SCHEMA)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                connection.commit()
+            elif version == SCHEMA_VERSION:
+                connection.executescript(_SCHEMA)
+                connection.commit()
+            else:
+                if version == 1:
+                    connection.executescript(_SCHEMA)
+                    connection.commit()
+                self._migrate_to_version_3(connection)
         except SessionStoreError:
             raise
         except sqlite3.Error as exc:
             raise _sqlite_store_error(exc) from None
         finally:
             connection.close()
+
+    @classmethod
+    def _migrate_v1_report_to_v2(cls, value: object) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != _VERSION_1_REPORT_FIELDS:
+            raise SessionStoreError("storage_unavailable")
+        if value.get("schema_version") != 1 or isinstance(
+            value.get("schema_version"), bool
+        ):
+            raise SessionStoreError("storage_unavailable")
+        migrated = dict(value)
+        migrated["schema_version"] = 2
+        migrated["run_mode"] = RunMode.MODIFY.value
+        try:
+            projected = make_persisted_run_report(migrated)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise SessionStoreError("storage_unavailable") from None
+        if projected != migrated:
+            raise SessionStoreError("storage_unavailable")
+        return dict(projected)
+
+    @classmethod
+    def _migrate_to_version_3(cls, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(session_runs)")
+            }
+            if "run_mode" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_runs ADD COLUMN "
+                    "run_mode TEXT NOT NULL DEFAULT 'modify' "
+                    "CHECK(run_mode IN ('modify', 'read_only'))"
+                )
+            rows = connection.execute(
+                "SELECT run_id, final_report_json FROM session_runs "
+                "WHERE final_report_json IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                report = cls._decode_json_object(row["final_report_json"])
+                migrated = cls._migrate_v1_report_to_v2(report)
+                connection.execute(
+                    "UPDATE session_runs SET final_report_json = ? WHERE run_id = ?",
+                    (cls._canonical_json(migrated), row["run_id"]),
+                )
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.commit()
+        except SessionStoreError:
+            connection.rollback()
+            raise
+        except (KeyError, TypeError, ValueError, sqlite3.Error):
+            connection.rollback()
+            raise SessionStoreError("storage_unavailable") from None
 
     def _timestamp(self) -> str:
         value = self._utc_clock()
@@ -411,6 +501,7 @@ class SQLiteSessionStore:
                 session_id=row["session_id"],
                 ordinal=row["ordinal"],
                 status=SessionRunStatus(row["status"]),
+                run_mode=RunMode(row["run_mode"]),
                 user_event_sequence=row["user_event_sequence"],
                 started_at_utc=row["started_at_utc"],
                 finished_at_utc=row["finished_at_utc"],
@@ -583,9 +674,12 @@ class SQLiteSessionStore:
         message: str,
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> SessionSubmission:
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
+        if type(run_mode) is not RunMode:
+            raise SessionStoreError("invalid_session_state")
         selected_skills = self._validate_selected_skills(selected_skills)
         safe_message = scrub_text(message, self._sensitive_values)
         try:
@@ -607,6 +701,7 @@ class SQLiteSessionStore:
                 session_id=session_id,
                 ordinal=1,
                 status=SessionRunStatus.QUEUED,
+                run_mode=run_mode,
                 user_event_sequence=1,
                 started_at_utc=None,
                 finished_at_utc=None,
@@ -652,12 +747,17 @@ class SQLiteSessionStore:
                 ),
             )
             connection.execute(
-                "INSERT INTO session_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_runs "
+                "(run_id, session_id, ordinal, status, run_mode, "
+                "user_event_sequence, started_at_utc, finished_at_utc, "
+                "agent_status, termination_reason, audit_run_id, final_report_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.run_id,
                     run.session_id,
                     run.ordinal,
                     run.status.value,
+                    run.run_mode.value,
                     run.user_event_sequence,
                     run.started_at_utc,
                     run.finished_at_utc,
@@ -893,9 +993,12 @@ class SQLiteSessionStore:
         message: str,
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> SessionSubmission:
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
+        if type(run_mode) is not RunMode:
+            raise SessionStoreError("invalid_session_state")
         selected_skills = self._validate_selected_skills(selected_skills)
         safe_message = scrub_text(message, self._sensitive_values)
         try:
@@ -928,6 +1031,7 @@ class SQLiteSessionStore:
                 session_id=session_id,
                 ordinal=ordinal,
                 status=SessionRunStatus.QUEUED,
+                run_mode=run_mode,
                 user_event_sequence=user_sequence,
                 started_at_utc=None,
                 finished_at_utc=None,
@@ -953,12 +1057,17 @@ class SQLiteSessionStore:
                 data={"status": SessionRunStatus.QUEUED.value},
             )
             connection.execute(
-                "INSERT INTO session_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_runs "
+                "(run_id, session_id, ordinal, status, run_mode, "
+                "user_event_sequence, started_at_utc, finished_at_utc, "
+                "agent_status, termination_reason, audit_run_id, final_report_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.run_id,
                     run.session_id,
                     run.ordinal,
                     run.status.value,
+                    run.run_mode.value,
                     run.user_event_sequence,
                     None,
                     None,
@@ -1223,11 +1332,16 @@ class SQLiteSessionStore:
                 self._select_session(connection, current.session_id)
             )
             timestamp = self._timestamp()
-            expected_status = {
-                SessionRunStatus.SUCCEEDED: "success",
-                SessionRunStatus.FAILED: "failed",
-                SessionRunStatus.INTERRUPTED: "interrupted",
-            }[result.status]
+            expected_status = (
+                "answered"
+                if result.status is SessionRunStatus.SUCCEEDED
+                and current.run_mode is RunMode.READ_ONLY
+                else {
+                    SessionRunStatus.SUCCEEDED: "success",
+                    SessionRunStatus.FAILED: "failed",
+                    SessionRunStatus.INTERRUPTED: "interrupted",
+                }[result.status]
+            )
             if result.agent_status not in {None, expected_status}:
                 raise SessionStoreError("invalid_session_state")
             expected_summary_fields = {
@@ -1267,6 +1381,7 @@ class SQLiteSessionStore:
                 if (
                     result.audit_run_id is None
                     or projected["run_id"] != result.audit_run_id
+                    or projected["run_mode"] != current.run_mode.value
                     or projected["status"] != expected_status
                     or projected["termination_reason"] != result.termination_reason
                 ):
@@ -1387,6 +1502,7 @@ class SQLiteSessionStore:
                         session_id=current.session_id,
                         ordinal=current.ordinal,
                         status=SessionRunStatus.INTERRUPTED,
+                        run_mode=current.run_mode,
                         user_event_sequence=current.user_event_sequence,
                         started_at_utc=current.started_at_utc,
                         finished_at_utc=timestamp,

@@ -22,6 +22,7 @@ from coding_agent.safety import (
 from coding_agent.tools.base import ExecutionContext, ToolArgumentError, ToolExecution
 
 _ARGUMENT_NAMES = {"command", "purpose"}
+_INSPECTION_ARGUMENT_NAMES = {"command"}
 _PURPOSES = {"inspect", "test", "verification"}
 _OUTPUT_LIMIT_BYTES = 64 * 1024
 _READ_CHUNK_BYTES = 8 * 1024
@@ -39,6 +40,20 @@ def _validated_arguments(arguments: object) -> tuple[str, str]:
     if not isinstance(purpose, str) or purpose not in _PURPOSES:
         raise ToolArgumentError("purpose must be inspect, test, or verification")
     return command.strip(), purpose
+
+
+def _validated_inspection_arguments(arguments: object) -> str:
+    if (
+        not isinstance(arguments, dict)
+        or set(arguments) != _INSPECTION_ARGUMENT_NAMES
+    ):
+        raise ToolArgumentError(
+            "inspect_git arguments must contain exactly: command"
+        )
+    command = arguments["command"]
+    if not isinstance(command, str) or not command.strip():
+        raise ToolArgumentError("command must be a non-empty string")
+    return command.strip()
 
 
 _REMOVED_ENVIRONMENT_KEYS = {
@@ -349,6 +364,55 @@ class RunCommandTool:
         authorized = policy.authorize(
             command,
             purpose=purpose,
+            source=CommandSource.MODEL,
+        )
+        return self._authorized_executor.execute(
+            authorized,
+            ExecutionContext(
+                workspace=policy.workspace,
+                command_timeout_seconds=context.command_timeout_seconds,
+            ),
+        )
+
+
+class InspectGitTool:
+    name = "inspect_git"
+    schema: JSONObject = {
+        "name": "inspect_git",
+        "description": "Inspect local Git state without modifying it.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string", "minLength": 1}},
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    }
+
+    def __init__(
+        self,
+        *,
+        authorized_executor: AuthorizedCommandExecutor | None = None,
+        policy_factory: PolicyFactory | None = None,
+    ) -> None:
+        self._authorized_executor = (
+            AuthorizedCommandExecutor()
+            if authorized_executor is None
+            else authorized_executor
+        )
+        self._policy_factory = (
+            CommandPolicy if policy_factory is None else policy_factory
+        )
+
+    def execute(
+        self,
+        arguments: JSONObject,
+        context: ExecutionContext,
+    ) -> ToolExecution:
+        command = _validated_inspection_arguments(arguments)
+        policy = self._policy_factory(context.workspace)
+        authorized = policy.authorize_git_inspection(
+            command,
             source=CommandSource.MODEL,
         )
         return self._authorized_executor.execute(

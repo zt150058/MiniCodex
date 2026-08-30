@@ -36,6 +36,7 @@ from coding_agent.model import (
     TransientModelError,
 )
 from coding_agent.openai_client import OpenAIResponsesClient
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import (
     AuthorizedCommand,
     CommandSource,
@@ -73,6 +74,7 @@ def _runner(
     initial_user_message: str | None = None,
     confirmed_text_handler: Callable[[str], None] | None = None,
     cancellation_requested: Callable[[], bool] | None = None,
+    run_mode: RunMode = RunMode.MODIFY,
 ) -> tuple[AgentRunner, FakeModelClient]:
     client = FakeModelClient(responses)
     runner = AgentRunner(
@@ -92,8 +94,82 @@ def _runner(
         initial_user_message=initial_user_message,
         confirmed_text_handler=confirmed_text_handler,
         cancellation_requested=cancellation_requested,
+        run_mode=run_mode,
     )
     return runner, client
+
+
+def test_agent_state_start_preserves_run_mode(tmp_path: Path) -> None:
+    default_state = agent_module.AgentState.start("inspect", tmp_path, 0.0)
+    read_only_state = agent_module.AgentState.start(
+        "inspect",
+        tmp_path,
+        0.0,
+        run_mode=RunMode.READ_ONLY,
+    )
+
+    assert default_state.run_mode is RunMode.MODIFY
+    assert read_only_state.run_mode is RunMode.READ_ONLY
+
+
+def test_read_only_text_response_becomes_answered(tmp_path: Path) -> None:
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="Project summary"),),
+        run_mode=RunMode.READ_ONLY,
+    )
+
+    state = runner.run("Inspect this workspace")
+
+    assert state.run_mode is RunMode.READ_ONLY
+    assert state.status is AgentStatus.ANSWERED
+    assert state.completion_text == "Project summary"
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN
+    assert state.verification_attempt_count == 0
+    assert state.last_verification is None
+
+
+def test_explicit_modify_text_without_gate_remains_completion_candidate(
+    tmp_path: Path,
+) -> None:
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(text="Done"),),
+        run_mode=RunMode.MODIFY,
+    )
+
+    assert runner.run("change it").status is AgentStatus.COMPLETION_CANDIDATE
+
+
+def test_runner_rejects_read_only_verification_gate(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="read-only mode"):
+        AgentRunner(
+            model_client=FakeModelClient((ModelResponse(text="unused"),)),
+            tool_registry=ToolRegistry(()),
+            execution_context=ExecutionContext(tmp_path),
+            verification_gate=object(),  # type: ignore[arg-type]
+            run_mode=RunMode.READ_ONLY,
+        )
+
+
+def test_state_and_runner_reject_non_enum_run_mode(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="run_mode"):
+        agent_module.AgentState.start(
+            "inspect",
+            tmp_path,
+            0.0,
+            run_mode="read_only",  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(TypeError, match="run_mode"):
+        AgentRunner(
+            model_client=FakeModelClient((ModelResponse(text="unused"),)),
+            tool_registry=ToolRegistry(()),
+            execution_context=ExecutionContext(tmp_path),
+            run_mode="read_only",  # type: ignore[arg-type]
+        )
 
 
 def test_rendered_initial_message_does_not_replace_current_task(tmp_path: Path) -> None:
@@ -701,6 +777,55 @@ def _record_call(index: int) -> ToolCall:
         name="record",
         arguments={"value": "same"},
     )
+
+
+def test_read_only_text_with_tool_call_is_not_terminal(tmp_path: Path) -> None:
+    tool = RecordingTool(ToolExecution(output="inspected"))
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                text="I will inspect first.",
+                tool_calls=(_record_call(1),),
+            ),
+            ModelResponse(text="Final explanation"),
+        ),
+        tools=(tool,),
+        run_mode=RunMode.READ_ONLY,
+    )
+
+    state = runner.run("Explain")
+
+    assert state.status is AgentStatus.ANSWERED
+    assert state.completion_text == "Final explanation"
+    assert len(client.requests) == 2
+    assert tool.executions == [{"value": "same"}]
+
+
+def test_read_only_mutation_fact_fails_internal_invariant(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingTool(
+        ToolExecution(
+            output="changed",
+            metadata=ToolResultMetadata(changed_paths=("changed.txt",)),
+        )
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(_record_call(1),)),
+            ModelResponse(text="Claimed answer"),
+        ),
+        tools=(tool,),
+        run_mode=RunMode.READ_ONLY,
+    )
+
+    state = runner.run("Inspect")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.INTERNAL_INVARIANT
+    assert state.completion_text is None
 
 
 def _compression_limits() -> ContextLimits:

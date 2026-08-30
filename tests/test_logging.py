@@ -25,6 +25,7 @@ from coding_agent.model import (
     ModelCallPurpose,
     invoke_model,
 )
+from coding_agent.run_mode import RunMode
 from coding_agent.tools.base import ExecutionContext
 from coding_agent.tools.filesystem import (
     ListDirectoryTool,
@@ -51,6 +52,44 @@ class FakeMonotonicClock:
         return next(self._values)
 
 
+def test_run_started_schema_v2_requires_run_mode(tmp_path: Path) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="a" * 32)
+    event = logger.emit(
+        EventType.RUN_STARTED,
+        {
+            "task_chars": 7,
+            "mutation_index": 0,
+            "run_mode": RunMode.READ_ONLY.value,
+        },
+    )
+    logger.close()
+
+    assert event.schema_version == 2
+    assert event.data["run_mode"] == "read_only"
+
+
+def test_run_completed_schema_v2_accepts_answered(tmp_path: Path) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="b" * 32)
+    event = logger.emit(
+        EventType.RUN_COMPLETED,
+        {
+            "status": "answered",
+            "termination_reason": None,
+            "logical_model_calls": 1,
+            "provider_attempts": 1,
+            "tool_calls": 0,
+            "verification_attempts": 0,
+            "mutation_index": 0,
+            "validation_index": None,
+            "elapsed_ms": 1,
+        },
+    )
+    logger.close()
+
+    assert event.schema_version == 2
+    assert event.data["status"] == "answered"
+
+
 def test_event_observer_runs_only_after_line_is_flushed(tmp_path: Path) -> None:
     observed: list[tuple[RunEvent, str]] = []
     logger = RunEventLogger.create(tmp_path, run_id="1" * 32)
@@ -62,7 +101,7 @@ def test_event_observer_runs_only_after_line_is_flushed(tmp_path: Path) -> None:
     logger.set_event_observer(observer)
     event = logger.emit(
         EventType.RUN_STARTED,
-        {"task_chars": 4, "mutation_index": 0},
+        {"task_chars": 4, "mutation_index": 0, "run_mode": "modify"},
     )
     assert observed[0][0] == event
     assert json.loads(observed[0][1].splitlines()[-1])["sequence"] == event.sequence
@@ -83,7 +122,7 @@ def test_ordinary_event_observer_failure_does_not_poison_audit_log(
     logger.set_event_observer(observer)
     first = logger.emit(
         EventType.RUN_STARTED,
-        {"task_chars": 4, "mutation_index": 0},
+        {"task_chars": 4, "mutation_index": 0, "run_mode": "modify"},
     )
     second = logger.emit(
         EventType.RUN_COMPLETED,
@@ -114,7 +153,7 @@ def test_event_observer_system_exit_is_not_swallowed(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as captured:
         logger.emit(
             EventType.RUN_STARTED,
-            {"task_chars": 4, "mutation_index": 0},
+            {"task_chars": 4, "mutation_index": 0, "run_mode": "modify"},
         )
     assert captured.value.code == 7
     logger.close()
@@ -136,7 +175,7 @@ def test_jsonl_has_deterministic_envelope_sequence_utf8_and_newline(
 
     first = logger.emit(
         EventType.RUN_STARTED,
-        {"task_chars": 2, "mutation_index": 0},
+        {"task_chars": 2, "mutation_index": 0, "run_mode": "modify"},
     )
     second = logger.emit(
         EventType.TOOL_CALL_STARTED,
@@ -420,12 +459,12 @@ def test_serialization_failure_poisons_logger_without_consuming_sequence(
     with pytest.raises(RunLogError) as first:
         logger.emit(
             EventType.RUN_STARTED,
-            {"task_chars": 1, "mutation_index": 0},
+            {"task_chars": 1, "mutation_index": 0, "run_mode": "modify"},
         )
     with pytest.raises(RunLogError) as second:
         logger.emit(
             EventType.RUN_STARTED,
-            {"task_chars": 1, "mutation_index": 0},
+            {"task_chars": 1, "mutation_index": 0, "run_mode": "modify"},
         )
 
     assert first.value.code == "event_serialization_failed"

@@ -1,6 +1,6 @@
 # MiniCodex 使用说明
 
-MiniCodex 是本地 Coding Agent，提供一次性 CLI 和同源 Web GUI。它在用户指定的工作区内读取和修改 UTF-8 文本、执行受控命令，并由本地验证门决定任务是否成功。模型层默认使用 OpenAI Responses，也可显式选择 compatible Chat Completions。项目入口见[仓库首页](../README.md)，模型接入细节见 [API 说明](OPENAI_API.md)。
+MiniCodex 是本地 Coding Agent，提供一次性 CLI 和同源 Web GUI。每个 run 都显式选择 `modify`（允许修改）或 `read_only`（只读问答）；模式不会从提示词推断。修改模式可在用户指定的工作区内读取和修改 UTF-8 文本、执行受控命令，并由本地验证门决定任务是否成功；只读模式只检查项目并返回答案。模型层默认使用 OpenAI Responses，也可显式选择 compatible Chat Completions。项目入口见[仓库首页](../README.md)，模型接入细节见 [API 说明](OPENAI_API.md)。
 
 ## 功能与适用场景
 
@@ -49,12 +49,13 @@ $env:OPENAI_MODEL = '<model-id>'
 | `task` | 是 | 交给本地 Agent 的一次性编程任务。 |
 | `--workspace` | 是 | 目标工作区目录；启动时规范化并执行安全检查。 |
 | `--verify` | 否 | 用户指定的强制最终验证命令；启动前使用同一命令策略授权。 |
+| `--read-only` | 否 | 选择 `read_only` 只读问答；默认不提供时使用 `modify`。 |
 | `--model` | 否 | 模型 ID；覆盖 `OPENAI_MODEL`。 |
 | `--api-mode` | 否 | 只接受 `responses` 或 `chat-completions`；默认 `responses`。 |
 | `--base-url` | 仅 Chat | compatible Chat Completions 的绝对 HTTPS API 前缀。 |
 | `-h` / `--help` | 否 | 显示帮助并退出。 |
 
-`responses + --base-url` 是非法配置，不会静默忽略；`chat-completions` 必须提供 `--base-url`。当前解析器没有交互模式、fake 模式或恢复会话参数。
+`responses + --base-url` 是非法配置，不会静默忽略；`chat-completions` 必须提供 `--base-url`。`--read-only` 与任何 `--verify` 组合会在启动前被拒绝，因为只读模式不会运行 `--verify`。当前解析器没有交互模式、fake 模式或恢复会话参数。
 
 ## 最小运行示例
 
@@ -62,6 +63,8 @@ $env:OPENAI_MODEL = '<model-id>'
 coding-agent "修复失败测试" --workspace . --api-mode responses --model '<openai-model-id>' --verify "pytest -q"
 
 coding-agent "修复失败测试" --workspace . --api-mode chat-completions --base-url '<https-provider-base-url-with-api-prefix>' --model '<compatible-model-id>' --verify "pytest -q"
+
+coding-agent "读取项目并介绍其用途" --workspace . --read-only --api-mode responses --model '<openai-model-id>'
 ```
 
 `responses` 可省略 `--api-mode`。未提供 `--verify` 时，模型必须通过 `run_command` 产生可信验证证据，或通过 `run_java_tests` 产生新鲜且内部一致的 Java verification 证据。目录查看、echo 和 `git status` 不能成为成功证据。
@@ -90,7 +93,9 @@ coding-agent-web --workspace . --api-mode chat-completions --base-url '<https-pr
 
 服务只绑定 IPv4 `127.0.0.1`，默认使用系统分配的随机端口，监听成功后才打开浏览器。传 `--no-open-browser` 可只输出本地 URL。页面、REST 和 fetch-SSE 使用同一进程级 Bearer token，并执行严格 Host 与 Origin 检查；token 不进入 URL、持久存储或日志。它不是远程服务，不应通过端口转发、代理或网络共享暴露。
 
-左侧可新建和切换持久会话；空闲会话可提交 follow-up，并为下一次运行选择有序的声明式 Skill。Skill 选择器只显示可用 Skill 的名称、描述和来源；发现诊断不在 GUI 中展示，指令正文也不会显示，GUI 不执行 Skill。全局一次只运行一个 Agent；运行或取消期间，历史仍可浏览，但发送和 Skill 修改会禁用。取消按钮只请求既有协作式取消，关闭浏览器不会取消正在运行的 Agent，重新打开页面会从持久快照和 SSE 游标恢复。页面通过服务器终态显示成功或失败，不根据浏览器断开伪造结果。
+左侧可新建和切换持久会话；空闲会话可提交 follow-up，并为下一次运行选择有序的声明式 Skill。发送前的紧凑选择器提供“允许修改”和“只读问答”，选择值只对当前提交生效并在运行期间锁定；同一会话的每条消息可以重新选择模式。页面刷新后选择器恢复默认的允许修改，不使用浏览器持久存储猜测权限。历史消息旁的模式标记来自持久化 run 记录。
+
+Skill 选择器只显示可用 Skill 的名称、描述和来源；发现诊断不在 GUI 中展示，指令正文也不会显示，GUI 不执行 Skill，Skill 也不能扩展所选模式的工具权限。全局一次只运行一个 Agent；运行或取消期间，历史仍可浏览，但发送和 Skill 修改会禁用。取消按钮只请求既有协作式取消，关闭浏览器不会取消正在运行的 Agent，重新打开页面会从持久快照和 SSE 游标恢复。页面通过服务器终态显示成功、已回答或失败，不根据浏览器断开伪造结果。
 
 本地 GUI 不提供账户，不支持 MCP，不支持并行运行，也不允许远程使用。浏览器启动失败只产生固定警告，服务仍继续运行。
 
@@ -106,17 +111,19 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 
 ## Agent 运行流程
 
-1. CLI 在联网前校验任务、工作区、API mode、base URL、模式专用凭据、模型和可选验证命令。
-2. composition root 只构造所选模型适配器，以及共享工作区、命令执行器、工具注册表、上下文管理器、终止策略、验证门和事件日志器。
+1. CLI 在联网前校验任务、工作区、运行模式、API mode、base URL、模式专用凭据、模型和可选验证命令。
+2. composition root 根据显式运行模式构造精确工具注册表；修改模式还构造共享命令执行器和验证门，两种模式共享所选模型适配器、上下文管理器、终止策略和事件日志器。
 3. 启动时只读取一次根 `AGENTS.md`，与内置基础规则组合成不可变运行指令；Agent 根据该指令和本地历史请求模型。超过字符或历史项阈值时生成结构化摘要，失败则使用确定性 fallback，摘要不会继承运行指令。
 4. 工具调用按响应顺序进行本地校验、授权、执行和观察，结果通过 `call_id` 配对写回历史。
 5. 文件修改增加 mutation index，并使旧验证状态失效。
-6. 完成候选只有在本地验证门接受新鲜证据后才能成为 SUCCESS。
+6. `modify` 的完成候选只有在本地验证门接受新鲜证据后才能成为 `SUCCESS`；`read_only` 的非空最终回答在零修改、零验证的不变量成立时成为 `ANSWERED`。
 7. 预算耗尽、重复无进展、安全拒绝或不可恢复错误产生稳定失败原因。
 
 两个模型适配器内部都支持 provider-neutral 文本流事件，以及首个 delta 前的结构化同步回退。**CLI 仍使用同步最终报告**，不会逐 token 显示内容；Web GUI 通过经过认证的 fetch-SSE 投影安全事件。部分输出仅驻留内存；中断后不会写入消息历史、JSONL 或 FinalReport。
 
-## 六个本地工具
+## 按运行模式划分的本地工具
+
+### 允许修改（`modify`）
 
 | 工具 | 能力与主要限制 |
 | --- | --- |
@@ -127,6 +134,16 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 | `run_command` | 参数数组、`shell=False`、固定 cwd、超时与双流 64 KiB 上限。 |
 | `run_java_tests` | 使用可信本机 JDK 编译源码并运行成对 `.in`/`.out` 黑盒用例。 |
 
+### 只读问答（`read_only`）
+
+| 工具 | 能力与主要限制 |
+| --- | --- |
+| `list_directory` | 稳定排序列举；递归深度 1–3，最多 500 项。 |
+| `read_file` | 带真实行号读取 UTF-8 文本；单次最多 256 KiB。 |
+| `inspect_git` | 只检查本地 Git；仅允许 `status`、`diff`、`log`、`show` 和 `ls-files`。 |
+
+只读注册表不包含 `replace_text`、`write_file`、`run_command` 或 `run_java_tests`，也不会构造验证执行路径。`inspect_git` 不能访问远程、运行工作区代码或执行任何 Git 写操作；命令仍通过原生 Windows 参数解析、可信启动器、固定 cwd、`shell=False`、超时和有界输出执行。
+
 `run_java_tests` 的 strict schema 是 `source_root`、`main_class`、`tests_directory` 和 `purpose`；`purpose` 只能是 `test` 或 `verification`。源码与 fixture 根目录都必须是工作区相对路径。最多发现 500 个 `.java` 文件和 200 对用例；单个 `.in` 原始输入最多 262,144 字节，单个 `.out` 期望输出最多 65,536 字节。用例按大小写折叠后的 POSIX 相对路径稳定排序，实际输出与期望输出只归一化 CRLF/CR/LF，除此之外精确比较。
 
 `purpose="test"` 只提供局部测试结果，不能形成最终成功证据。只有新鲜的 Java verification 结果，即 `purpose="verification"` 且全部用例通过、`validation_index == mutation_index`，才可满足没有用户 `--verify` 的验证门。编译和全部用例共享最多 60 秒的截止时间；输出、超时、首个失败 case 和安全错误使用有界结构化结果。
@@ -135,13 +152,16 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 
 ## 成功、验证与退出码
 
-SUCCESS 不由模型文字决定。最新验证必须在最后一次文件修改后运行、退出码为 0，并满足 `validation_index == mutation_index`。
+`SUCCESS` 不由模型文字决定。修改模式的新鲜验证必须在最后一次文件修改后运行、退出码为 0，并满足 `validation_index == mutation_index`。
+
+只读模式的非空最终文本在没有修改和验证事实时成为 `ANSWERED`，GUI 显示“已回答”，退出码同样为 `0`；它只表示问答正常结束，不表示测试通过或代码已验证。预算、安全拒绝、审计失败、模型错误和用户中断仍可终止只读运行。
 
 用户提供 `--verify` 时，即使已有新鲜 Java 证据，也必须执行用户命令并以其结果为最终门槛；未提供时才允许可信 `run_command` 或完整通过的 Java verification 证据。
 
 | 退出码 | FinalReport 状态 | 含义 |
 | --- | --- | --- |
 | `0` | `success` | 完成候选具有新鲜、通过的本地验证证据。 |
+| `0` | `answered` | 只读问答正常结束；没有修改，也没有验证成功声明。 |
 | `1` | `failed` | 预算、重复、安全、模型、工具、验证或审计失败。 |
 | `2` | 无 FinalReport | CLI 参数或启动配置错误。 |
 | `130` | `interrupted` | 用户中断，日志会尽力关闭并生成中断报告。 |
@@ -150,7 +170,7 @@ SUCCESS 不由模型文字决定。最新验证必须在最后一次文件修改
 
 每次已启动运行的事件写入 `.coding-agent/logs/<run_id>.jsonl`。事件按连续 sequence 记录模型调用元数据、工具调用/结果、安全拒绝、压缩、验证和终止事实；不记录完整任务文本、工具原始内容、环境全集、API key、认证头、continuation 或隐藏推理。`OPENAI_API_KEY` 和 `CHAT_COMPLETIONS_API_KEY` 都会从 `run_command` 子进程环境中移除。
 
-进程在 stdout 输出一个有界 JSON FinalReport，其中包含状态、退出码、终止原因、修改路径、验证证据、计数、日志相对路径和审计失败代码。报告与 JSONL 使用同一执行状态。
+进程在 stdout 输出一个有界 JSON FinalReport，其中包含运行模式、状态、退出码、终止原因、修改路径、验证证据、计数、日志相对路径和审计失败代码。报告与 JSONL 使用同一执行状态；审计 schema 严格区分 `ANSWERED` 与 `SUCCESS`。
 
 ## 离线演示与完整测试
 
@@ -193,6 +213,7 @@ GUI 的确定性视觉 fixture 不读取凭据或调用模型：
 - `model is not configured`：设置 `OPENAI_MODEL` 或传 `--model`。
 - `workspace rejected`：确认目录存在，且路径没有非法设备名、受保护组件或 reparse point。
 - `--verify rejected`：命令不在安全白名单、包含控制符，或不是可信验证命令。
+- `--read-only cannot be combined with --verify`：二者权限语义冲突；移除验证命令，或改用默认修改模式。
 - `trusted Java runtime is unavailable`：确认 Windows PATH 中存在工作区外的 `javac.exe` 与 `java.exe`。
 - 退出 `1`：读取 FinalReport 的 termination reason、验证证据和 `.coding-agent/logs/<run_id>.jsonl` 中的脱敏事件。
 - 测试超时：命令执行器会终止 Windows 子进程树并保留受限的 stdout/stderr；检查 `timed_out` 和 `cleanup_error`。
@@ -205,7 +226,7 @@ GUI 的确定性视觉 fixture 不读取凭据或调用模型：
 
 ## 安全边界和已知限制
 
-路径和命令限制由确定性本地代码执行，包含工作区约束、受保护目录、Windows reparse point 检查、有限命令集、固定 cwd、`shell=False`、超时和输出上限。
+路径和命令限制由确定性本地代码执行，包含工作区约束、受保护目录、Windows reparse point 检查、有限命令集、固定 cwd、`shell=False`、超时和输出上限。`read_only` 是 Agent 的确定性能力边界，不是操作系统级沙箱；它不会注册修改或通用命令工具，但被允许读取的内容仍会发送给所选模型。
 
 `--base-url` 可配置不代表兼容所有服务。compatible endpoint 必须支持标准 Chat Completions assistant `tool_calls`、非空函数 call ID、strict function schema，以及用 `tool_call_id` 配对的 `role=tool` 结果；本项目不会根据 URL 猜测、探测或自动切换 API mode。
 

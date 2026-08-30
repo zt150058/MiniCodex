@@ -22,6 +22,7 @@ from coding_agent.model import (
     ModelError,
     invoke_model,
 )
+from coding_agent.run_mode import RunMode
 from coding_agent.state import (
     AgentState,
     AgentStatus,
@@ -87,6 +88,7 @@ class AgentRunner:
         initial_user_message: str | None = None,
         confirmed_text_handler: ConfirmedTextHandler | None = None,
         cancellation_requested: CancellationCheck | None = None,
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> None:
         if not callable(clock):
             raise TypeError("clock must be callable")
@@ -106,6 +108,10 @@ class AgentRunner:
             cancellation_requested
         ):
             raise TypeError("cancellation_requested must be callable or null")
+        if not isinstance(run_mode, RunMode):
+            raise TypeError("run_mode must be RunMode")
+        if run_mode is RunMode.READ_ONLY and verification_gate is not None:
+            raise ValueError("read-only mode cannot use a verification gate")
         self._model_client = model_client
         self._tool_registry = tool_registry
         self._execution_context = execution_context
@@ -121,6 +127,7 @@ class AgentRunner:
         self._initial_user_message = initial_user_message
         self._confirmed_text_handler = confirmed_text_handler
         self._cancellation_requested = cancellation_requested
+        self._run_mode = run_mode
 
     def _emit(self, event_type: EventType, data: dict[str, object]) -> None:
         if self._event_sink is not None:
@@ -275,6 +282,7 @@ class AgentRunner:
             self._execution_context.workspace,
             self._clock(),
             initial_user_message=self._initial_user_message,
+            run_mode=self._run_mode,
         )
         limits = self._termination_policy.limits
         budget = ModelCallBudget(
@@ -285,7 +293,11 @@ class AgentRunner:
         try:
             self._emit(
                 EventType.RUN_STARTED,
-                {"task_chars": len(task), "mutation_index": state.mutation_index},
+                {
+                    "task_chars": len(task),
+                    "mutation_index": state.mutation_index,
+                    "run_mode": state.run_mode.value,
+                },
             )
             result = self._run_loop(state, budget)
             self._emit_run_completed(result)
@@ -593,6 +605,22 @@ class AgentRunner:
                         "verification_status": state.verification_status.value,
                     },
                 )
+                if state.run_mode is RunMode.READ_ONLY:
+                    if (
+                        state.mutation_index != 0
+                        or state.modified_paths
+                        or state.verification_status
+                        is not VerificationStatus.NOT_RUN
+                        or state.verification_attempt_count != 0
+                        or state.last_verification is not None
+                    ):
+                        state.completion_text = None
+                        return self._terminate(
+                            state,
+                            TerminationReason.INTERNAL_INVARIANT,
+                        )
+                    state.status = AgentStatus.ANSWERED
+                    return state
                 gate = self._verification_gate
                 if gate is None:
                     return state

@@ -100,6 +100,10 @@
           <div class="composer-box">
             <textarea id="message-input" rows="3" maxlength="12000" placeholder="描述你想检查、修复或实现的内容…"></textarea>
             <div class="composer-actions">
+              <div id="run-mode-control" class="run-mode-control" role="group" aria-label="运行权限模式">
+                <button id="run-mode-modify" class="run-mode-option" type="button" data-run-mode="modify" aria-label="允许 Agent 修改工作区" aria-pressed="true">允许修改</button>
+                <button id="run-mode-read-only" class="run-mode-option" type="button" data-run-mode="read_only" aria-label="只读问答，不修改工作区" aria-pressed="false">只读问答</button>
+              </div>
               <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
               <button id="send-message-button" class="send-button" type="submit" aria-label="发送消息">
                 发送

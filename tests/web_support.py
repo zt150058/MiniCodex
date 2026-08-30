@@ -31,6 +31,7 @@ from coding_agent.session_events import (
     SessionUpdateBatch,
     SessionUpdateKind,
 )
+from coding_agent.run_mode import RunMode
 from coding_agent.skills import (
     SkillCatalogDiagnostic,
     SkillCatalogView,
@@ -69,6 +70,7 @@ def make_run_record(
     run_id: str = RUN_ID,
     session_id: str = SESSION_ID,
     status: SessionRunStatus = SessionRunStatus.QUEUED,
+    run_mode: RunMode = RunMode.MODIFY,
 ) -> SessionRunRecord:
     terminal = status in {
         SessionRunStatus.SUCCEEDED,
@@ -81,6 +83,7 @@ def make_run_record(
         session_id=session_id,
         ordinal=1 if run_id == RUN_ID else 2,
         status=status,
+        run_mode=run_mode,
         user_event_sequence=1,
         started_at_utc=TIMESTAMP if active or terminal else None,
         finished_at_utc=TIMESTAMP if terminal else None,
@@ -172,10 +175,10 @@ class RecordingController:
     )
     selected_skill_ids: tuple[str, ...] = ()
     create_handle: RunHandle = field(
-        default_factory=lambda: RunHandle(SESSION_ID, RUN_ID)
+        default_factory=lambda: RunHandle(SESSION_ID, RUN_ID, RunMode.MODIFY)
     )
     follow_up_handle: RunHandle = field(
-        default_factory=lambda: RunHandle(SESSION_ID, SECOND_RUN_ID)
+        default_factory=lambda: RunHandle(SESSION_ID, SECOND_RUN_ID, RunMode.MODIFY)
     )
     cancellation_result: CancellationResult = CancellationResult.REQUESTED
     update_batches: deque[SessionUpdateBatch] = field(default_factory=deque)
@@ -197,9 +200,13 @@ class RecordingController:
         return self.sessions
 
     def create_session(
-        self, message: str, *, skill_ids: tuple[str, ...] = ()
+        self,
+        message: str,
+        *,
+        skill_ids: tuple[str, ...] = (),
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> RunHandle:
-        self._record("create_session", message, skill_ids)
+        self._record("create_session", message, skill_ids, run_mode)
         return self.create_handle
 
     def get_session(self, session_id: str) -> SessionView:
@@ -208,8 +215,14 @@ class RecordingController:
             raise SessionControllerError("session_not_found")
         return self.session_view
 
-    def submit_message(self, session_id: str, message: str) -> RunHandle:
-        self._record("submit_message", session_id, message)
+    def submit_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        run_mode: RunMode = RunMode.MODIFY,
+    ) -> RunHandle:
+        self._record("submit_message", session_id, message, run_mode)
         return self.follow_up_handle
 
     def list_skills(self) -> SkillCatalogView:

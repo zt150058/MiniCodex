@@ -22,9 +22,16 @@ from coding_agent.logging import (
     RunLogError,
     RunMetadata,
 )
-from coding_agent.messages import ModelRequest, ModelResponse, ToolResultMetadata
+from coding_agent.messages import (
+    ModelRequest,
+    ModelResponse,
+    ToolCall,
+    ToolResultMetadata,
+)
 from coding_agent.model import FakeModelClient, ModelClient
+from coding_agent.run_mode import RunMode
 from coding_agent.safety import AuthorizedCommand
+from coding_agent.state import AgentStatus
 from coding_agent.tools.base import ExecutionContext, ToolExecution
 
 
@@ -136,6 +143,17 @@ def _chat_config(workspace: Path) -> RunConfig:
     )
 
 
+def _read_only_config(workspace: Path) -> RunConfig:
+    return load_run_config(
+        task="inspect demo",
+        workspace=workspace,
+        model="fake-model",
+        verify_command=None,
+        run_mode=RunMode.READ_ONLY,
+        environ={"OPENAI_API_KEY": FAKE_KEY},
+    )
+
+
 def _successful_factories() -> ApplicationFactories:
     executor = RecordingExecutor()
 
@@ -177,6 +195,115 @@ def _factories_with_model_client(
         logger=logger_factory,
         command_executor=lambda: executor,  # type: ignore[arg-type]
         clock=lambda: 0.0,
+    )
+
+
+def test_modify_run_composes_exact_existing_six_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeModelClient((ModelResponse(text="done"),))
+    gate_calls = 0
+    from coding_agent import app as app_module
+
+    original_gate = app_module.VerificationGate
+
+    def recording_gate(*args: object, **kwargs: object) -> object:
+        nonlocal gate_calls
+        gate_calls += 1
+        return original_gate(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "VerificationGate", recording_gate)
+    result = execute_agent_run(
+        _config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="a" * 32,
+        ),
+    )
+
+    assert result.report.status is AgentStatus.SUCCESS
+    assert tuple(schema["name"] for schema in client.requests[0].tool_schemas) == (
+        "list_directory",
+        "read_file",
+        "replace_text",
+        "write_file",
+        "run_command",
+        "run_java_tests",
+    )
+    assert gate_calls == 1
+
+
+def test_read_only_run_composes_only_inspection_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeModelClient((ModelResponse(text="inspection complete"),))
+
+    def forbidden_gate(*args: object, **kwargs: object) -> object:
+        raise AssertionError("read-only run must not construct a verification gate")
+
+    monkeypatch.setattr("coding_agent.app.VerificationGate", forbidden_gate)
+    result = execute_agent_run(
+        _read_only_config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="b" * 32,
+        ),
+    )
+
+    assert result.report.status is AgentStatus.ANSWERED
+    assert tuple(schema["name"] for schema in client.requests[0].tool_schemas) == (
+        "list_directory",
+        "read_file",
+        "inspect_git",
+    )
+
+
+def test_read_only_unknown_write_is_paired_and_never_executed(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "must-not-exist.txt"
+    client = FakeModelClient(
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        call_id="write-1",
+                        name="write_file",
+                        arguments={
+                            "path": target.name,
+                            "content": "forbidden",
+                        },
+                    ),
+                )
+            ),
+            ModelResponse(text="write was unavailable"),
+        )
+    )
+
+    result = execute_agent_run(
+        _read_only_config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="c" * 32,
+        ),
+    )
+
+    assert result.report.status is AgentStatus.ANSWERED
+    assert target.exists() is False
+    tool_results = [
+        message
+        for message in client.requests[1].messages
+        if getattr(message, "call_id", None) == "write-1"
+    ]
+    assert len(tool_results) == 1
+    assert tool_results[0].status == "rejected"
+    assert tool_results[0].error == (
+        "unknown_tool: no tool registered as 'write_file'"
     )
 
 
@@ -428,6 +555,7 @@ def test_composition_builds_private_run_instructions_once(
         workspace: Path,
         *,
         skill_instructions: str | None = None,
+        run_mode: RunMode = RunMode.MODIFY,
     ) -> object:
         nonlocal calls
         calls += 1
@@ -435,6 +563,7 @@ def test_composition_builds_private_run_instructions_once(
             builder,
             workspace,
             skill_instructions=skill_instructions,
+            run_mode=run_mode,
         )
 
     monkeypatch.setattr(RunInstructionBuilder, "build", counting_build)

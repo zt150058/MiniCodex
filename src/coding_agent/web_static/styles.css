@@ -465,6 +465,12 @@ select:disabled {
   color: #3e614a;
 }
 
+.status-pill--answered {
+  border-color: #b9c9d8;
+  background: #edf4f9;
+  color: #3f6079;
+}
+
 .status-pill--failure {
   background: #efddda;
   color: var(--color-failure);
@@ -650,6 +656,49 @@ select:disabled {
   border-top: 1px solid #eee4d7;
 }
 
+.run-mode-control {
+  display: inline-flex;
+  flex: 0 0 auto;
+  padding: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+  background: #f5eee5;
+}
+
+.run-mode-option {
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--color-ink-muted);
+  font-size: 10px;
+  box-shadow: none;
+}
+
+.run-mode-option[aria-pressed="true"] {
+  background: var(--color-surface);
+  color: var(--color-accent);
+  box-shadow: 0 1px 4px rgba(88, 67, 51, 0.12);
+}
+
+.run-mode-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.run-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 7px;
+  padding: 2px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  color: var(--color-ink-muted);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
 .composer-hint {
   color: var(--color-ink-muted);
   font-size: 10px;
@@ -745,6 +794,10 @@ select:disabled {
 
   .composer-hint {
     display: none;
+  }
+
+  .run-mode-option {
+    padding-inline: 7px;
   }
 }
 

@@ -44,7 +44,7 @@ def test_sse_terminal_replay_uses_exact_ordered_frames() -> None:
     finished = make_update(
         2,
         SessionUpdateKind.RUN_FINISHED,
-        {"status": "succeeded"},
+        {"status": "succeeded", "agent_status": "success"},
     )
     controller = RecordingController(
         update_batches=deque(
@@ -73,11 +73,41 @@ def test_sse_terminal_replay_uses_exact_ordered_frames() -> None:
     assert controller.calls == [("read_updates", RUN_ID, 0)]
 
 
+def test_sse_answered_terminal_preserves_exact_v2_status_pair() -> None:
+    finished = make_update(
+        1,
+        SessionUpdateKind.RUN_FINISHED,
+        {"status": "succeeded", "agent_status": "answered"},
+    )
+    controller = RecordingController(
+        update_batches=deque(
+            [SessionUpdateBatch((finished,), 1, False)]
+        )
+    )
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "GET",
+            f"/api/v1/runs/{RUN_ID}/events",
+            headers={**auth_headers(), "Accept": "text/event-stream"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.text == (
+        f"id: 1\nevent: run_finished\ndata: {finished.to_json()}\n\n"
+    )
+    assert finished.to_dict()["data"] == {
+        "status": "succeeded",
+        "agent_status": "answered",
+    }
+
+
 def test_sse_last_event_id_replays_only_newer_terminal_event() -> None:
     finished = make_update(
         2,
         SessionUpdateKind.RUN_FINISHED,
-        {"status": "succeeded"},
+        {"status": "succeeded", "agent_status": "success"},
     )
     controller = RecordingController(
         update_batches=deque([SessionUpdateBatch((finished,), 2, False)])
@@ -187,7 +217,7 @@ def test_sse_empty_wait_emits_heartbeat_before_terminal_event() -> None:
     finished = make_update(
         1,
         SessionUpdateKind.RUN_FINISHED,
-        {"status": "failed"},
+        {"status": "failed", "agent_status": "failed"},
     )
     controller = RecordingController(
         update_batches=deque(
@@ -430,7 +460,7 @@ class BlockingSseController(RecordingController):
                 run_id,
                 2,
                 SessionUpdateKind.RUN_FINISHED,
-                {"status": "failed"},
+                {"status": "failed", "agent_status": "failed"},
             )
             return SessionUpdateBatch((finished,), 2, False)
         started = self._update(
@@ -461,7 +491,7 @@ class BlockingSseController(RecordingController):
             run_id,
             2,
             SessionUpdateKind.RUN_FINISHED,
-            {"status": "failed"},
+            {"status": "failed", "agent_status": "failed"},
         )
         return SessionUpdateBatch((finished,), 2, False)
 

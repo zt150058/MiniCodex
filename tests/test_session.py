@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from coding_agent.run_mode import RunMode
 from coding_agent.session import SessionError, make_session_title, utc_now, uuid4_hex
 from coding_agent.session import (
     NewSessionEvent,
@@ -82,6 +83,7 @@ def test_domain_records_are_immutable_and_payload_repr_is_hidden() -> None:
         session_id=SESSION_ID,
         ordinal=1,
         status=SessionRunStatus.QUEUED,
+        run_mode=RunMode.MODIFY,
         user_event_sequence=1,
         started_at_utc=None,
         finished_at_utc=None,
@@ -207,8 +209,9 @@ def test_safe_run_summary_contains_only_accepted_terminal_facts() -> None:
 
 def _valid_persisted_report_input() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": RUN_ID,
+        "run_mode": "modify",
         "status": "success",
         "exit_code": 0,
         "completion": {
@@ -265,6 +268,7 @@ def test_persisted_run_report_excludes_conversation_and_command_evidence() -> No
     assert set(persisted) == {
         "schema_version",
         "run_id",
+        "run_mode",
         "status",
         "exit_code",
         "termination_reason",
@@ -306,6 +310,103 @@ def test_persisted_run_report_excludes_conversation_and_command_evidence() -> No
         "stderr",
     ):
         assert forbidden not in raw
+
+
+def _make_run_record(*, run_mode: object) -> SessionRunRecord:
+    return SessionRunRecord(
+        run_id=RUN_ID,
+        session_id=SESSION_ID,
+        ordinal=1,
+        status=SessionRunStatus.QUEUED,
+        run_mode=run_mode,  # type: ignore[arg-type]
+        user_event_sequence=1,
+        started_at_utc=None,
+        finished_at_utc=None,
+        agent_status=None,
+        termination_reason=None,
+        audit_run_id=None,
+        final_report=None,
+    )
+
+
+def _answered_report_input() -> dict[str, object]:
+    report = _valid_persisted_report_input()
+    report.update(
+        run_mode="read_only",
+        status="answered",
+        changed_paths=[],
+        mutation_index=0,
+        validation_index=None,
+        verification_attempts=0,
+    )
+    report["verification"] = {
+        "status": "not_run",
+        "source": None,
+        "command": None,
+        "exit_code": None,
+        "timed_out": False,
+        "truncated": False,
+        "duration_ms": None,
+        "validation_index": None,
+        "stdout": None,
+        "stderr": None,
+        "error_code": None,
+    }
+    return report
+
+
+def test_session_run_record_requires_provider_neutral_run_mode() -> None:
+    record = _make_run_record(run_mode=RunMode.READ_ONLY)
+    assert record.run_mode is RunMode.READ_ONLY
+    with pytest.raises(TypeError, match="run_mode"):
+        _make_run_record(run_mode="read_only")
+
+
+def test_persisted_answered_report_projects_run_mode() -> None:
+    persisted = make_persisted_run_report(_answered_report_input())
+    assert persisted["schema_version"] == 2
+    assert persisted["run_mode"] == "read_only"
+    assert persisted["status"] == "answered"
+    assert persisted["exit_code"] == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "mode", "exit_code"),
+    [
+        ("answered", "modify", 0),
+        ("answered", "read_only", 1),
+        ("success", "read_only", 0),
+    ],
+)
+def test_persisted_report_rejects_mode_status_mismatch(
+    status: str,
+    mode: str,
+    exit_code: int,
+) -> None:
+    report = _answered_report_input()
+    report.update(status=status, run_mode=mode, exit_code=exit_code)
+    with pytest.raises(ValueError):
+        make_persisted_run_report(report)  # type: ignore[arg-type]
+
+
+def test_answered_safe_summary_is_bounded_and_excludes_private_report_data() -> None:
+    report = _answered_report_input()
+    report["completion"] = {"text": "private answer body"}
+    report["continuation"] = {"encrypted": "private continuation"}
+    report["instructions"] = "private instructions"
+
+    summary = make_safe_run_summary(
+        report,  # type: ignore[arg-type]
+        status="answered",
+        termination_reason=None,
+    )
+
+    assert summary["status"] == "answered"
+    assert summary["verification_status"] == "not_run"
+    rendered = json.dumps(summary, ensure_ascii=False)
+    assert "private answer body" not in rendered
+    assert "private continuation" not in rendered
+    assert "private instructions" not in rendered
 
 
 @pytest.mark.parametrize(

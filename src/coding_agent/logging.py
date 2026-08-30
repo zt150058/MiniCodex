@@ -22,7 +22,7 @@ from coding_agent.model import (
 )
 
 
-EVENT_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 2
 _RUN_ID = re.compile(r"[0-9a-f]{32}")
 
 
@@ -141,7 +141,9 @@ def _is_reparse(path: Path) -> bool:
 
 
 _EVENT_KEYS: dict[EventType, frozenset[str]] = {
-    EventType.RUN_STARTED: frozenset({"task_chars", "mutation_index"}),
+    EventType.RUN_STARTED: frozenset(
+        {"task_chars", "mutation_index", "run_mode"}
+    ),
     EventType.TOOL_CALL_STARTED: frozenset(
         {"ordinal", "tool_name", "call_id_hash", "mutation_index"}
     ),
@@ -225,10 +227,11 @@ _NONNEGATIVE_INT_FIELDS = {
 }
 _ENUM_FIELDS = {
     "purpose": {"main", "summary"},
-    "status": {"ok", "error", "rejected", "not_run", "stale", "running", "completion_candidate", "passed", "failed", "timed_out", "success", "interrupted"},
+    "status": {"ok", "error", "rejected", "not_run", "stale", "running", "completion_candidate", "passed", "failed", "timed_out", "success", "answered", "interrupted"},
     "source": {"model", "user_verify"},
     "summary_source": {"none", "model", "fallback"},
     "verification_status": {"not_run", "stale", "running", "passed", "failed", "timed_out", "error"},
+    "run_mode": {"modify", "read_only"},
 }
 _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9._-]+"),
@@ -391,7 +394,7 @@ def _validate_data(
     } and status not in {"passed", "failed", "timed_out", "error"}:
         raise RunLogError("invalid_event_data")
     if event_type is EventType.RUN_COMPLETED and status not in {
-        "completion_candidate", "success", "failed", "interrupted"
+        "completion_candidate", "success", "answered", "failed", "interrupted"
     }:
         raise RunLogError("invalid_event_data")
     if event_type in {

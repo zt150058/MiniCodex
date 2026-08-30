@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from coding_agent.messages import ToolCall
+from coding_agent.messages import ToolCall, ToolResultMetadata
 from coding_agent.safety import (
     AuthorizedCommand,
     CommandPolicy,
@@ -21,6 +21,7 @@ from coding_agent.tools.base import ExecutionContext, ToolArgumentError, ToolExe
 from coding_agent.tools.registry import ToolRegistry
 from coding_agent.tools.shell import (
     AuthorizedCommandExecutor,
+    InspectGitTool,
     RunCommandTool,
     parse_windows_command_line,
 )
@@ -168,6 +169,151 @@ def test_run_command_registers_without_registry_changes(tmp_path: Path) -> None:
         "invalid_arguments: run_command arguments must contain exactly: "
         "command, purpose"
     )
+
+
+def test_inspect_git_has_exact_strict_schema() -> None:
+    assert InspectGitTool.schema == {
+        "name": "inspect_git",
+        "description": "Inspect local Git state without modifying it.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string", "minLength": 1}},
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def test_inspect_git_authorizes_fixed_purpose_and_uses_executor(
+    tmp_path: Path,
+) -> None:
+    argv = ("C:\\trusted\\git.exe", "status", "--short")
+    authorized = AuthorizedCommand(
+        argv=argv,
+        normalized_command="git status --short",
+        purpose="inspect",
+        source=CommandSource.MODEL,
+    )
+
+    class RecordingInspectionPolicy:
+        workspace = tmp_path.resolve()
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, CommandSource]] = []
+
+        def authorize_git_inspection(
+            self,
+            command: object,
+            *,
+            source: CommandSource,
+        ) -> AuthorizedCommand:
+            self.calls.append((command, source))
+            return authorized
+
+    class RecordingAuthorizedExecutor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[AuthorizedCommand, ExecutionContext]] = []
+
+        def execute(
+            self,
+            command: AuthorizedCommand,
+            context: ExecutionContext,
+        ) -> ToolExecution:
+            self.calls.append((command, context))
+            return ToolExecution(output="delegated")
+
+    policy = RecordingInspectionPolicy()
+    executor = RecordingAuthorizedExecutor()
+    result = InspectGitTool(
+        authorized_executor=executor,  # type: ignore[arg-type]
+        policy_factory=lambda workspace: policy,  # type: ignore[arg-type]
+    ).execute(
+        {"command": "git status --short"},
+        ExecutionContext(tmp_path, command_timeout_seconds=17),
+    )
+
+    assert result.output == "delegated"
+    assert policy.calls == [("git status --short", CommandSource.MODEL)]
+    assert executor.calls == [
+        (
+            authorized,
+            ExecutionContext(tmp_path.resolve(), command_timeout_seconds=17),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{}, {"command": ""}, {"command": 1}, {"command": "git status", "x": 1}],
+)
+def test_inspect_git_rejects_invalid_arguments_before_policy(
+    arguments: object,
+    tmp_path: Path,
+) -> None:
+    calls: list[object] = []
+
+    class RecordingInspectionPolicy:
+        workspace = tmp_path.resolve()
+
+        def authorize_git_inspection(
+            self,
+            command: object,
+            *,
+            source: CommandSource,
+        ) -> AuthorizedCommand:
+            calls.append((command, source))
+            raise AssertionError("policy must not be called")
+
+    with pytest.raises(ToolArgumentError):
+        InspectGitTool(
+            policy_factory=lambda workspace: RecordingInspectionPolicy(),  # type: ignore[arg-type]
+        ).execute(
+            arguments,  # type: ignore[arg-type]
+            ExecutionContext(tmp_path),
+        )
+    assert calls == []
+
+
+def test_inspect_git_preserves_nonzero_exit_as_successful_execution(
+    tmp_path: Path,
+) -> None:
+    authorized = AuthorizedCommand(
+        argv=("C:\\trusted\\git.exe", "show", "missing"),
+        normalized_command="git show missing",
+        purpose="inspect",
+        source=CommandSource.MODEL,
+    )
+
+    class RecordingInspectionPolicy:
+        workspace = tmp_path.resolve()
+
+        def authorize_git_inspection(
+            self,
+            command: object,
+            *,
+            source: CommandSource,
+        ) -> AuthorizedCommand:
+            return authorized
+
+    class NonzeroExecutor:
+        def execute(
+            self,
+            command: AuthorizedCommand,
+            context: ExecutionContext,
+        ) -> ToolExecution:
+            return ToolExecution(
+                output=json.dumps({"stdout": "", "stderr": "missing revision"}),
+                metadata=ToolResultMetadata(exit_code=1),
+            )
+
+    result = InspectGitTool(
+        authorized_executor=NonzeroExecutor(),  # type: ignore[arg-type]
+        policy_factory=lambda workspace: RecordingInspectionPolicy(),  # type: ignore[arg-type]
+    ).execute({"command": "git show missing"}, ExecutionContext(tmp_path))
+
+    assert result.metadata.exit_code == 1
+    assert json.loads(result.output or "")["stderr"] == "missing revision"
 
 
 @pytest.mark.parametrize(

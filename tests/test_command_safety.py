@@ -522,6 +522,63 @@ def _git_locator(trusted: Path) -> Callable[[str], str | None]:
 
 
 @pytest.mark.parametrize(
+    "command",
+    [
+        "git status --short",
+        "git diff -- README.md",
+        "git log -n 3",
+        "git show HEAD -- README.md",
+        "git ls-files -- README.md",
+    ],
+)
+def test_authorize_git_inspection_accepts_existing_read_only_grammar(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    trusted = tmp_path.parent / f"{tmp_path.name}-git-inspection"
+    trusted.mkdir()
+    (tmp_path / "README.md").write_text("# Test\n", encoding="utf-8")
+    policy = CommandPolicy(tmp_path, executable_locator=_git_locator(trusted))
+
+    authorized = policy.authorize_git_inspection(
+        command,
+        source=CommandSource.MODEL,
+    )
+
+    assert authorized.purpose == "inspect"
+    assert authorized.source is CommandSource.MODEL
+    assert Path(authorized.argv[0]).name.casefold() in {"git", "git.exe"}
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m pytest",
+        "pytest -q",
+        "java Main",
+        "powershell -Command Get-ChildItem",
+        "cmd /c dir",
+        "bash -c ls",
+        "git add .",
+        "git commit -m x",
+        "git push",
+        "git status && whoami",
+        'git status "',
+    ],
+)
+def test_authorize_git_inspection_rejects_non_inspection_commands(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    trusted = tmp_path.parent / f"{tmp_path.name}-git-inspection-rejected"
+    trusted.mkdir()
+    policy = CommandPolicy(tmp_path, executable_locator=_git_locator(trusted))
+
+    with pytest.raises((SafetyViolation, ToolArgumentError)):
+        policy.authorize_git_inspection(command, source=CommandSource.MODEL)
+
+
+@pytest.mark.parametrize(
     "arguments",
     [
         ["status", "--short"],

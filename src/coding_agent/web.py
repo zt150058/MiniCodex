@@ -25,6 +25,7 @@ from .session import (
 )
 from .session_controller import SessionController, SessionView
 from .session_events import SessionUpdateBatch, SessionUpdateKind
+from .run_mode import RunMode
 from .skills import SkillCatalogDiagnostic, SkillCatalogView, SkillDescriptor
 from .web_auth import WebAccessPolicy, WebAuthorizationError
 
@@ -134,6 +135,14 @@ class _CreateSessionRequest(BaseModel):
 
     message: StrictStr
     skill_ids: tuple[StrictStr, ...] = ()
+    run_mode: RunMode = RunMode.MODIFY
+
+    @field_validator("run_mode", mode="before")
+    @classmethod
+    def accept_exact_run_mode(cls, value: object) -> object:
+        if type(value) is str and value in {mode.value for mode in RunMode}:
+            return RunMode(value)
+        return value
 
     @field_validator("skill_ids", mode="before")
     @classmethod
@@ -147,6 +156,14 @@ class _FollowUpRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     message: StrictStr
+    run_mode: RunMode = RunMode.MODIFY
+
+    @field_validator("run_mode", mode="before")
+    @classmethod
+    def accept_exact_run_mode(cls, value: object) -> object:
+        if type(value) is str and value in {mode.value for mode in RunMode}:
+            return RunMode(value)
+        return value
 
 
 class _SkillSelectionRequest(BaseModel):
@@ -226,6 +243,7 @@ def _serialize_run(record: SessionRunRecord) -> dict[str, object]:
         "run_id": record.run_id,
         "ordinal": record.ordinal,
         "status": record.status.value,
+        "run_mode": record.run_mode.value,
         "started_at_utc": record.started_at_utc,
         "finished_at_utc": record.finished_at_utc,
         "agent_status": record.agent_status,
@@ -519,8 +537,13 @@ def create_web_app(
         handle = controller.create_session(
             payload.message,
             skill_ids=payload.skill_ids,
+            run_mode=payload.run_mode,
         )
-        return {"session_id": handle.session_id, "run_id": handle.run_id}
+        return {
+            "session_id": handle.session_id,
+            "run_id": handle.run_id,
+            "run_mode": handle.run_mode.value,
+        }
 
     @app.get("/api/v1/sessions")
     def list_sessions(
@@ -544,8 +567,16 @@ def create_web_app(
         session_id: str,
         payload: _FollowUpRequest,
     ) -> dict[str, str]:
-        handle = controller.submit_message(session_id, payload.message)
-        return {"session_id": handle.session_id, "run_id": handle.run_id}
+        handle = controller.submit_message(
+            session_id,
+            payload.message,
+            run_mode=payload.run_mode,
+        )
+        return {
+            "session_id": handle.session_id,
+            "run_id": handle.run_id,
+            "run_mode": handle.run_mode.value,
+        }
 
     @app.get("/api/v1/skills")
     def list_skills() -> dict[str, object]:

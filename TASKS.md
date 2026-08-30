@@ -974,6 +974,46 @@
 
 **当前状态**
 
+`已完成`
+
+## 25. 显式修改与只读问答运行模式
+
+**任务目标**
+
+增加逐 run 显式 `modify`/`read_only` 能力边界，使工作区读取与项目介绍可以在不修改、不验证时以 `ANSWERED` 正常结束，同时保持修改任务只能凭最后一次修改后的新鲜验证进入 `SUCCESS`。
+
+**涉及模块**
+
+- `run_mode.py`、配置、指令、Agent 状态机、审计和最终报告
+- 命令安全策略、`inspect_git` 与按模式构建的 `ToolRegistry`
+- Session、SQLite 迁移、Controller、REST、SSE、CLI 和本地 GUI
+- 离线单元、集成、Windows 专项和文档合同测试
+
+**验收标准**
+
+- 模式由用户逐 run 显式选择，默认 `modify`，不能根据提示词推断。
+- `modify` 精确保留现有六个工具；`read_only` 只暴露 `list_directory`、`read_file` 和 `inspect_git`。
+- `inspect_git` 只能复用既有安全语法执行本地只读 Git 子命令，不能运行工作区代码或 Git 写操作。
+- 合法只读最终文本进入 `ANSWERED`、退出码为 `0`；任何修改事实都使该终态成为内部不变量错误。
+- `SUCCESS` 仍只允许具有新鲜通过验证证据的修改运行。
+- 模式和 `answered` 语义贯通 SQLite、REST/SSE、最终报告、CLI 和 GUI，并兼容历史会话迁移。
+- 默认测试完全离线，不读取真实凭据，不新增依赖或 Agent 框架。
+
+**需要编写的测试**
+
+- 模式枚举、配置、指令、状态机、报告和审计严格 schema 测试。
+- `inspect_git` 允许/拒绝矩阵与按模式 Registry 组合测试。
+- SQLite v2→v3、报告 v1→v2 原子迁移和生命周期持久化测试。
+- Controller、REST、SSE、CLI、GUI 与同一会话切换模式测试。
+- 项目读取与介绍不再耗尽逻辑模型调用预算的离线集成测试。
+- Task1—Task24、Windows reparse point、超时与进程树完整回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: add explicit read-only run mode`
+
+**当前状态**
+
 `进行中`
 
 ## 任务完成规则
