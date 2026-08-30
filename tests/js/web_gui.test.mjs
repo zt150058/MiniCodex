@@ -329,6 +329,13 @@ function controllerFixture() {
   elements.skillToggle.setAttribute("aria-expanded", "false");
   elements.skillToggle.setAttribute("aria-controls", "skill-panel");
   elements.skillPanel.hidden = true;
+  elements.connectionStatus.dataset.visible = "false";
+  elements.connectionStatus.setAttribute("aria-hidden", "true");
+  elements.emptyState = document.createElement("div");
+  elements.emptyState.setAttribute("id", "empty-state");
+  elements.emptyState.className = "empty-state";
+  elements.emptyState.append(document.createTextNode("把一个清晰的代码任务交给 Agent"));
+  elements.conversationLog.append(elements.emptyState);
   return { document, elements };
 }
 
@@ -342,6 +349,88 @@ function submitEvent() {
     },
   };
 }
+
+
+function keydownEvent({ key = "Enter", shiftKey = false, isComposing = false } = {}) {
+  return {
+    type: "keydown",
+    key,
+    shiftKey,
+    isComposing,
+    defaultPrevented: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+  };
+}
+
+
+test("session list renders only a compact title with the full title available", async () => {
+  const { document, elements } = controllerFixture();
+  const longTitle = "请检查项目中的所有失败测试并修复实现，同时解释每一处修改";
+  const api = {
+    listSessions: async () => ({
+      sessions: [{
+        session_id: "s1",
+        title: longTitle,
+        status: "idle",
+        last_run_id: null,
+      }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+
+  await controller.initialize();
+
+  const item = findElements(elements.sessionList, "li")[0];
+  const button = findElements(item, "button")[0];
+  const spans = findElements(button, "span");
+  assert.equal(item.className, "session-item");
+  assert.equal(button.className, "session-button");
+  assert.deepEqual(spans.map((span) => span.className), ["session-title"]);
+  assert.equal(spans[0].textContent, longTitle);
+  assert.equal(spans[0].getAttribute("title"), longTitle);
+  assert.equal(button.textContent.includes("空闲"), false);
+  assert.equal(button.childNodes.every((node) => node.nodeType === 1), true);
+  controller.destroy();
+});
+
+
+test("no selected session keeps the start prompt after initialization and reset", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Existing", status: "idle", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Existing", status: "idle", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "succeeded", started_at_utc: null }],
+      events: [{ run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Inspect" } }],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+
+  await controller.initialize();
+  assert.deepEqual(elements.conversationLog.childNodes, [elements.emptyState]);
+
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+  assert.equal(elements.conversationLog.textContent.includes("Inspect"), true);
+
+  elements.newSessionButton.dispatchEvent({ type: "click" });
+  assert.deepEqual(elements.conversationLog.childNodes, [elements.emptyState]);
+  assert.equal(
+    elements.conversationLog.textContent,
+    "把一个清晰的代码任务交给 Agent",
+  );
+  controller.destroy();
+});
 
 
 test("controller creates a session with preselected ordered skills", async () => {
@@ -383,6 +472,51 @@ test("controller creates a session with preselected ordered skills", async () =>
   assert.deepEqual(calls, [["createSession", "Repair", ["workspace:review", "user:tests"]]]);
   assert.equal(controller.getState().selectedSessionId, "s1");
   assert.equal(controller.getState().activeRunId, "r1");
+  assert.equal(elements.messageInput.value, "");
+  controller.destroy();
+});
+
+
+test("Enter submits while Shift Enter and IME confirmation keep editing", async () => {
+  const { document, elements } = controllerFixture();
+  const calls = [];
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    createSession: async (message) => {
+      calls.push(message);
+      return { session_id: "s1", run_id: "r1" };
+    },
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Repair", status: "running", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "running", started_at_utc: null }],
+      events: [{ run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Repair" } }],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer: async () => "terminal",
+  });
+  await controller.initialize();
+
+  elements.messageInput.value = "Repair";
+  const shifted = keydownEvent({ shiftKey: true });
+  elements.messageInput.dispatchEvent(shifted);
+  const composing = keydownEvent({ isComposing: true });
+  elements.messageInput.dispatchEvent(composing);
+  assert.equal(shifted.defaultPrevented, false);
+  assert.equal(composing.defaultPrevented, false);
+  assert.deepEqual(calls, []);
+  assert.equal(elements.messageInput.value, "Repair");
+
+  const entered = keydownEvent();
+  elements.messageInput.dispatchEvent(entered);
+  await controller.whenIdle();
+  assert.equal(entered.defaultPrevented, true);
+  assert.deepEqual(calls, ["Repair"]);
   assert.equal(elements.messageInput.value, "");
   controller.destroy();
 });
@@ -1359,7 +1493,32 @@ test("browser startup consumes bootstrap and initializes the real controller", a
     true,
   );
   assert.equal(requests.every((request) => !request.url.includes("fixed-test-token")), true);
-  assert.equal(elements.connectionStatus.textContent, "已连接本地服务");
+  assert.equal(elements.connectionStatus.textContent, "");
+  assert.equal(elements.connectionStatus.dataset.visible, "false");
+  assert.equal(elements.connectionStatus.getAttribute("aria-hidden"), "true");
+  controller.destroy();
+});
+
+
+test("request failures reveal the normally hidden connection notice", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    createSession: async () => {
+      throw new gui.WebClientError("controller_busy");
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+
+  elements.messageInput.value = "Inspect";
+  elements.messageComposer.dispatchEvent(submitEvent());
+  await controller.whenIdle();
+
+  assert.equal(elements.connectionStatus.dataset.visible, "true");
+  assert.equal(elements.connectionStatus.getAttribute("aria-hidden"), "false");
+  assert.equal(elements.connectionStatus.textContent, "请求失败：controller_busy");
   controller.destroy();
 });
 

@@ -32,6 +32,7 @@ REQUIRED_IDS = {
     "send-message-button",
     "connection-status",
     "coding-agent-bootstrap",
+    "workspace-name",
 }
 
 
@@ -60,9 +61,14 @@ def gui_source(name: str) -> str:
     )
 
 
-def make_app(*, token: str = TOKEN, gui_root: Path | None = None):
+def make_app(
+    *,
+    token: str = TOKEN,
+    gui_root: Path | None = None,
+    workspace: Path = Path("workspace"),
+):
     return create_web_app(
-        controller=RecordingController(),
+        controller=RecordingController(workspace=workspace),
         access_policy=WebAccessPolicy(token=token, port=43123),
         gui_root=gui_root,
     )
@@ -137,6 +143,26 @@ def test_document_bootstrap_html_escapes_the_access_token() -> None:
     assert response.status_code == 200
     assert token not in response.text
     assert "token&amp;quot;&lt;tag&gt;&quot;" in response.text
+
+
+def test_document_projects_only_the_escaped_workspace_folder_name() -> None:
+    response = asyncio.run(
+        request(
+            make_app(
+                workspace=Path("private-parent") / 'folder<&"',
+            ),
+            "GET",
+            "/",
+            headers=document_headers(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert "private-parent" not in response.text
+    assert "folder&lt;&amp;&quot;" in response.text
+    assert "__CODING_AGENT_WORKSPACE_NAME__" not in response.text
+    assert "MiniCodex" in response.text
+    assert "Coding Agent</p>" not in response.text
 
 
 def test_document_rejects_invalid_host_and_origin_without_bearer() -> None:
@@ -214,6 +240,28 @@ def test_gui_layout_has_unique_semantic_landmarks_and_controls() -> None:
     assert all(parser.ids.count(identifier) == 1 for identifier in REQUIRED_IDS)
     for tag in ("nav", "main", "header", "ol", "form"):
         assert tag in parser.tags
+
+
+def test_empty_state_uses_minicodex_and_normal_connection_notice_is_hidden() -> None:
+    source = gui_source("index.html")
+    parser = GuiMarkupParser()
+    parser.feed(source)
+    attributes = {
+        attrs.get("id"): attrs
+        for _tag, attrs in parser.attributes
+        if attrs.get("id")
+    }
+
+    assert (
+        "MiniCodex 可以在授权范围内读取和修改工作区文件、运行受控命令，并展示真实验证结果。"
+        in source
+    )
+    assert "Agent 可以在授权范围内" not in source
+    assert "data-visible" in attributes["connection-status"]
+    assert attributes["connection-status"]["data-visible"] == "false"
+    assert attributes["connection-status"]["aria-hidden"] == "true"
+    assert "hidden" not in attributes["connection-status"]
+    assert "正在连接本地服务" not in source
     buttons = [attrs for tag, attrs in parser.attributes if tag == "button"]
     assert buttons
     assert all(button.get("type") in {"button", "submit"} for button in buttons)
@@ -290,6 +338,39 @@ def test_gui_palette_and_wide_central_layout_match_approved_design() -> None:
     assert "background: black" not in css.lower()
     assert "http://" not in css.lower()
     assert "https://" not in css.lower()
+
+
+def test_workspace_name_is_constrained_to_one_ellipsized_line() -> None:
+    css = gui_source("styles.css")
+
+    assert ".brand-copy {" in css
+    brand_copy_rule = css.split(".brand-copy {", 1)[1].split("}", 1)[0]
+    assert "min-width: 0" in brand_copy_rule
+    assert ".workspace-name {" in css
+    workspace_rule = css.split(".workspace-name {", 1)[1].split("}", 1)[0]
+    assert "min-width: 0" in workspace_rule
+    assert "overflow: hidden" in workspace_rule
+    assert "text-overflow: ellipsis" in workspace_rule
+    assert "white-space: nowrap" in workspace_rule
+
+
+def test_session_titles_are_larger_and_have_no_secondary_status_style() -> None:
+    css = gui_source("styles.css")
+
+    session_title_rule = css.split(".session-title {", 1)[1].split("}", 1)[0]
+    assert "font-size: 14px" in session_title_rule
+    assert ".session-meta {" not in css
+
+
+def test_hidden_connection_notice_keeps_its_grid_slot() -> None:
+    css = gui_source("styles.css")
+
+    assert '.connection-status[data-visible="false"] {' in css
+    hidden_rule = css.split(
+        '.connection-status[data-visible="false"] {', 1
+    )[1].split("}", 1)[0]
+    assert "visibility: hidden" in hidden_rule
+    assert "display: none" not in hidden_rule
 
 
 def test_gui_responsive_drawer_focus_and_reduced_motion_are_explicit() -> None:

@@ -133,6 +133,17 @@ select:disabled {
   letter-spacing: -0.01em;
 }
 
+.brand-copy {
+  min-width: 0;
+}
+
+.workspace-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .eyebrow {
   color: var(--color-ink-muted);
   font-size: 10px;
@@ -249,15 +260,10 @@ select:disabled {
 
 .session-title {
   overflow: hidden;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 680;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.session-meta {
-  color: var(--color-ink-muted);
-  font-size: 10px;
 }
 
 .skill-section {
@@ -492,6 +498,10 @@ select:disabled {
   border-bottom: 1px solid rgba(221, 208, 192, 0.7);
   color: var(--color-ink-muted);
   font-size: 10px;
+}
+
+.connection-status[data-visible="false"] {
+  visibility: hidden;
 }
 
 .conversation-log {

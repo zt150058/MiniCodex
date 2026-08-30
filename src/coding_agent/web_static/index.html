@@ -16,9 +16,9 @@
               <path d="M7 7.5 3.5 12 7 16.5M17 7.5l3.5 4.5-3.5 4.5M14 5l-4 14" />
             </svg>
           </div>
-          <div>
-            <p class="eyebrow">LOCAL WORKSPACE</p>
-            <p class="brand-name">Coding Agent</p>
+          <div class="brand-copy">
+            <p id="workspace-name" class="eyebrow workspace-name">__CODING_AGENT_WORKSPACE_NAME__</p>
+            <p class="brand-name">MiniCodex</p>
           </div>
           <button id="sidebar-close" class="icon-button sidebar-close" type="button" aria-label="关闭会话栏">×</button>
         </div>
@@ -79,10 +79,7 @@
           <button id="cancel-run-button" class="danger-button" type="button" aria-label="取消当前运行" disabled>取消</button>
         </header>
 
-        <div id="connection-status" class="connection-status" role="status" aria-live="polite">
-          <span class="connection-dot" aria-hidden="true"></span>
-          正在连接本地服务…
-        </div>
+        <div id="connection-status" class="connection-status" role="status" aria-live="polite" aria-hidden="true" data-visible="false"></div>
 
         <section id="conversation-log" class="conversation-log" aria-label="会话内容" aria-live="polite">
           <div class="empty-state" id="empty-state">
@@ -94,7 +91,7 @@
             </div>
             <p class="eyebrow">READY WHEN YOU ARE</p>
             <h2>把一个清晰的代码任务交给 Agent</h2>
-            <p>Agent 可以在授权范围内读取和修改工作区文件、运行受控命令，并展示真实验证结果。</p>
+            <p>MiniCodex 可以在授权范围内读取和修改工作区文件、运行受控命令，并展示真实验证结果。</p>
           </div>
         </section>
 

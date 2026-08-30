@@ -54,6 +54,7 @@ _CONTROLLER_ERROR_STATUS = {
 }
 _EVENT_CURSOR_PATTERN = re.compile(r"[0-9]+\Z")
 _ACCESS_TOKEN_MARKER = "__CODING_AGENT_ACCESS_TOKEN__"
+_WORKSPACE_NAME_MARKER = "__CODING_AGENT_WORKSPACE_NAME__"
 _DOCUMENT_SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
@@ -470,11 +471,18 @@ def create_web_app(
         source = resource_root.joinpath("index.html").read_text(
             encoding="utf-8"
         )
-        if source.count(_ACCESS_TOKEN_MARKER) != 1:
+        if (
+            source.count(_ACCESS_TOKEN_MARKER) != 1
+            or source.count(_WORKSPACE_NAME_MARKER) != 1
+        ):
             raise RuntimeError("invalid GUI bootstrap resource")
         rendered = source.replace(
             _ACCESS_TOKEN_MARKER,
             html.escape(access_policy.token, quote=True),
+        )
+        rendered = rendered.replace(
+            _WORKSPACE_NAME_MARKER,
+            html.escape(controller.workspace.name or "workspace", quote=True),
         )
         return Response(
             rendered,

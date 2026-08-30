@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 import socket
 from threading import Event, Thread
 
@@ -163,6 +164,7 @@ def make_update(
 
 @dataclass
 class RecordingController:
+    workspace: Path = Path("workspace")
     sessions: tuple[SessionRecord, ...] = ()
     session_view: SessionView | None = None
     skill_view: SkillCatalogView = field(

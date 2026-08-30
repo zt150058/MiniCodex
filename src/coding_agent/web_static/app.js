@@ -529,6 +529,18 @@ export function createUiController({
   let elapsedTimer = null;
   let activeStream = null;
 
+  function setConnectionNotice(message) {
+    elements.connectionStatus.replaceChildren();
+    if (typeof message === "string" && message) {
+      elements.connectionStatus.append(document.createTextNode(message));
+      elements.connectionStatus.dataset.visible = "true";
+      elements.connectionStatus.setAttribute("aria-hidden", "false");
+    } else {
+      elements.connectionStatus.dataset.visible = "false";
+      elements.connectionStatus.setAttribute("aria-hidden", "true");
+    }
+  }
+
   function anySessionActive() {
     return state.sessions.some((session) =>
       ACTIVE_SESSION_STATUSES.has(session.status),
@@ -577,15 +589,17 @@ export function createUiController({
     elements.sessionList.replaceChildren();
     for (const session of state.sessions) {
       const item = document.createElement("li");
+      item.className = "session-item";
       const button = document.createElement("button");
       button.setAttribute("type", "button");
       button.className = "session-button";
       button.dataset.sessionId = session.session_id;
-      appendPlainText(document, button, session.title || "未命名会话");
-      const status = document.createElement("span");
-      status.className = "session-button__status";
-      appendPlainText(document, status, STATUS_LABELS[session.status] ?? "状态未知");
-      button.append(status);
+      const sessionTitle = session.title || "未命名会话";
+      const title = document.createElement("span");
+      title.className = "session-title";
+      title.setAttribute("title", sessionTitle);
+      appendPlainText(document, title, sessionTitle);
+      button.append(title);
       item.append(button);
       elements.sessionList.append(item);
     }
@@ -625,6 +639,10 @@ export function createUiController({
   function renderConversation() {
     elements.conversationLog.replaceChildren();
     const detail = state.selectedSession;
+    if (!detail) {
+      elements.conversationLog.append(elements.emptyState);
+      return;
+    }
     const projection = runProjectionFacts(detail);
     const renderedTerminalRuns = new Set();
 
@@ -765,9 +783,7 @@ export function createUiController({
         if (error?.name !== "AbortError") {
           state.errorCode =
             error instanceof WebClientError ? error.code : "stream_unavailable";
-          elements.connectionStatus.replaceChildren(
-            document.createTextNode(`连接中断：${state.errorCode}`),
-          );
+          setConnectionNotice(`连接中断：${state.errorCode}`);
         }
       })
       .finally(() => {
@@ -800,9 +816,7 @@ export function createUiController({
   function track(action) {
     pending = pending.then(action).catch((error) => {
       state.errorCode = error instanceof WebClientError ? error.code : "ui_action_failed";
-      elements.connectionStatus.replaceChildren(
-        document.createTextNode(`请求失败：${state.errorCode}`),
-      );
+      setConnectionNotice(`请求失败：${state.errorCode}`);
     });
     return pending;
   }
@@ -845,8 +859,7 @@ export function createUiController({
     }
   });
 
-  elements.messageComposer.addEventListener("submit", (event) => {
-    event.preventDefault();
+  function submitComposer() {
     const message = elements.messageInput.value.trim();
     if (!message || anySessionActive()) return;
     track(async () => {
@@ -868,6 +881,24 @@ export function createUiController({
       renderSelectedSession();
       startActiveStream(handle.run_id);
     });
+  }
+
+  elements.messageComposer.addEventListener("submit", (event) => {
+    event.preventDefault();
+    submitComposer();
+  });
+
+  elements.messageInput.addEventListener("keydown", (event) => {
+    if (
+      event.key !== "Enter" ||
+      event.shiftKey ||
+      event.isComposing ||
+      event.keyCode === 229
+    ) {
+      return;
+    }
+    event.preventDefault();
+    submitComposer();
   });
 
   elements.cancelButton.addEventListener("click", () => {
@@ -921,9 +952,7 @@ export function createUiController({
       );
       state.activeRunId = active?.last_run_id ?? null;
       state.connection = "connected";
-      elements.connectionStatus.replaceChildren(
-        document.createTextNode("已连接本地服务"),
-      );
+      setConnectionNotice(null);
       renderSessions();
       renderSkills();
       renderSelectedSession();
@@ -958,6 +987,7 @@ export function collectGuiElements(document) {
     sendButton: "send-message-button",
     connectionStatus: "connection-status",
     newSessionButton: "new-session-button",
+    emptyState: "empty-state",
   };
   const elements = Object.fromEntries(
     Object.entries(ids).map(([name, id]) => [name, document.getElementById(id)]),
@@ -1007,5 +1037,9 @@ if (typeof window !== "undefined" && typeof document !== "undefined") {
   void startBrowserApplication({ document, window }).catch(() => {
     const connection = document.getElementById("connection-status");
     connection?.replaceChildren(document.createTextNode("无法连接本地服务"));
+    if (connection) {
+      connection.dataset.visible = "true";
+      connection.setAttribute("aria-hidden", "false");
+    }
   });
 }
