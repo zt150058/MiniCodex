@@ -105,8 +105,9 @@ Before completing a task, verify:
 - Execute tool calls sequentially in the first version.
 - Every run has an explicit immutable `RunMode`; never infer authority from
   prompt text. `modify` remains the backward-compatible default.
-- A `modify` run exposes exactly `list_directory`, `read_file`, `replace_text`,
-  `write_file`, `run_command`, and `run_java_tests`.
+- A `modify` run exposes exactly `list_directory`, `read_file`,
+  `create_directory`, `replace_text`, `write_file`, `run_command`, and
+  `run_java_tests`.
 - A `read_only` run exposes exactly `list_directory`, `read_file`, and the
   dedicated `inspect_git` tool. It must not construct mutation, generic
   command, Java, or verification tools.
@@ -116,6 +117,8 @@ Before completing a task, verify:
 - `write_file` may create a file but may not overwrite one. `replace_text`
   must require an exact expected match count. Do not add deletion or move
   tools in the first version.
+- `create_directory` creates exactly one missing directory. Its direct parent
+  must already exist; it must not recursively create parents.
 - Parse commands into argument arrays and execute with `shell=False`.
 - Do not expose PowerShell, `cmd.exe`, Bash, WSL, network commands, package
   installation, system administration, or destructive Git commands.
@@ -124,6 +127,15 @@ Before completing a task, verify:
   command strings cannot invoke them.
 - Treat `.git/` and `.coding-agent/` as protected internal paths.
 - Any successful file mutation must invalidate earlier verification evidence.
+- After an eligible mutation response without forced or stale external
+  verification evidence, run local structural integrity exactly once for the
+  final mutation index. It does not prove tests or compilation and does not
+  itself permit success without later final text. A passing local integrity
+  result must immediately activate the post-mutation decision checkpoint.
+- Record every credible verification fact, but treat it as strong progress
+  only when its validation index advances, its status changes, or its source
+  upgrades from local integrity to model verification to user verification.
+  Repeating the same evidence must not reset convergence state.
 - If `--verify` is supplied, the agent may report success only after that exact
   command runs after the latest mutation and exits with code 0.
 - Without `--verify`, require fresh evidence after the latest mutation from
@@ -141,6 +153,14 @@ Before completing a task, verify:
   `python -m unittest ...` with `purpose="verification"`, and
   `run_java_tests` for Java. A rejected command may receive bounded safe
   correction, but local code must never rewrite or auto-execute it.
+- Put reproducible interactive defects in focused regression tests when the
+  registered tools can exercise them. Do not create one-off diagnostic scripts
+  merely to bypass command policy. If interaction cannot be automated, report
+  that manual interaction remains unverified and preserve the real exit code.
+- Text emitted by a model response that also contains tool calls is provisional:
+  retain it only in provider history for call pairing, discard its live GUI
+  projection when tool execution starts, and never persist it as a confirmed
+  assistant message.
 - Unverified mutations never succeed. If recovery ends without fresh passing
   evidence for the latest mutation, preserve the files and terminate as
   `changes_unverified`; do not claim rollback or `SUCCESS`.
@@ -153,6 +173,15 @@ Before completing a task, verify:
   exploration limits must issue a decision checkpoint before `no_progress`.
 - Write only redacted execution facts to JSONL. Never log hidden reasoning,
   authentication headers, environment dumps, or provider continuation payloads.
+- Chat Completions may make exactly one synchronous recovery request for a
+  structurally invalid stream only before any text was publicly emitted. Both
+  attempts share one logical call and provider budget. Never recover this way
+  after public text, and never relax strict response parsing.
+- Production-owned official SDK clients use a 30-second request timeout and
+  disable SDK retries; adapter retries remain bounded by the existing provider
+  attempt budget. Injected offline test clients remain unchanged.
+- A GUI command activity with an integer process exit code must display
+  `exit N`; tool transport status is shown only when no process exit code exists.
 - Treat code executed from the workspace as trusted for the first version and
   state clearly that the project is not an operating-system sandbox.
 

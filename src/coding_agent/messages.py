@@ -9,6 +9,7 @@ JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 JSONObject: TypeAlias = dict[str, JSONValue]
 ToolStatus: TypeAlias = Literal["ok", "error", "rejected"]
+DEFAULT_MODEL_MAX_OUTPUT_TOKENS = 16_384
 
 
 def _non_empty(value: object, field_name: str) -> str:
@@ -360,7 +361,7 @@ def _validate_message_sequence(messages: tuple[Message, ...]) -> None:
 class ModelRequest(_JsonMixin):
     messages: tuple[Message, ...]
     tool_schemas: tuple[JSONObject, ...] = ()
-    max_output_tokens: int = 4096
+    max_output_tokens: int = DEFAULT_MODEL_MAX_OUTPUT_TOKENS
     continuation_items: tuple[object, ...] = field(
         default=(), repr=False, compare=False
     )

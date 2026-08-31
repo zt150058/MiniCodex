@@ -23,6 +23,7 @@ from coding_agent.session_store import SQLiteSessionStore, SessionDeletionManife
 SESSION_ID = "1" * 32
 RUN_ID = "2" * 32
 AUDIT_ID = "a" * 32
+MODEL_ID = "selected-model"
 
 
 def _failed_result(run_id: str, audit_run_id: str) -> SessionRunResult:
@@ -49,13 +50,14 @@ def _store_with_terminal_session(
     generated = iter(f"{digit:x}" * 32 for digit in range(1, 16))
     store = SQLiteSessionStore(workspace, id_factory=lambda: next(generated))
     store.initialize()
-    submission = store.create_session("target")
+    submission = store.create_session("target", model_id=MODEL_ID)
     run_ids = [submission.run.run_id]
     store.finish_run(_failed_result(submission.run.run_id, audit_ids[0]))
     for position, audit_id in enumerate(audit_ids[1:], start=2):
         submission = store.submit_message(
             submission.session.session_id,
             f"target {position}",
+            model_id=MODEL_ID,
         )
         run_ids.append(submission.run.run_id)
         store.finish_run(_failed_result(submission.run.run_id, audit_id))
@@ -888,7 +890,9 @@ def test_recovery_preflights_duplicate_public_targets_across_operations(
     tmp_path: Path,
 ) -> None:
     store, first_session_id, _run_ids = _store_with_terminal_session(tmp_path)
-    second_submission = store.create_session("second target")
+    second_submission = store.create_session(
+        "second target", model_id=MODEL_ID
+    )
     store.finish_run(_failed_result(second_submission.run.run_id, AUDIT_ID))
     first_operation = _write_operation(
         tmp_path,

@@ -205,6 +205,7 @@ def _patch_composition(
     listener = RecordingSocket(events)
     controller = RecordingController(events, shutdown_results)
     server = RecordingServer(events, server_outcome)
+    model_catalog = object()
     observed: dict[str, object] = {}
 
     def socket_factory() -> RecordingSocket:
@@ -223,14 +224,26 @@ def _patch_composition(
         observed["executor_config"] = config
         return object()
 
+    def model_catalog_factory(config: RunConfig) -> object:
+        events.append("catalog:create")
+        observed["catalog_config"] = config
+        observed["model_catalog"] = model_catalog
+        return model_catalog
+
     def controller_factory(
         workspace: Path,
         executor: object,
         *,
         sensitive_values: tuple[str, ...],
+        model_catalog: object,
     ) -> RecordingController:
         events.append("controller:open")
-        observed["controller_args"] = (workspace, executor, sensitive_values)
+        observed["controller_args"] = (
+            workspace,
+            executor,
+            sensitive_values,
+            model_catalog,
+        )
         return controller
 
     def app_factory(*, controller: object, access_policy: object) -> object:
@@ -261,6 +274,12 @@ def _patch_composition(
     monkeypatch.setattr(web_cli, "_socket_factory", socket_factory, raising=False)
     monkeypatch.setattr(web_cli, "_policy_factory", policy_factory, raising=False)
     monkeypatch.setattr(web_cli, "_executor_factory", executor_factory, raising=False)
+    monkeypatch.setattr(
+        web_cli,
+        "_model_catalog_factory",
+        model_catalog_factory,
+        raising=False,
+    )
     monkeypatch.setattr(
         web_cli,
         "_controller_factory",
@@ -315,6 +334,7 @@ def test_web_application_uses_prebound_loopback_socket_and_reverse_cleanup(
         "socket:bind:127.0.0.1:0",
         "socket:listen",
         "policy:generate:43123",
+        "catalog:create",
         "controller:open",
         "app:create",
         "server:create",
@@ -334,9 +354,13 @@ def test_web_application_uses_prebound_loopback_socket_and_reverse_cleanup(
         "proxy_headers": False,
         "reload": False,
     }
-    workspace, _executor, sensitive_values = observed["controller_args"]
+    workspace, _executor, sensitive_values, model_catalog = observed[
+        "controller_args"
+    ]
     assert workspace == tmp_path.resolve()
     assert sensitive_values == (API_KEY, "web-access-secret")
+    assert observed["catalog_config"] is observed["executor_config"]
+    assert model_catalog is observed["model_catalog"]
     assert stdout.getvalue() == (
         "Local coding agent: http://127.0.0.1:43123/\n"
     )

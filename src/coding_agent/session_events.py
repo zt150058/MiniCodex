@@ -268,6 +268,7 @@ def _validate_payload(kind: SessionUpdateKind, data: JSONObject) -> None:
             "verification_failure",
             "final_read_allowance_exhausted",
             "duplicate_only_turn",
+            "post_mutation_integrity",
         }:
             raise ValueError("checkpoint reason is invalid")
         if data["phase"] not in {"discover", "act", "verify", "finish"}:

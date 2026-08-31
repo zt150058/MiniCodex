@@ -8,18 +8,6 @@ const STATUS_LABELS = Object.freeze({
   interrupted: "已中断",
 });
 
-const PHASE_LABELS = Object.freeze({
-  waiting: "等待任务",
-  model: "模型处理中",
-  tool: "执行工具",
-  verification: "验证修改",
-  finished: "运行结束",
-  discover: "调查中",
-  act: "执行中",
-  verify: "验证中",
-  finish: "收尾中",
-});
-
 const ACTIVITY_LABELS = Object.freeze({
   model_progress: "MiniCodex 正在处理",
   tool_started: "工具开始",
@@ -37,12 +25,6 @@ const RUN_MODE_LABELS = Object.freeze({
   read_only: "只读",
 });
 const BUDGET_PROFILES = new Set(["standard", "deep"]);
-const BUDGET_PROFILE_LABELS = Object.freeze({
-  standard: "标准",
-  deep: "深入",
-});
-
-
 export function appendPlainText(document, parent, text) {
   parent.append(document.createTextNode(String(text)));
 }
@@ -218,7 +200,7 @@ function appendMarkdownTable(document, parent, lines, index) {
 }
 
 
-function appendMarkdownBlocks(document, parent, text) {
+function appendMarkdownBlocks(document, parent, text, onCopyCode = null) {
   const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
   let index = 0;
   while (index < lines.length) {
@@ -245,13 +227,27 @@ function appendMarkdownBlocks(document, parent, text) {
       const code = document.createElement("code");
       if (fence[1]) code.className = `language-${fence[1].toLowerCase()}`;
       const codeLines = lines.slice(index + 1, closing);
+      const codeText = codeLines.join("\n");
       appendPlainText(
         document,
         code,
-        codeLines.length ? `${codeLines.join("\n")}\n` : "",
+        codeLines.length ? `${codeText}\n` : "",
       );
       pre.append(code);
-      appendMarkdownBlock(document, parent, pre);
+      const wrapper = document.createElement("div");
+      wrapper.className = "code-block";
+      const copyButton = document.createElement("button");
+      copyButton.setAttribute("type", "button");
+      copyButton.className = "code-copy-button";
+      copyButton.dataset.copyState = "idle";
+      copyButton.setAttribute("aria-label", "复制代码");
+      appendPlainText(document, copyButton, "复制");
+      copyButton.disabled = typeof onCopyCode !== "function";
+      copyButton.addEventListener("click", () => {
+        if (typeof onCopyCode === "function") onCopyCode(copyButton, codeText);
+      });
+      wrapper.append(copyButton, pre);
+      appendMarkdownBlock(document, parent, wrapper);
       index = closing + 1;
       continue;
     }
@@ -288,7 +284,7 @@ function appendMarkdownBlocks(document, parent, text) {
         index += 1;
       }
       const blockquote = document.createElement("blockquote");
-      appendMarkdownBlocks(document, blockquote, quoteLines.join("\n"));
+      appendMarkdownBlocks(document, blockquote, quoteLines.join("\n"), onCopyCode);
       appendMarkdownBlock(document, parent, blockquote);
       continue;
     }
@@ -330,7 +326,14 @@ function appendMarkdownBlocks(document, parent, text) {
 }
 
 
-export function appendMessage(document, container, role, text, runMode = null) {
+export function appendMessage(
+  document,
+  container,
+  role,
+  text,
+  runMode = null,
+  onCopyCode = null,
+) {
   const message = document.createElement("article");
   message.className = `message message--${role === "user" ? "user" : "assistant"}`;
   const label = document.createElement("div");
@@ -345,7 +348,7 @@ export function appendMessage(document, container, role, text, runMode = null) {
   const body = document.createElement("div");
   body.className = "message__body";
   if (role === "user") appendPlainText(document, body, String(text));
-  else appendMarkdownBlocks(document, body, String(text));
+  else appendMarkdownBlocks(document, body, String(text), onCopyCode);
   message.append(label, body);
   container.append(message);
   return message;
@@ -360,7 +363,10 @@ function safeActivityDetails(kind, data) {
     return [data.tool_name, `#${data.ordinal}`];
   }
   if (kind === "tool_finished") {
-    return [data.tool_name, data.status, `${data.duration_ms} ms`];
+    const outcome = Number.isInteger(data.exit_code)
+      ? `exit ${data.exit_code}`
+      : data.status;
+    return [data.tool_name, outcome, `${data.duration_ms} ms`];
   }
   if (kind === "verification_started") {
     return [data.source, `#${data.attempt_index}`];
@@ -386,20 +392,41 @@ function safeActivityDetails(kind, data) {
 }
 
 
-export function appendActivity(document, container, kind, data) {
+export function appendActivity(
+  document,
+  container,
+  kind,
+  data,
+  { active = false } = {},
+) {
   const card = document.createElement("div");
   card.className = kind === "changes_unverified"
     ? "activity-card activity-card--changes-unverified"
     : "activity-card";
+  if (active) card.classList.add("activity-card--active");
+  if (active) {
+    const indicator = document.createElement("span");
+    indicator.className = "activity-indicator";
+    indicator.setAttribute("aria-hidden", "true");
+    for (let index = 0; index < 3; index += 1) {
+      const dot = document.createElement("span");
+      dot.className = "activity-indicator__dot";
+      indicator.append(dot);
+    }
+    card.append(indicator);
+  }
   const label = ACTIVITY_LABELS[kind] ?? String(kind);
   const details = safeActivityDetails(kind, data ?? {})
     .filter((value) => value !== undefined && value !== null && value !== "")
     .map(String);
+  const content = document.createElement("span");
+  content.className = "activity-card__content";
   appendPlainText(
     document,
-    card,
+    content,
     details.length ? `${label} · ${details.join(" · ")}` : label,
   );
+  card.append(content);
   container.append(card);
   return card;
 }
@@ -409,8 +436,6 @@ export function renderRunHeader(
   document,
   elements,
   run,
-  phase,
-  progress = null,
   transientStatus = null,
 ) {
   const status = run?.status;
@@ -429,19 +454,6 @@ export function renderRunHeader(
           ? "running"
           : "idle"
   }`;
-  const phaseLabel = PHASE_LABELS[phase] ?? "状态同步中";
-  const progressLabel = progress && BUDGET_PROFILES.has(progress.budget_profile)
-    ? [
-        BUDGET_PROFILE_LABELS[progress.budget_profile],
-        `模型 ${progress.main_model_calls}/${progress.main_model_limit}`,
-        `摘要 ${progress.summary_model_calls}/${progress.summary_model_limit}`,
-        `请求 ${progress.provider_attempts}/${progress.provider_attempt_limit}`,
-        `工具 ${progress.tool_calls}/${progress.tool_limit}`,
-      ].join(" · ")
-    : null;
-  elements.runPhase.replaceChildren(document.createTextNode(
-    progressLabel ? `${phaseLabel} · ${progressLabel}` : phaseLabel,
-  ));
   elements.cancelButton.disabled = ![
     "queued",
     "running",
@@ -480,6 +492,14 @@ export function createInitialUiState() {
     selectedSkillIds: [],
     selectedRunMode: "modify",
     selectedBudgetProfile: "standard",
+    modelCatalog: {
+      enabled: false,
+      status: "disabled",
+      defaultModelId: null,
+      modelIds: [],
+      errorCode: null,
+    },
+    selectedModelId: null,
     activeRunId: null,
     lastSequence: 0,
     provisionalText: "",
@@ -538,6 +558,8 @@ export function createApiClient({
 
   return Object.freeze({
     listSessions: () => request("/api/v1/sessions?limit=50"),
+    listModels: (refresh = false) =>
+      request(`/api/v1/models?refresh=${refresh ? "true" : "false"}`),
     loadSession: (sessionId) =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`),
     deleteSession: (sessionId) =>
@@ -556,6 +578,7 @@ export function createApiClient({
       skillIds,
       runMode = "modify",
       budgetProfile = "standard",
+      modelId = null,
     ) =>
       request("/api/v1/sessions", {
         method: "POST",
@@ -564,6 +587,7 @@ export function createApiClient({
           skill_ids: skillIds,
           run_mode: runMode,
           budget_profile: budgetProfile,
+          model_id: modelId,
         },
       }),
     submitFollowUp: (
@@ -571,6 +595,7 @@ export function createApiClient({
       message,
       runMode = "modify",
       budgetProfile = "standard",
+      modelId = null,
     ) =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: "POST",
@@ -578,6 +603,7 @@ export function createApiClient({
           message,
           run_mode: runMode,
           budget_profile: budgetProfile,
+          model_id: modelId,
         },
       }),
     saveSkillSelection: (sessionId, skillIds) =>
@@ -911,6 +937,15 @@ function formatElapsed(milliseconds) {
 }
 
 
+export function defaultClipboardWrite(text) {
+  const clipboard = globalThis.navigator?.clipboard;
+  if (!clipboard || typeof clipboard.writeText !== "function") {
+    return Promise.reject(new Error("clipboard unavailable"));
+  }
+  return clipboard.writeText(text);
+}
+
+
 export function createUiController({
   document,
   elements,
@@ -918,18 +953,69 @@ export function createUiController({
   now = () => Date.now(),
   setIntervalImpl = globalThis.setInterval,
   clearIntervalImpl = globalThis.clearInterval,
+  setTimeoutImpl = globalThis.setTimeout,
+  clearTimeoutImpl = globalThis.clearTimeout,
+  clipboardWrite = defaultClipboardWrite,
   streamConsumer = consumeRunStream,
   confirmDelete = () => false,
 }) {
   if (typeof confirmDelete !== "function") {
     throw new TypeError("confirmDelete must be callable");
   }
+  for (const [name, callback] of [
+    ["setTimeoutImpl", setTimeoutImpl],
+    ["clearTimeoutImpl", clearTimeoutImpl],
+    ["clipboardWrite", clipboardWrite],
+  ]) {
+    if (typeof callback !== "function") {
+      throw new TypeError(`${name} must be callable`);
+    }
+  }
   const state = createInitialUiState();
   let pending = Promise.resolve();
   let elapsedTimer = null;
   let activeStream = null;
   let skillImportPending = false;
+  let expandedSkillId = null;
   let sessionDeletePending = false;
+  let modelRefreshPending = false;
+  let renderedModelIds = [];
+  let destroyed = false;
+  const copyResetTimers = new Set();
+
+  function setCopyButtonState(button, stateName, text, ariaLabel, disabled) {
+    button.dataset.copyState = stateName;
+    button.disabled = disabled;
+    button.setAttribute("aria-label", ariaLabel);
+    button.replaceChildren(document.createTextNode(text));
+  }
+
+  function clearCopyResetTimers() {
+    for (const timerId of copyResetTimers) clearTimeoutImpl(timerId);
+    copyResetTimers.clear();
+  }
+
+  function scheduleCopyButtonReset(button) {
+    const timerId = setTimeoutImpl(() => {
+      copyResetTimers.delete(timerId);
+      setCopyButtonState(button, "idle", "复制", "复制代码", false);
+    }, 1500);
+    copyResetTimers.add(timerId);
+  }
+
+  async function copyCodeText(button, codeText) {
+    if (destroyed || button.disabled) return;
+    setCopyButtonState(button, "pending", "复制中…", "正在复制代码", true);
+    try {
+      await clipboardWrite(codeText);
+      if (destroyed) return;
+      setCopyButtonState(button, "success", "已复制", "代码已复制", true);
+    } catch {
+      if (destroyed) return;
+      setCopyButtonState(button, "error", "复制失败", "代码复制失败", true);
+    }
+    scheduleCopyButtonReset(button);
+  }
 
   function setConnectionNotice(message) {
     elements.connectionStatus.replaceChildren();
@@ -947,6 +1033,87 @@ export function createUiController({
     return state.sessions.some((session) =>
       ACTIVE_SESSION_STATUSES.has(session.status),
     );
+  }
+
+  function normalizeModelCatalog(payload) {
+    const modelIds = Array.isArray(payload?.model_ids)
+      ? payload.model_ids.filter((modelId) => typeof modelId === "string" && modelId)
+      : [];
+    const defaultModelId = typeof payload?.default_model_id === "string"
+      && modelIds.includes(payload.default_model_id)
+      ? payload.default_model_id
+      : null;
+    const enabled = payload?.enabled === true && defaultModelId !== null;
+    const status = ["ready", "stale", "unavailable", "disabled"].includes(
+      payload?.status,
+    ) ? payload.status : "unavailable";
+    return {
+      enabled,
+      status,
+      defaultModelId,
+      modelIds,
+      errorCode: typeof payload?.error_code === "string"
+        ? payload.error_code
+        : null,
+    };
+  }
+
+  function unavailableModelCatalog() {
+    return {
+      enabled: false,
+      status: "unavailable",
+      defaultModelId: null,
+      modelIds: [],
+      errorCode: "model_catalog_unavailable",
+    };
+  }
+
+  function applyModelCatalog(payload, { preserveSelection = true } = {}) {
+    const catalog = normalizeModelCatalog(payload);
+    const preserved = preserveSelection
+      && catalog.modelIds.includes(state.selectedModelId)
+      ? state.selectedModelId
+      : null;
+    state.modelCatalog = catalog;
+    state.selectedModelId = catalog.enabled
+      ? preserved ?? catalog.defaultModelId
+      : null;
+  }
+
+  function renderModelControl() {
+    const catalog = state.modelCatalog;
+    elements.modelControl.hidden = !catalog.enabled;
+    const catalogChanged = renderedModelIds.length !== catalog.modelIds.length
+      || renderedModelIds.some((modelId, index) => modelId !== catalog.modelIds[index]);
+    if (catalogChanged) {
+      elements.modelSelect.replaceChildren();
+      for (const modelId of catalog.modelIds) {
+        const option = document.createElement("option");
+        option.value = modelId;
+        option.setAttribute("title", modelId);
+        appendPlainText(document, option, modelId);
+        elements.modelSelect.append(option);
+      }
+      renderedModelIds = [...catalog.modelIds];
+    }
+    elements.modelSelect.value = state.selectedModelId ?? "";
+    elements.modelSelect.setAttribute("title", state.selectedModelId ?? "");
+    const mutationLocked = anySessionActive();
+    elements.modelSelect.disabled = mutationLocked
+      || modelRefreshPending
+      || state.selectedModelId === null;
+    elements.refreshModelsButton.disabled = mutationLocked || modelRefreshPending;
+    const statusText = modelRefreshPending
+      ? "正在刷新…"
+      : catalog.status === "stale"
+        ? "模型列表可能已过期"
+        : catalog.status === "unavailable"
+          ? "无法获取模型列表"
+          : "";
+    elements.modelCatalogStatus.replaceChildren(
+      document.createTextNode(statusText),
+    );
+    elements.modelCatalogStatus.setAttribute("title", statusText);
   }
 
   function selectedRun() {
@@ -1015,6 +1182,7 @@ export function createUiController({
     for (const button of findSessionDeleteButtons(elements.sessionList)) {
       button.disabled = mutationLocked || sessionDeletePending;
     }
+    renderModelControl();
   }
 
   function findInputs(root) {
@@ -1081,25 +1249,64 @@ export function createUiController({
   function renderSkills() {
     elements.skillList.replaceChildren();
     const selected = new Set(state.selectedSkillIds);
-    for (const skill of state.skills) {
-      const label = document.createElement("label");
-      label.className = "skill-option";
+    if (!state.skills.some((skill) => skill.skill_id === expandedSkillId)) {
+      expandedSkillId = null;
+    }
+    state.skills.forEach((skill, index) => {
+      const skillName = skill.name ?? skill.skill_id;
+      const skillDescription = skill.description ?? "";
+      const expanded = skill.skill_id === expandedSkillId;
+      const option = document.createElement("div");
+      option.className = [
+        "skill-option",
+        selected.has(skill.skill_id) ? "skill-option--selected" : "",
+        expanded ? "skill-option--expanded" : "",
+      ].filter(Boolean).join(" ");
       const input = document.createElement("input");
       input.setAttribute("type", "checkbox");
       input.dataset.skillId = skill.skill_id;
       input.checked = selected.has(skill.skill_id);
-      const copy = document.createElement("span");
-      copy.className = "skill-option__copy";
+      input.setAttribute("aria-label", `选择 Skill：${skillName}`);
+
+      const detailsId = `skill-details-${index}`;
+      const toggle = document.createElement("button");
+      toggle.setAttribute("type", "button");
+      toggle.className = "skill-option__toggle";
+      toggle.dataset.skillExpandId = skill.skill_id;
+      toggle.setAttribute("aria-expanded", String(expanded));
+      toggle.setAttribute("aria-controls", detailsId);
+      toggle.setAttribute(
+        "aria-label",
+        `${expanded ? "收起" : "展开"} Skill：${skillName}`,
+      );
       const name = document.createElement("strong");
-      appendPlainText(document, name, skill.name ?? skill.skill_id);
-      const description = document.createElement("span");
-      appendPlainText(document, description, skill.description ?? "");
+      name.className = "skill-option__name";
+      appendPlainText(document, name, skillName);
+      const preview = document.createElement("span");
+      preview.className = "skill-option__preview";
+      preview.setAttribute("title", skillDescription);
+      appendPlainText(document, preview, skillDescription);
+      const chevron = document.createElement("span");
+      chevron.className = "skill-option__chevron";
+      chevron.setAttribute("aria-hidden", "true");
+      appendPlainText(document, chevron, "⌄");
+      toggle.append(name, preview, chevron);
+
+      const details = document.createElement("div");
+      details.setAttribute("id", detailsId);
+      details.className = "skill-option__details";
+      details.hidden = !expanded;
+      const description = document.createElement("p");
+      description.className = "skill-option__description";
+      appendPlainText(document, description, skillDescription);
       const source = document.createElement("small");
-      appendPlainText(document, source, skill.source ?? "");
-      copy.append(name, description, source);
-      label.append(input, copy);
-      elements.skillList.append(label);
-    }
+      source.className = "skill-option__source";
+      appendPlainText(document, source, `来源：${skill.source ?? "未知"}`);
+      details.append(description, source);
+
+      option.append(input, toggle, details);
+      elements.skillList.append(option);
+    });
     elements.skillSummary.replaceChildren(
       document.createTextNode(`已选择 ${state.selectedSkillIds.length} 个`),
     );
@@ -1115,6 +1322,7 @@ export function createUiController({
   }
 
   function renderConversation() {
+    clearCopyResetTimers();
     elements.conversationLog.replaceChildren();
     const detail = state.selectedSession;
     if (!detail) {
@@ -1177,7 +1385,14 @@ export function createUiController({
         projection.runsById.get(event.run_id)?.status === "succeeded" &&
         projection.lastAssistantSequence.get(event.run_id) === event.sequence
       ) {
-        appendMessage(document, elements.conversationLog, "assistant", event.data.content);
+        appendMessage(
+          document,
+          elements.conversationLog,
+          "assistant",
+          event.data.content,
+          null,
+          copyCodeText,
+        );
       }
 
       if (
@@ -1202,11 +1417,12 @@ export function createUiController({
         elements.conversationLog,
         currentActivity.kind,
         currentActivity.data,
+        { active: true },
       );
     } else if (state.activeRunId && state.provisionalText) {
       appendActivity(document, elements.conversationLog, "model_progress", {
         content: state.provisionalText,
-      });
+      }, { active: true });
     }
   }
 
@@ -1238,8 +1454,6 @@ export function createUiController({
       document,
       elements,
       run,
-      state.phase,
-      state.runProgress,
       state.transientStatus,
     );
     renderConversation();
@@ -1433,6 +1647,21 @@ export function createUiController({
     }
   });
 
+  elements.skillList.addEventListener("click", (event) => {
+    let target = event.target;
+    while (target && target !== elements.skillList) {
+      const skillId = target.nodeType === 1
+        ? target.dataset?.skillExpandId
+        : null;
+      if (skillId) {
+        expandedSkillId = expandedSkillId === skillId ? null : skillId;
+        renderSkills();
+        return;
+      }
+      target = target.parentNode;
+    }
+  });
+
   elements.skillList.addEventListener("change", (event) => {
     const skillId = event.target?.dataset?.skillId;
     if (!skillId || anySessionActive()) {
@@ -1572,11 +1801,45 @@ export function createUiController({
     }
   });
 
+  elements.modelSelect.addEventListener("change", () => {
+    if (anySessionActive() || modelRefreshPending) {
+      renderModelControl();
+      return;
+    }
+    const selected = elements.modelSelect.value;
+    if (state.modelCatalog.modelIds.includes(selected)) {
+      state.selectedModelId = selected;
+    }
+    renderModelControl();
+  });
+
+  elements.refreshModelsButton.addEventListener("click", () => {
+    if (anySessionActive() || modelRefreshPending) return;
+    modelRefreshPending = true;
+    renderControls();
+    track(async () => {
+      try {
+        const catalog = await api.listModels(true);
+        applyModelCatalog(catalog);
+      } catch {
+        state.modelCatalog = {
+          ...state.modelCatalog,
+          status: state.modelCatalog.modelIds.length ? "stale" : "unavailable",
+          errorCode: "model_catalog_unavailable",
+        };
+      } finally {
+        modelRefreshPending = false;
+        renderControls();
+      }
+    });
+  });
+
   function submitComposer() {
     const message = elements.messageInput.value.trim();
     if (!message || anySessionActive()) return;
     const runMode = state.selectedRunMode;
     const budgetProfile = state.selectedBudgetProfile;
+    const modelId = state.selectedModelId;
     track(async () => {
       let handle;
       if (state.selectedSessionId) {
@@ -1585,6 +1848,7 @@ export function createUiController({
           message,
           runMode,
           budgetProfile,
+          modelId,
         );
         await selectSession(handle.session_id);
       } else {
@@ -1593,6 +1857,7 @@ export function createUiController({
           state.selectedSkillIds,
           runMode,
           budgetProfile,
+          modelId,
         );
         await selectSession(handle.session_id);
         if (!state.sessions.some((session) => session.session_id === handle.session_id)) {
@@ -1661,13 +1926,18 @@ export function createUiController({
 
   return Object.freeze({
     async initialize() {
-      const [sessions, skills] = await Promise.all([
+      const modelCatalogRequest = typeof api.listModels === "function"
+        ? api.listModels(false).catch(() => unavailableModelCatalog())
+        : Promise.resolve(unavailableModelCatalog());
+      const [sessions, skills, modelCatalog] = await Promise.all([
         api.listSessions(),
         api.listSkills(),
+        modelCatalogRequest,
       ]);
       state.sessions = [...(sessions.sessions ?? [])];
       state.skills = [...(skills.skills ?? [])];
       state.skillDiagnostics = [...(skills.diagnostics ?? [])];
+      applyModelCatalog(modelCatalog, { preserveSelection: false });
       const active = state.sessions.find((session) =>
         ACTIVE_SESSION_STATUSES.has(session.status),
       );
@@ -1682,8 +1952,10 @@ export function createUiController({
     getState: () => state,
     whenIdle: () => pending,
     destroy() {
+      destroyed = true;
       stopActiveStream();
       stopElapsedTimer();
+      clearCopyResetTimers();
     },
   });
 }
@@ -1703,7 +1975,7 @@ export function collectGuiElements(document) {
     skillImportStatus: "skill-import-status",
     conversationTitle: "conversation-title",
     runStatus: "run-status",
-    runPhase: "run-phase",
+    workspacePath: "workspace-path",
     runElapsed: "run-elapsed",
     cancelButton: "cancel-run-button",
     conversationLog: "conversation-log",
@@ -1718,6 +1990,10 @@ export function collectGuiElements(document) {
     budgetProfileControl: "budget-profile-control",
     budgetProfileStandardButton: "budget-profile-standard",
     budgetProfileDeepButton: "budget-profile-deep",
+    modelControl: "model-control",
+    modelSelect: "model-select",
+    refreshModelsButton: "refresh-models-button",
+    modelCatalogStatus: "model-catalog-status",
     emptyState: "empty-state",
   };
   const elements = Object.fromEntries(

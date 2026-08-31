@@ -36,6 +36,11 @@ _ERROR_CODES = frozenset(
 _NON_EVIDENCE_ARGUMENTS = frozenset({"-h", "--help", "-V", "--version"})
 _LOCAL_INTEGRITY_COMMAND = "builtin:validate_changed_files"
 _LOCAL_INTEGRITY_MAX_BYTES = 524_288
+_VERIFICATION_SOURCE_RANK = {
+    CommandSource.LOCAL_INTEGRITY: 0,
+    CommandSource.MODEL: 1,
+    CommandSource.USER_VERIFY: 2,
+}
 
 
 def _same_executable(left: str, right: str) -> bool:
@@ -165,6 +170,26 @@ class VerificationResult:
             "duration_ms": self.duration_ms,
             "error": self.error,
         }
+
+
+def verification_advances_progress(
+    previous: VerificationResult | None,
+    current: VerificationResult,
+) -> bool:
+    if previous is not None and not isinstance(previous, VerificationResult):
+        raise TypeError("previous must be VerificationResult or None")
+    if not isinstance(current, VerificationResult):
+        raise TypeError("current must be VerificationResult")
+    if previous is None:
+        return True
+    if current.validation_index != previous.validation_index:
+        return current.validation_index > previous.validation_index
+    if current.status is not previous.status:
+        return True
+    return (
+        _VERIFICATION_SOURCE_RANK[current.source]
+        > _VERIFICATION_SOURCE_RANK[previous.source]
+    )
 
 
 class VerificationOutcome(StrEnum):
@@ -547,7 +572,13 @@ class VerificationGate:
         try:
             guard = PathGuard(self._execution_context.workspace)
             for relative_path in state.modified_paths:
-                guarded = guard.existing_file(relative_path)
+                guarded = guard.existing_entry(relative_path)
+                if guarded.absolute.is_dir():
+                    checked_paths.append(guarded.relative)
+                    continue
+                if not guarded.absolute.is_file():
+                    failure = (guarded.relative, "invalid_changed_path")
+                    break
                 with guarded.absolute.open("rb") as stream:
                     raw = stream.read(_LOCAL_INTEGRITY_MAX_BYTES + 1)
                 if len(raw) > _LOCAL_INTEGRITY_MAX_BYTES:

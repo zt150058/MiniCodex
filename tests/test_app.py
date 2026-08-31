@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections import deque
+from copy import deepcopy
 from io import StringIO
 import json
 from pathlib import Path
+from types import SimpleNamespace as ns
 from typing import BinaryIO
 
 import pytest
@@ -13,6 +16,7 @@ from coding_agent.app import (
     production_factories,
     run_application,
 )
+from coding_agent.chat_completions_client import ChatCompletionsModelClient
 from coding_agent.config import ApiMode, RunConfig, load_run_config
 from coding_agent.instructions import RunInstructionBuilder
 from coding_agent.logging import (
@@ -32,11 +36,86 @@ from coding_agent.model import FakeModelClient, ModelClient
 from coding_agent.run_mode import RunMode
 from coding_agent.safety import AuthorizedCommand
 from coding_agent.state import AgentStatus
+from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 from coding_agent.tools.base import ExecutionContext, ToolExecution
 
 
 FAKE_KEY = "task13-obviously-fake-key"
 CHAT_FAKE_KEY = "task15-chat-obviously-fake-key"
+
+
+class FakeChatStream:
+    def __init__(self, chunks: tuple[object, ...]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    def __iter__(self):
+        yield from self.chunks
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeChatCompletions:
+    def __init__(self, *outcomes: object) -> None:
+        self.outcomes = deque(outcomes)
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.calls.append(deepcopy(kwargs))
+        if not self.outcomes:
+            raise AssertionError("unexpected Chat Completions API call")
+        outcome = self.outcomes.popleft()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class FakeChatSDK:
+    def __init__(self, *outcomes: object) -> None:
+        self.chat = ns(completions=FakeChatCompletions(*outcomes))
+
+
+def _invalid_chat_stream() -> FakeChatStream:
+    return FakeChatStream(
+        (
+            ns(
+                id="chat-stream",
+                choices=[
+                    ns(
+                        index=0,
+                        delta=ns(
+                            role=None,
+                            content=None,
+                            tool_calls=None,
+                            function_call=None,
+                            refusal=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+        )
+    )
+
+
+def _sync_chat_text(text: str) -> object:
+    return ns(
+        id="chat-sync",
+        choices=[
+            ns(
+                finish_reason="stop",
+                message=ns(
+                    role="assistant",
+                    content=text,
+                    tool_calls=None,
+                    function_call=None,
+                ),
+            )
+        ],
+        usage=None,
+    )
 
 
 class RecordingExecutor:
@@ -186,7 +265,7 @@ def _successful_factories() -> ApplicationFactories:
 
 def _factories_with_model_client(
     workspace: Path,
-    client: FakeModelClient,
+    client: ModelClient,
     *,
     run_id: str,
 ) -> ApplicationFactories:
@@ -209,7 +288,7 @@ def _factories_with_model_client(
     )
 
 
-def test_modify_run_composes_exact_existing_six_tools(
+def test_modify_run_composes_exact_seven_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -238,6 +317,7 @@ def test_modify_run_composes_exact_existing_six_tools(
     assert tuple(schema["name"] for schema in client.requests[0].tool_schemas) == (
         "list_directory",
         "read_file",
+        "create_directory",
         "replace_text",
         "write_file",
         "run_command",
@@ -283,6 +363,49 @@ def test_optional_modify_run_writes_readme_and_uses_local_integrity(
     assert (tmp_path / "README.md").read_text(encoding="utf-8").startswith(
         "# Demo"
     )
+
+
+def test_optional_modify_run_creates_directory_project_in_one_batch(
+    tmp_path: Path,
+) -> None:
+    source = "int main() { return 0; }\n"
+    client = FakeModelClient(
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        call_id="mkdir-snake",
+                        name="create_directory",
+                        arguments={"path": "snake"},
+                    ),
+                    ToolCall(
+                        call_id="write-main",
+                        name="write_file",
+                        arguments={"path": "snake/main.cpp", "content": source},
+                    ),
+                )
+            ),
+            ModelResponse(text="Snake project created."),
+        )
+    )
+
+    result = execute_agent_run(
+        _optional_modify_config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="f" * 32,
+        ),
+    )
+
+    assert result.report.status is AgentStatus.SUCCESS
+    assert result.state.verification_attempt_count == 1
+    assert result.state.mutation_index == result.state.validation_index == 2
+    assert result.state.modified_paths == ("snake", "snake/main.cpp")
+    assert (tmp_path / "snake").is_dir()
+    assert (tmp_path / "snake" / "main.cpp").read_text(
+        encoding="utf-8"
+    ) == source
 
 
 def test_optional_modify_capability_can_answer_without_mutation(
@@ -331,6 +454,47 @@ def test_read_only_run_composes_only_inspection_tools(
         "read_file",
         "inspect_git",
     )
+
+
+def test_read_only_stream_fallback_keeps_three_inspection_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CHAT_COMPLETIONS_API_KEY", raising=False)
+    sdk = FakeChatSDK(_invalid_chat_stream(), _sync_chat_text("inspection done"))
+    client = ChatCompletionsModelClient(
+        model="chat-model",
+        api_key=CHAT_FAKE_KEY,
+        base_url="https://offline-provider.example/api/v1",
+        sdk_client=sdk,
+    )
+    events: list[ModelStreamEvent] = []
+
+    result = execute_agent_run(
+        _read_only_config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="1" * 32,
+        ),
+        stream_handler=events.append,
+    )
+
+    assert result.report.status is AgentStatus.ANSWERED
+    assert result.state.completion_text == "inspection done"
+    assert [event.kind for event in events] == [
+        ModelStreamEventKind.RESPONSE_COMPLETED
+    ]
+    assert len(sdk.chat.completions.calls) == 2
+    for call in sdk.chat.completions.calls:
+        tools = call["tools"]
+        assert isinstance(tools, list)
+        assert [tool["function"]["name"] for tool in tools] == [
+            "list_directory",
+            "read_file",
+            "inspect_git",
+        ]
 
 
 def test_read_only_unknown_write_is_paired_and_never_executed(
@@ -403,6 +567,53 @@ def test_execute_agent_run_includes_selected_skill_in_main_request_only(
     assert private_body not in (tmp_path / result.report.log_path).read_text(
         encoding="utf-8"
     )
+
+
+def test_chat_selected_skill_survives_invalid_stream_sync_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CHAT_COMPLETIONS_API_KEY", raising=False)
+    sdk = FakeChatSDK(_invalid_chat_stream(), _sync_chat_text("review complete"))
+    client = ChatCompletionsModelClient(
+        model="chat-model",
+        api_key=CHAT_FAKE_KEY,
+        base_url="https://offline-provider.example/api/v1",
+        sdk_client=sdk,
+    )
+    private_body = "selected skill private sentinel"
+    observed_events: list[RunEvent] = []
+    stream_events: list[ModelStreamEvent] = []
+
+    result = execute_agent_run(
+        _chat_config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="2" * 32,
+        ),
+        skill_instructions=f"### Skill: review — Review\n{private_body}",
+        event_observer=observed_events.append,
+        stream_handler=stream_events.append,
+    )
+
+    assert result.report.status is AgentStatus.SUCCESS
+    assert len(sdk.chat.completions.calls) == 2
+    assert [event.kind for event in stream_events] == [
+        ModelStreamEventKind.RESPONSE_COMPLETED
+    ]
+    for call in sdk.chat.completions.calls:
+        messages = call["messages"]
+        assert isinstance(messages, list)
+        assert private_body in str(messages[0]["content"])
+    public_surfaces = (
+        repr(result)
+        + repr(observed_events)
+        + json.dumps(result.report.to_dict(), ensure_ascii=False)
+        + (tmp_path / result.report.log_path).read_text(encoding="utf-8")
+    )
+    assert private_body not in public_surfaces
 
 
 def test_execute_agent_run_without_skills_preserves_existing_instructions(
@@ -580,6 +791,7 @@ def test_composition_uses_fixed_tools_and_shared_executor(tmp_path: Path) -> Non
     assert [schema["name"] for schema in model.requests[0].tool_schemas] == [
         "list_directory",
         "read_file",
+        "create_directory",
         "replace_text",
         "write_file",
         "run_command",

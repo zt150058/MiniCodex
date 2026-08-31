@@ -32,6 +32,7 @@ from coding_agent.session import (
 )
 from coding_agent.logging import scrub_text
 from coding_agent.budget import BudgetProfile
+from coding_agent.model_catalog import ModelCatalogError, require_model_id
 from coding_agent.run_mode import RunMode
 from coding_agent.skills import (
     RunSkillSnapshotMetadata,
@@ -40,7 +41,7 @@ from coding_agent.skills import (
 )
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _INTERNAL_DIRECTORY = ".coding-agent"
 _DATABASE_NAME = "sessions.sqlite3"
 _LOCK_NAME = "sessions.lock"
@@ -88,6 +89,7 @@ class SessionStore(Protocol):
         self,
         message: str,
         *,
+        model_id: str,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
@@ -117,6 +119,7 @@ class SessionStore(Protocol):
         session_id: str,
         message: str,
         *,
+        model_id: str,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
@@ -283,6 +286,7 @@ CREATE TABLE IF NOT EXISTS session_runs (
     termination_reason TEXT,
     audit_run_id TEXT,
     final_report_json TEXT,
+    model_id TEXT CHECK(model_id IS NULL OR length(model_id) > 0),
     UNIQUE(session_id, ordinal)
 );
 
@@ -418,7 +422,9 @@ class SQLiteSessionStore:
                     connection.commit()
                 if version in {1, 2}:
                     self._migrate_to_version_3(connection)
-                self._migrate_to_version_4(connection)
+                if version in {1, 2, 3}:
+                    self._migrate_to_version_4(connection)
+                self._migrate_to_version_5(connection)
                 connection.executescript(_SCHEMA)
                 connection.commit()
         except SessionStoreError:
@@ -530,12 +536,30 @@ class SQLiteSessionStore:
                     "UPDATE session_runs SET final_report_json = ? WHERE run_id = ?",
                     (cls._canonical_json(report), row["run_id"]),
                 )
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.execute("PRAGMA user_version = 4")
             connection.commit()
         except SessionStoreError:
             connection.rollback()
             raise
         except (KeyError, TypeError, ValueError, sqlite3.Error):
+            connection.rollback()
+            raise SessionStoreError("storage_unavailable") from None
+
+    @classmethod
+    def _migrate_to_version_5(cls, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(session_runs)")
+            }
+            if "model_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_runs ADD COLUMN model_id TEXT"
+                )
+            connection.execute("PRAGMA user_version = 5")
+            connection.commit()
+        except sqlite3.Error:
             connection.rollback()
             raise SessionStoreError("storage_unavailable") from None
 
@@ -616,6 +640,7 @@ class SQLiteSessionStore:
                 termination_reason=row["termination_reason"],
                 audit_run_id=row["audit_run_id"],
                 final_report=final_report,
+                model_id=row["model_id"],
             )
         except (KeyError, TypeError, ValueError):
             raise SessionStoreError("database_corrupt") from None
@@ -825,10 +850,15 @@ class SQLiteSessionStore:
         self,
         message: str,
         *,
+        model_id: str,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> SessionSubmission:
+        try:
+            model_id = require_model_id(model_id)
+        except ModelCatalogError:
+            raise SessionStoreError("invalid_session_state") from None
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
         if type(run_mode) is not RunMode:
@@ -865,6 +895,7 @@ class SQLiteSessionStore:
                 termination_reason=None,
                 audit_run_id=None,
                 final_report=None,
+                model_id=model_id,
             )
             user_event = SessionEvent(
                 session_id=session_id,
@@ -906,8 +937,8 @@ class SQLiteSessionStore:
                 "INSERT INTO session_runs "
                 "(run_id, session_id, ordinal, status, run_mode, budget_profile, "
                 "user_event_sequence, started_at_utc, finished_at_utc, "
-                "agent_status, termination_reason, audit_run_id, final_report_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "agent_status, termination_reason, audit_run_id, final_report_json, "
+                "model_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.run_id,
                     run.session_id,
@@ -922,6 +953,7 @@ class SQLiteSessionStore:
                     run.termination_reason,
                     run.audit_run_id,
                     None,
+                    run.model_id,
                 ),
             )
             self._insert_skill_configuration(
@@ -1318,10 +1350,15 @@ class SQLiteSessionStore:
         session_id: str,
         message: str,
         *,
+        model_id: str,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> SessionSubmission:
+        try:
+            model_id = require_model_id(model_id)
+        except ModelCatalogError:
+            raise SessionStoreError("invalid_session_state") from None
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
         if type(run_mode) is not RunMode:
@@ -1369,6 +1406,7 @@ class SQLiteSessionStore:
                 termination_reason=None,
                 audit_run_id=None,
                 final_report=None,
+                model_id=model_id,
             )
             user_event = SessionEvent(
                 session_id=session_id,
@@ -1390,8 +1428,8 @@ class SQLiteSessionStore:
                 "INSERT INTO session_runs "
                 "(run_id, session_id, ordinal, status, run_mode, budget_profile, "
                 "user_event_sequence, started_at_utc, finished_at_utc, "
-                "agent_status, termination_reason, audit_run_id, final_report_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "agent_status, termination_reason, audit_run_id, final_report_json, "
+                "model_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.run_id,
                     run.session_id,
@@ -1406,6 +1444,7 @@ class SQLiteSessionStore:
                     None,
                     None,
                     None,
+                    run.model_id,
                 ),
             )
             self._insert_skill_configuration(
@@ -1858,6 +1897,7 @@ class SQLiteSessionStore:
                         termination_reason="process_restarted",
                         audit_run_id=None,
                         final_report=None,
+                        model_id=current.model_id,
                     )
                 )
             connection.commit()

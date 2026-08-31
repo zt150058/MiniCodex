@@ -190,6 +190,46 @@ def test_new_file_rejects_existing_target_and_bad_parent(tmp_path: Path) -> None
     )
 
 
+def test_new_directory_returns_absent_target_under_real_parent(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "Project"
+    parent.mkdir()
+
+    guarded = PathGuard(tmp_path).new_directory(r"Project\src")
+
+    assert guarded == GuardedPath(
+        absolute=parent.resolve() / "src",
+        relative="Project/src",
+    )
+    assert guarded.absolute.exists() is False
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "code"),
+    [
+        (".", SafetyCode.PATH_TYPE_MISMATCH),
+        ("missing/child", SafetyCode.PARENT_NOT_FOUND),
+        ("existing", SafetyCode.PATH_TYPE_MISMATCH),
+        ("parent.txt/child", SafetyCode.PATH_TYPE_MISMATCH),
+        (".git/generated", SafetyCode.PROTECTED_PATH),
+        ("../outside", SafetyCode.PATH_OUTSIDE_WORKSPACE),
+    ],
+)
+def test_new_directory_rejects_invalid_target_or_parent(
+    tmp_path: Path,
+    raw_path: str,
+    code: SafetyCode,
+) -> None:
+    (tmp_path / "existing").mkdir()
+    (tmp_path / "parent.txt").write_text("x", encoding="utf-8")
+
+    _assert_violation(
+        code,
+        lambda: PathGuard(tmp_path).new_directory(raw_path),
+    )
+
+
 @pytest.mark.parametrize(
     "raw_path",
     [
@@ -357,6 +397,10 @@ def test_real_junction_escape_and_new_file_parent_are_denied(tmp_path: Path) -> 
     _assert_violation(
         SafetyCode.REPARSE_POINT_DENIED,
         lambda: guard.new_file("junction/new.txt"),
+    )
+    _assert_violation(
+        SafetyCode.REPARSE_POINT_DENIED,
+        lambda: guard.new_directory("junction/new-directory"),
     )
 
 

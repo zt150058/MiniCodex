@@ -10,6 +10,7 @@ from coding_agent.context import ContextManager, ContextPreparationError
 from coding_agent.logging import EventSink, EventType, RunLogError
 from coding_agent.messages import (
     AssistantMessage,
+    DEFAULT_MODEL_MAX_OUTPUT_TOKENS,
     ModelRequest,
     ToolCall,
     ToolResult,
@@ -55,6 +56,7 @@ from coding_agent.verification import (
     VerificationGate,
     VerificationOutcome,
     VerificationResult,
+    verification_advances_progress,
 )
 
 
@@ -63,7 +65,9 @@ CancellationCheck: TypeAlias = Callable[[], bool]
 
 _READ_TOOL_NAMES = frozenset({"list_directory", "read_file", "inspect_git"})
 _VERIFICATION_TOOL_NAMES = frozenset({"run_command", "run_java_tests"})
-_MUTATION_TOOL_NAMES = frozenset({"replace_text", "write_file"})
+_MUTATION_TOOL_NAMES = frozenset(
+    {"create_directory", "replace_text", "write_file"}
+)
 _FAILED_VERIFICATION_STATUSES = frozenset(
     {
         VerificationStatus.FAILED,
@@ -72,9 +76,25 @@ _FAILED_VERIFICATION_STATUSES = frozenset(
     }
 )
 _OUTPUT_LIMIT_RECOVERY_INSTRUCTION = (
-    "Output recovery: the previous response reached its output token limit. "
-    "Continue with one small tool call at a time, use one file per response, "
-    "and keep every tool argument complete. Do not repeat partial prose."
+    "Output recovery: the previous response was discarded because it reached "
+    "the output token limit. Do not repeat it. Produce exactly one complete "
+    "action: either one tool call whose total argument content is at most "
+    "12,000 characters, or final text of at most 2,000 characters. Split "
+    "larger work across later turns and keep every tool argument complete. "
+    "Do not include prose together with a tool call."
+)
+_OUTPUT_LIMIT_RECOVERY_MAX_TOKENS = 32_768
+_FRESH_LOCAL_INTEGRITY_INSTRUCTION = (
+    "The current mutation epoch already passed deterministic local integrity "
+    "validation. This is not test or compilation evidence. If the requested "
+    "change is complete, return a final answer with no tool calls. Do not use "
+    "unrelated Python, pytest, unittest, ruff, mypy, or Git commands to claim "
+    "C/C++ build verification. Do not repeatedly read the same files when the "
+    "authorized tools cannot run the required build. Instead, state that only "
+    "local integrity was checked and give the user the exact external build "
+    "command. If there is not enough evidence to continue, report the blocker "
+    "accurately rather than claiming that compilation passed. Otherwise "
+    "continue only with necessary work."
 )
 
 
@@ -106,6 +126,25 @@ def _with_command_correction(result: ToolResult) -> ToolResult:
             "<workspace-relative-file.py>, python -m pytest ..., or python -m "
             "unittest ... with purpose=\"verification\"; use run_java_tests "
             "for Java"
+        ),
+        metadata=result.metadata,
+    )
+
+
+def _with_parent_correction(result: ToolResult) -> ToolResult:
+    if result.error is None or not result.error.startswith(
+        "security_rejected:parent_not_found:"
+    ):
+        return result
+    return ToolResult(
+        call_id=result.call_id,
+        tool_name=result.tool_name,
+        status=result.status,
+        output=result.output,
+        error=(
+            "security_rejected:parent_not_found: parent directory does not "
+            "exist; call create_directory once for each missing parent, from "
+            "shallowest to deepest"
         ),
         metadata=result.metadata,
     )
@@ -288,6 +327,98 @@ class AgentRunner:
         )
         return decision.reason if decision.should_stop else None
 
+    def _run_eager_local_integrity(
+        self,
+        state: AgentState,
+    ) -> TerminationReason | None:
+        gate = self._verification_gate
+        if (
+            gate is None
+            or gate.requires_execution
+            or not gate.requires_local_integrity(state)
+        ):
+            return None
+        reason = self._policy_reason(
+            state,
+            NextOperation.VERIFICATION,
+            verification_reserve_active=False,
+        )
+        if reason is not None:
+            self._emit(
+                EventType.VERIFICATION_BLOCKED,
+                {
+                    "source": CommandSource.LOCAL_INTEGRITY.value,
+                    "reason": reason.value,
+                    "mutation_index": state.mutation_index,
+                    "executed": False,
+                },
+            )
+            return reason
+
+        self._transition_phase(state, AgentPhase.VERIFY)
+        self._emit(
+            EventType.VERIFICATION_STARTED,
+            {
+                "source": CommandSource.LOCAL_INTEGRITY.value,
+                "command_hash": self._hash_text(
+                    "builtin:validate_changed_files"
+                ),
+                "mutation_index": state.mutation_index,
+                "attempt_index": state.verification_attempt_count + 1,
+            },
+        )
+        state.tool_call_count += 1
+        try:
+            decision = gate.evaluate(state)
+        except VerificationError:
+            return TerminationReason.INTERNAL_INVARIANT
+        if self._is_cancellation_requested():
+            return TerminationReason.USER_INTERRUPTED
+        if decision.command_executed and decision.result is not None:
+            self._emit(
+                EventType.VERIFICATION_COMPLETED,
+                self._verification_event_data(decision.result),
+            )
+        if decision.outcome is VerificationOutcome.SUCCESS:
+            evidence = decision.result
+            if (
+                evidence is not None
+                and evidence.source is CommandSource.LOCAL_INTEGRITY
+                and evidence.status is VerificationStatus.PASSED
+                and evidence.validation_index == state.mutation_index
+                and state.progress.activate_checkpoint()
+            ):
+                self._emit(
+                    EventType.DECISION_CHECKPOINT,
+                    {
+                        "reason": "post_mutation_integrity",
+                        "phase": state.progress.phase.value,
+                        "main_calls_remaining": max(
+                            0,
+                            self._termination_policy.limits.max_main_logical_calls
+                            - state.main_model_call_count,
+                        ),
+                    },
+                )
+            return None
+        if decision.feedback is not None:
+            state.messages += (decision.feedback,)
+        self._transition_phase(state, AgentPhase.ACT)
+        state.progress.activate_checkpoint()
+        self._emit(
+            EventType.DECISION_CHECKPOINT,
+            {
+                "reason": "verification_failure",
+                "phase": state.progress.phase.value,
+                "main_calls_remaining": max(
+                    0,
+                    self._termination_policy.limits.max_main_logical_calls
+                    - state.main_model_call_count,
+                ),
+            },
+        )
+        return None
+
     def _transition_phase(self, state: AgentState, phase: AgentPhase) -> None:
         previous = state.progress.phase
         if state.progress.transition(phase):
@@ -377,15 +508,12 @@ class AgentRunner:
             return
         if result.status == "ok":
             state.consecutive_tool_errors = 0
-            state.consecutive_safety_rejections = 0
         elif result.error is not None and result.error.startswith(
             "security_rejected:"
         ):
-            state.consecutive_safety_rejections += 1
             state.consecutive_tool_errors = 0
         else:
             state.consecutive_tool_errors += 1
-            state.consecutive_safety_rejections = 0
 
         call_fingerprint = tool_call_fingerprint(call)
         result_fingerprint = tool_result_fingerprint(result)
@@ -405,6 +533,24 @@ class AgentRunner:
             state.repeated_tool_call_count = 0
         state.last_tool_fingerprint = call_fingerprint
         state.last_tool_result_fingerprint = result_fingerprint
+
+    @staticmethod
+    def _settle_safety_rejection_batch(
+        state: AgentState,
+        executed_results: tuple[ToolResult, ...],
+    ) -> None:
+        if not executed_results:
+            return
+        safety_only = all(
+            result.status == "rejected"
+            and result.error is not None
+            and result.error.startswith("security_rejected:")
+            for result in executed_results
+        )
+        if safety_only:
+            state.consecutive_safety_rejections += 1
+        else:
+            state.consecutive_safety_rejections = 0
 
     def run(self, task: str) -> AgentState:
         state = AgentState.start(
@@ -537,12 +683,21 @@ class AgentRunner:
                     },
                 )
             reason = self._policy_reason(state, NextOperation.MODEL)
-            if progress_decision.action is ProgressAction.STOP and reason not in {
-                TerminationReason.INTERNAL_INVARIANT,
-                TerminationReason.CONSECUTIVE_SAFETY_REJECTIONS,
-                TerminationReason.TIME_LIMIT,
-                TerminationReason.PROVIDER_ATTEMPT_LIMIT,
-            }:
+            safety_correction_pending = (
+                0 < state.consecutive_safety_rejections
+                < limits.safety_rejection_limit
+            )
+            if (
+                progress_decision.action is ProgressAction.STOP
+                and not safety_correction_pending
+                and reason
+                not in {
+                    TerminationReason.INTERNAL_INVARIANT,
+                    TerminationReason.CONSECUTIVE_SAFETY_REJECTIONS,
+                    TerminationReason.TIME_LIMIT,
+                    TerminationReason.PROVIDER_ATTEMPT_LIMIT,
+                }
+            ):
                 self._emit(
                     EventType.NO_PROGRESS_DETECTED,
                     {
@@ -665,6 +820,22 @@ class AgentRunner:
                         f"{_OUTPUT_LIMIT_RECOVERY_INSTRUCTION}"
                     )
                 )
+            evidence = state.last_verification
+            if (
+                evidence is not None
+                and evidence.source is CommandSource.LOCAL_INTEGRITY
+                and evidence.status is VerificationStatus.PASSED
+                and evidence.validation_index == state.mutation_index
+                and state.verification_status is VerificationStatus.PASSED
+            ):
+                request_instructions = (
+                    _FRESH_LOCAL_INTEGRITY_INSTRUCTION
+                    if request_instructions is None
+                    else (
+                        f"{request_instructions}\n\n"
+                        f"{_FRESH_LOCAL_INTEGRITY_INSTRUCTION}"
+                    )
+                )
             if state.progress.checkpoint_active or state.has_unverified_changes:
                 control = render_execution_control(
                     ledger=state.progress,
@@ -703,6 +874,11 @@ class AgentRunner:
             request = ModelRequest(
                 messages=state.messages,
                 tool_schemas=self._tool_registry.schemas,
+                max_output_tokens=(
+                    _OUTPUT_LIMIT_RECOVERY_MAX_TOKENS
+                    if state.consecutive_output_limit_errors == 1
+                    else DEFAULT_MODEL_MAX_OUTPUT_TOKENS
+                ),
                 continuation_items=state.continuation_items,
                 instructions=request_instructions,
             )
@@ -761,8 +937,6 @@ class AgentRunner:
                 if response.text is not None and response.text.strip()
                 else None
             )
-            if assistant_text is not None and self._confirmed_text_handler is not None:
-                self._confirmed_text_handler(assistant_text)
             if response.tool_calls:
                 state.messages += (
                     AssistantMessage(
@@ -772,6 +946,8 @@ class AgentRunner:
                 )
                 if self._is_cancellation_requested():
                     return self._interrupt(state, response.tool_calls)
+                mutation_index_at_response_start = state.mutation_index
+                executed_results: list[ToolResult] = []
                 for index, call in enumerate(response.tool_calls):
                     if self._is_cancellation_requested():
                         return self._interrupt(state, response.tool_calls[index:])
@@ -840,8 +1016,11 @@ class AgentRunner:
                             call,
                             self._execution_context,
                         )
+                        result = _with_parent_correction(result)
                         if call.name == "run_command":
                             result = _with_command_correction(result)
+                    if executed:
+                        executed_results.append(result)
                     state.messages += (result,)
                     mutation_index_before = state.mutation_index
                     _record_successful_mutation(state, result)
@@ -881,7 +1060,9 @@ class AgentRunner:
                             },
                         )
                     evidence_recorded = False
+                    evidence_advanced = False
                     if self._verification_gate is not None:
+                        previous_evidence = state.last_verification
                         try:
                             evidence_recorded = self._verification_gate.observe_tool_result(
                                 state,
@@ -901,6 +1082,10 @@ class AgentRunner:
                         if evidence_recorded:
                             evidence = state.last_verification
                             assert evidence is not None
+                            evidence_advanced = verification_advances_progress(
+                                previous_evidence,
+                                evidence,
+                            )
                             self._emit(
                                 EventType.VERIFICATION_EVIDENCE_RECORDED,
                                 {
@@ -914,7 +1099,7 @@ class AgentRunner:
                         mutation_advanced=(
                             state.mutation_index != mutation_index_before
                         ),
-                        verification_recorded=evidence_recorded,
+                        verification_advanced=evidence_advanced,
                         mutation_epoch=state.mutation_index,
                     )
                     self._emit_progress(state, strength, source="tool")
@@ -944,10 +1129,22 @@ class AgentRunner:
                             state,
                             response.tool_calls[index + 1 :],
                         )
+                self._settle_safety_rejection_batch(
+                    state,
+                    tuple(executed_results),
+                )
+                if state.mutation_index != mutation_index_at_response_start:
+                    eager_reason = self._run_eager_local_integrity(state)
+                    if eager_reason is TerminationReason.USER_INTERRUPTED:
+                        return self._interrupt(state)
+                    if eager_reason is not None:
+                        return self._terminate(state, eager_reason)
                 state.progress.finish_main_turn()
                 progress_turn_active = False
                 continue
 
+            if assistant_text is not None and self._confirmed_text_handler is not None:
+                self._confirmed_text_handler(assistant_text)
             if self._is_cancellation_requested():
                 return self._interrupt(state)
             if assistant_text is not None:

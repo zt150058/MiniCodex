@@ -17,6 +17,7 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     FakeModelClient,
     FakeModelExhaustedError,
     FatalModelError,
@@ -33,6 +34,10 @@ from coding_agent.model import (
     TransientModelError,
     invoke_model,
 )
+
+
+def test_default_provider_timeout_is_fixed_and_positive() -> None:
+    assert DEFAULT_PROVIDER_TIMEOUT_SECONDS == 30.0
 
 
 def test_model_response_failures_expose_stable_safe_codes() -> None:

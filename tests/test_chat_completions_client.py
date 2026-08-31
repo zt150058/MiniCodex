@@ -42,6 +42,7 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     FatalModelError,
     ModelBudgetExceeded,
     ModelBudgetReason,
@@ -441,6 +442,7 @@ def test_constructor_disables_sdk_retries_and_does_not_store_secrets(
         "api_key": FAKE_KEY,
         "base_url": FAKE_BASE_URL,
         "max_retries": 0,
+        "timeout": DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     }
     rendered = repr(client)
     assert FAKE_KEY not in rendered
@@ -512,6 +514,21 @@ def test_complete_sends_exact_no_tool_request_fields() -> None:
             "max_tokens": 321,
         }
     ]
+
+
+def test_complete_uses_16384_default_output_limit() -> None:
+    sdk = FakeSDKClient(chat_response(content="done"))
+    client = ChatCompletionsModelClient(
+        model="chat-model",
+        api_key=FAKE_KEY,
+        base_url=FAKE_BASE_URL,
+        sdk_client=sdk,
+        sleeper=lambda delay: None,
+    )
+
+    client.complete(ModelRequest(messages=(UserMessage("offline"),)))
+
+    assert sdk.chat.completions.calls[0]["max_tokens"] == 16_384
 
 
 def test_chat_maps_instructions_to_one_provider_only_system_message() -> None:

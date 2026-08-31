@@ -578,8 +578,13 @@ def test_python_write_recovers_from_rejected_commands_and_verifies(
 
     assert state.status is AgentStatus.SUCCESS
     assert state.mutation_index == state.validation_index == 1
-    assert state.verification_attempt_count == 1
+    assert state.verification_attempt_count == 2
     assert state.verification_status is VerificationStatus.PASSED
+    assert state.last_verification is not None
+    assert state.last_verification.source is CommandSource.MODEL
+    assert "already passed deterministic local integrity" in (
+        model.requests[1].instructions or ""
+    )
     assert state.consecutive_safety_rejections == 0
     assert len(model.requests) == 5
 
@@ -620,13 +625,15 @@ def test_python_write_with_exhausted_recovery_keeps_unverified_change(
     )
     model = FakeModelClient(tuple(responses))
     context = ExecutionContext(tmp_path)
+    executor = _FakeVerificationExecutor()
     runner = AgentRunner(
         model_client=model,
         tool_registry=ToolRegistry((WriteFileTool(), RunCommandTool())),
         execution_context=context,
         verification_gate=VerificationGate(
-            required_command=None,
+            required_command=_required_verification(),
             execution_context=context,
+            executor=executor,
         ),
         termination_policy=_profile_policy(BudgetProfile.STANDARD),
         budget_profile=BudgetProfile.STANDARD,
@@ -642,4 +649,5 @@ def test_python_write_with_exhausted_recovery_keeps_unverified_change(
     assert state.validation_index is None
     assert state.verification_attempt_count == 0
     assert state.verification_status is VerificationStatus.STALE
+    assert executor.calls == []
     assert len(model.requests) == 4

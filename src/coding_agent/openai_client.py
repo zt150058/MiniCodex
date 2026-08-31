@@ -33,6 +33,7 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     FatalModelError,
     InvalidModelResponseError,
     ModelBudgetExceeded,
@@ -722,7 +723,11 @@ class OpenAIResponsesClient:
 
         self._model = model.strip()
         self._client = (
-            OpenAI(api_key=api_key.strip(), max_retries=0)
+            OpenAI(
+                api_key=api_key.strip(),
+                max_retries=0,
+                timeout=DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+            )
             if sdk_client is None
             else sdk_client
         )

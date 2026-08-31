@@ -136,7 +136,11 @@ def test_phase_progress_checkpoint_and_latch_events_have_exact_safe_keys(
 
 @pytest.mark.parametrize(
     "reason",
-    ["final_read_allowance_exhausted", "verification_failure"],
+    [
+        "final_read_allowance_exhausted",
+        "verification_failure",
+        "post_mutation_integrity",
+    ],
 )
 def test_decision_checkpoint_accepts_amendment_reasons(
     tmp_path: Path,

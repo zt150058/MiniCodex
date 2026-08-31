@@ -9,6 +9,7 @@ import webbrowser
 import uvicorn
 
 from coding_agent.config import ConfigError, RunConfig, load_run_config
+from coding_agent.model_catalog import create_model_catalog
 from coding_agent.session_controller import SessionController
 from coding_agent.session_runtime import AgentSessionRunExecutor
 from coding_agent.web import create_web_app
@@ -30,6 +31,7 @@ class WebApplication(Protocol):
 _socket_factory = lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 _policy_factory = WebAccessPolicy.generate
 _executor_factory = AgentSessionRunExecutor
+_model_catalog_factory = create_model_catalog
 _controller_factory = SessionController.open
 _web_app_factory = create_web_app
 
@@ -190,9 +192,11 @@ def run_web_application(
         assigned_port = int(listener.getsockname()[1])
         policy = _policy_factory(assigned_port)
         executor = _executor_factory(config)
+        model_catalog = _model_catalog_factory(config)
         controller = _controller_factory(
             config.workspace,
             executor,
+            model_catalog=model_catalog,
             sensitive_values=(config.api_key, policy.token),
         )
         app = _web_app_factory(

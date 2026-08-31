@@ -7,19 +7,26 @@ from collections import deque
 import pytest
 
 from coding_agent.budget import BudgetProfile
+from coding_agent.model_catalog import (
+    MODEL_CATALOG_UNAVAILABLE,
+    ModelCatalogStatus,
+    ModelCatalogView,
+)
 from coding_agent.session import SessionControllerError
-from coding_agent.session_controller import CancellationResult, RunHandle
+from coding_agent.session_controller import CancellationResult, RunHandle, SessionView
 from coding_agent.session_deletion import SessionDeletionResult
 from coding_agent.run_mode import RunMode
 from coding_agent.web_auth import WebAccessPolicy
 from tests.web_support import (
     RUN_ID,
+    MODEL_ID,
     SECOND_RUN_ID,
     SECOND_SESSION_ID,
     SESSION_ID,
     RecordingController,
     auth_headers,
     make_session_record,
+    make_run_record,
     make_session_view,
     make_skill_view,
     request,
@@ -50,6 +57,199 @@ def test_health_requires_auth_and_returns_exact_schema() -> None:
     assert allowed.json() == {"schema_version": 1, "status": "ok"}
     assert allowed.headers["cache-control"] == "no-store"
     assert controller.calls == []
+
+
+@pytest.mark.parametrize(
+    ("view", "expected"),
+    (
+        (
+            ModelCatalogView(
+                True,
+                ModelCatalogStatus.READY,
+                MODEL_ID,
+                (MODEL_ID, "selected-model"),
+                None,
+            ),
+            {
+                "enabled": True,
+                "status": "ready",
+                "default_model_id": MODEL_ID,
+                "model_ids": [MODEL_ID, "selected-model"],
+                "error_code": None,
+            },
+        ),
+        (
+            ModelCatalogView(
+                True,
+                ModelCatalogStatus.STALE,
+                MODEL_ID,
+                (MODEL_ID,),
+                MODEL_CATALOG_UNAVAILABLE,
+            ),
+            {
+                "enabled": True,
+                "status": "stale",
+                "default_model_id": MODEL_ID,
+                "model_ids": [MODEL_ID],
+                "error_code": MODEL_CATALOG_UNAVAILABLE,
+            },
+        ),
+        (
+            ModelCatalogView(
+                True,
+                ModelCatalogStatus.UNAVAILABLE,
+                MODEL_ID,
+                (MODEL_ID,),
+                MODEL_CATALOG_UNAVAILABLE,
+            ),
+            {
+                "enabled": True,
+                "status": "unavailable",
+                "default_model_id": MODEL_ID,
+                "model_ids": [MODEL_ID],
+                "error_code": MODEL_CATALOG_UNAVAILABLE,
+            },
+        ),
+        (
+            ModelCatalogView(
+                False,
+                ModelCatalogStatus.DISABLED,
+                MODEL_ID,
+                (MODEL_ID,),
+                None,
+            ),
+            {
+                "enabled": False,
+                "status": "disabled",
+                "default_model_id": MODEL_ID,
+                "model_ids": [MODEL_ID],
+                "error_code": None,
+            },
+        ),
+    ),
+)
+def test_models_endpoint_projects_safe_catalog_states(
+    view: ModelCatalogView,
+    expected: dict[str, object],
+) -> None:
+    controller = RecordingController(model_view=view)
+    denied = asyncio.run(request(make_app(controller), "GET", "/api/v1/models"))
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "GET",
+            "/api/v1/models?refresh=true",
+            headers=auth_headers(),
+        )
+    )
+
+    assert denied.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert response.headers["cache-control"] == "no-store"
+    assert controller.calls == [("list_models", True)]
+
+
+@pytest.mark.parametrize("refresh", ["1", "TRUE", "", "yes"])
+def test_models_endpoint_rejects_nonliteral_refresh(refresh: str) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "GET",
+            f"/api/v1/models?refresh={refresh}",
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "invalid_request"}}
+    assert controller.calls == []
+
+
+def test_models_endpoint_defaults_refresh_to_false() -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "GET",
+            "/api/v1/models",
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert controller.calls == [("list_models", False)]
+
+
+def test_selected_model_is_delegated_and_returned_for_both_submission_routes() -> None:
+    selected = "selected-model"
+    controller = RecordingController(
+        create_handle=RunHandle(
+            SESSION_ID,
+            RUN_ID,
+            RunMode.MODIFY,
+            BudgetProfile.STANDARD,
+            selected,
+        ),
+        follow_up_handle=RunHandle(
+            SESSION_ID,
+            SECOND_RUN_ID,
+            RunMode.MODIFY,
+            BudgetProfile.STANDARD,
+            selected,
+        ),
+    )
+    app = make_app(controller)
+
+    created = asyncio.run(
+        request(
+            app,
+            "POST",
+            "/api/v1/sessions",
+            json={"message": "first", "model_id": selected},
+            headers=auth_headers(),
+        )
+    )
+    followed = asyncio.run(
+        request(
+            app,
+            "POST",
+            f"/api/v1/sessions/{SESSION_ID}/messages",
+            json={"message": "second", "model_id": selected},
+            headers=auth_headers(),
+        )
+    )
+
+    assert created.status_code == 201
+    assert followed.status_code == 202
+    assert created.json()["model_id"] == selected
+    assert followed.json()["model_id"] == selected
+    assert controller.calls[0][3] == selected
+    assert controller.calls[1][3] == selected
+
+
+def test_legacy_run_projects_null_model_without_fabricating_default() -> None:
+    view = make_session_view()
+    controller = RecordingController(
+        session_view=SessionView(
+            session=view.session,
+            runs=(make_run_record(model_id=None),),
+            events=view.events,
+        )
+    )
+
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "GET",
+            f"/api/v1/sessions/{SESSION_ID}",
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.json()["runs"][0]["model_id"] is None
 
 
 def test_delete_session_is_authenticated_bodyless_and_delegates_exact_id() -> None:
@@ -203,6 +403,8 @@ def test_unhandled_route_error_is_stable_and_private(capsys) -> None:
         {"message": True},
         {"message": "repair", "skill_ids": [True]},
         {"message": "repair", "skill_ids": "python-testing"},
+        {"message": "repair", "model_id": True},
+        {"message": "repair", "model_id": ["test-model"]},
     ],
 )
 def test_create_session_rejects_invalid_request_shapes(payload: object) -> None:
@@ -213,6 +415,24 @@ def test_create_session_rejects_invalid_request_shapes(payload: object) -> None:
             "POST",
             "/api/v1/sessions",
             json=payload,
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "invalid_request"}}
+    assert controller.calls == []
+
+
+@pytest.mark.parametrize("model_id", [True, 1, ["test-model"], {"id": "test-model"}])
+def test_follow_up_rejects_non_string_model_id(model_id: object) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            f"/api/v1/sessions/{SESSION_ID}/messages",
+            json={"message": "repair", "model_id": model_id},
             headers=auth_headers(),
         )
     )
@@ -294,11 +514,13 @@ def test_create_session_accepts_exact_body_limit() -> None:
         "run_id": controller.create_handle.run_id,
         "run_mode": "modify",
         "budget_profile": "standard",
+        "model_id": MODEL_ID,
     }
     assert controller.calls[0][0] == "create_session"
     assert len(controller.calls[0][1]) == 131_058
     assert controller.calls[0][2:] == (
         (),
+        None,
         RunMode.MODIFY,
         BudgetProfile.STANDARD,
     )
@@ -403,12 +625,14 @@ def test_create_session_delegates_message_and_ordered_skill_ids() -> None:
         "run_id": RUN_ID,
         "run_mode": "modify",
         "budget_profile": "standard",
+        "model_id": MODEL_ID,
     }
     assert controller.calls == [
         (
             "create_session",
             "repair tests",
             ("python-testing",),
+            None,
             RunMode.MODIFY,
             BudgetProfile.STANDARD,
         ),
@@ -523,6 +747,7 @@ def test_session_detail_uses_allowlisted_projection_and_selected_skills() -> Non
                 "status": "queued",
                 "run_mode": "modify",
                 "budget_profile": "standard",
+                "model_id": MODEL_ID,
                 "started_at_utc": None,
                 "finished_at_utc": None,
                 "agent_status": None,
@@ -588,16 +813,45 @@ def test_session_follow_up_delegates_and_returns_accepted_handle() -> None:
         "run_id": SECOND_RUN_ID,
         "run_mode": "modify",
         "budget_profile": "standard",
+        "model_id": MODEL_ID,
     }
     assert controller.calls == [
         (
             "submit_message",
             SESSION_ID,
             "continue",
+            None,
             RunMode.MODIFY,
             BudgetProfile.STANDARD,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_status"),
+    (
+        ("/api/v1/sessions", 201),
+        (f"/api/v1/sessions/{SESSION_ID}/messages", 202),
+    ),
+)
+def test_submission_routes_accept_explicit_null_model_as_default_request(
+    path: str,
+    expected_status: int,
+) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            path,
+            json={"message": "hello", "model_id": None},
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["model_id"] == MODEL_ID
+    assert None in controller.calls[0]
 
 
 @pytest.mark.parametrize(
@@ -648,12 +902,14 @@ def test_create_and_follow_up_accept_exact_run_modes(
             RUN_ID,
             mode,
             BudgetProfile.STANDARD,
+            MODEL_ID,
         ),
         follow_up_handle=RunHandle(
             SESSION_ID,
             SECOND_RUN_ID,
             mode,
             BudgetProfile.STANDARD,
+            MODEL_ID,
         ),
     )
     response = asyncio.run(
@@ -727,12 +983,15 @@ def test_create_and_follow_up_accept_exact_budget_profiles(
     expected_status: int,
 ) -> None:
     controller = RecordingController(
-        create_handle=RunHandle(SESSION_ID, RUN_ID, RunMode.MODIFY, profile),
+        create_handle=RunHandle(
+            SESSION_ID, RUN_ID, RunMode.MODIFY, profile, MODEL_ID
+        ),
         follow_up_handle=RunHandle(
             SESSION_ID,
             SECOND_RUN_ID,
             RunMode.MODIFY,
             profile,
+            MODEL_ID,
         ),
     )
     response = asyncio.run(
@@ -995,6 +1254,7 @@ def test_cancel_returns_existing_controller_result(result: CancellationResult) -
     ("code", "status"),
     [
         ("invalid_message", 400),
+        ("model_not_available", 400),
         ("invalid_skill_selection", 400),
         ("duplicate_skill_selection", 400),
         ("skill_selection_too_large", 400),

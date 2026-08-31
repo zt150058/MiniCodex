@@ -18,7 +18,9 @@ from coding_agent.tools.base import (
     ToolArgumentError,
     ToolExecution,
 )
+from coding_agent.tools.filesystem import ReadFileTool, WriteFileTool
 from coding_agent.tools.registry import ToolRegistry
+from coding_agent.verification import VerificationGate
 
 
 FAKE_KEY = "task15-agent-obviously-fake-key"
@@ -78,6 +80,115 @@ class FakeSDKClient:
         self.chat = SimpleNamespace(
             completions=FakeCompletionsResource(outcomes)
         )
+
+
+class FakeStream:
+    def __init__(self, chunks: tuple[object, ...]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    def __iter__(self):
+        yield from self.chunks
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _stream_chunk(
+    *,
+    content: str | None = None,
+    tool_calls: list[object] | None = None,
+    finish_reason: str | None = None,
+) -> object:
+    return SimpleNamespace(
+        id="chatcmpl-stream",
+        choices=[
+            SimpleNamespace(
+                index=0,
+                delta=SimpleNamespace(
+                    role=None,
+                    content=content,
+                    tool_calls=tool_calls,
+                    function_call=None,
+                    refusal=None,
+                ),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=None,
+    )
+
+
+def _invalid_no_text_stream() -> FakeStream:
+    return FakeStream((_stream_chunk(),))
+
+
+def _text_stream(text: str) -> FakeStream:
+    return FakeStream((_stream_chunk(content=text, finish_reason="stop"),))
+
+
+def _tool_stream(
+    call_id: str,
+    name: str,
+    arguments: JSONObject,
+) -> FakeStream:
+    return FakeStream(
+        (
+            _stream_chunk(
+                tool_calls=[
+                    SimpleNamespace(
+                        index=0,
+                        id=call_id,
+                        type="function",
+                        function=SimpleNamespace(
+                            name=name,
+                            arguments=json.dumps(
+                                arguments,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        ),
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+
+
+def _sync_tool_response(
+    call_id: str,
+    name: str,
+    arguments: JSONObject,
+) -> object:
+    return SimpleNamespace(
+        id="chatcmpl-sync",
+        choices=[
+            SimpleNamespace(
+                finish_reason="tool_calls",
+                message=SimpleNamespace(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id=call_id,
+                            type="function",
+                            function=SimpleNamespace(
+                                name=name,
+                                arguments=json.dumps(
+                                    arguments,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ),
+                            ),
+                        )
+                    ],
+                    function_call=None,
+                ),
+            )
+        ],
+        usage=None,
+    )
 
 
 def _response(
@@ -389,3 +500,66 @@ def test_every_request_has_exact_assistant_tool_pairing(
         ]
         assert returned == declared
         assert len(returned) == len(set(returned))
+
+
+def test_agents_file_sync_fallback_then_eager_read_and_finish(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CHAT_COMPLETIONS_API_KEY", raising=False)
+    agents_body = (
+        "# Project instructions\n\n"
+        "- Use test-driven development.\n"
+        "- Review completed work before reporting success.\n"
+    )
+    sdk = FakeSDKClient(
+        _invalid_no_text_stream(),
+        _sync_tool_response(
+            "write-agents",
+            "write_file",
+            {"path": "AGENTS.md", "content": agents_body},
+        ),
+        _tool_stream(
+            "read-agents",
+            "read_file",
+            {"path": "AGENTS.md", "start_line": 1, "end_line": None},
+        ),
+        _text_stream("AGENTS.md created and checked."),
+    )
+    client = ChatCompletionsModelClient(
+        model="chat-model",
+        api_key=FAKE_KEY,
+        base_url=FAKE_BASE_URL,
+        sdk_client=sdk,
+        sleeper=lambda delay: None,
+    )
+    execution_context = ExecutionContext(tmp_path)
+    runner = AgentRunner(
+        model_client=client,
+        tool_registry=ToolRegistry((ReadFileTool(), WriteFileTool())),
+        execution_context=execution_context,
+        context_manager=ContextManager(model_client=client),
+        clock=lambda: 0.0,
+        verification_gate=VerificationGate(
+            required_command=None,
+            execution_context=execution_context,
+        ),
+        stream_handler=lambda event: None,
+    )
+
+    state = runner.run("create and review AGENTS.md")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.completion_text == "AGENTS.md created and checked."
+    assert state.verification_attempt_count == 1
+    assert state.mutation_index == state.validation_index == 1
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == agents_body
+    calls = sdk.chat.completions.calls
+    assert [call.get("stream") for call in calls] == [True, None, True, True]
+    third_messages = _messages(calls[2])
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == "write-agents"
+        for message in third_messages
+    )

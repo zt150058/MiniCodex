@@ -10,6 +10,9 @@ from typing import Protocol, TypeAlias, runtime_checkable
 from coding_agent.messages import ModelRequest, ModelResponse, TokenUsage
 
 
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 30.0
+
+
 @runtime_checkable
 class ModelClient(Protocol):
     def complete(self, request: ModelRequest) -> ModelResponse: ...

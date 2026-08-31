@@ -7,7 +7,7 @@ from importlib.resources.abc import Traversable
 import json
 import re
 from threading import Lock
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -26,6 +26,7 @@ from .session import (
 from .session_controller import SessionController, SessionView
 from .session_events import SessionUpdateBatch, SessionUpdateKind
 from .budget import BudgetProfile
+from .model_catalog import ModelCatalogView
 from .run_mode import RunMode
 from .skills import SkillCatalogDiagnostic, SkillCatalogView, SkillDescriptor
 from .web_auth import WebAccessPolicy, WebAuthorizationError
@@ -36,6 +37,7 @@ _MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _SKILL_IMPORT_PATH = "/api/v1/skills/import"
 _CONTROLLER_ERROR_STATUS = {
     "invalid_message": 400,
+    "model_not_available": 400,
     "invalid_skill_selection": 400,
     "duplicate_skill_selection": 400,
     "skill_selection_too_large": 400,
@@ -59,7 +61,7 @@ _CONTROLLER_ERROR_STATUS = {
 }
 _EVENT_CURSOR_PATTERN = re.compile(r"[0-9]+\Z")
 _ACCESS_TOKEN_MARKER = "__CODING_AGENT_ACCESS_TOKEN__"
-_WORKSPACE_NAME_MARKER = "__CODING_AGENT_WORKSPACE_NAME__"
+_WORKSPACE_PATH_MARKER = "__CODING_AGENT_WORKSPACE_PATH__"
 _DOCUMENT_SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": (
@@ -138,6 +140,7 @@ class _CreateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     message: StrictStr
+    model_id: StrictStr | None = None
     skill_ids: tuple[StrictStr, ...] = ()
     run_mode: RunMode = RunMode.MODIFY
     budget_profile: BudgetProfile = BudgetProfile.STANDARD
@@ -170,6 +173,7 @@ class _FollowUpRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     message: StrictStr
+    model_id: StrictStr | None = None
     run_mode: RunMode = RunMode.MODIFY
     budget_profile: BudgetProfile = BudgetProfile.STANDARD
 
@@ -295,12 +299,23 @@ def _serialize_run(record: SessionRunRecord) -> dict[str, object]:
         "status": record.status.value,
         "run_mode": record.run_mode.value,
         "budget_profile": record.budget_profile.value,
+        "model_id": record.model_id,
         "started_at_utc": record.started_at_utc,
         "finished_at_utc": record.finished_at_utc,
         "agent_status": record.agent_status,
         "termination_reason": record.termination_reason,
         "audit_run_id": record.audit_run_id,
         "final_report": record.final_report,
+    }
+
+
+def _serialize_model_catalog(view: ModelCatalogView) -> dict[str, object]:
+    return {
+        "enabled": view.enabled,
+        "status": view.status.value,
+        "default_model_id": view.default_model_id,
+        "model_ids": list(view.model_ids),
+        "error_code": view.error_code,
     }
 
 
@@ -554,17 +569,18 @@ def create_web_app(
         )
         if (
             source.count(_ACCESS_TOKEN_MARKER) != 1
-            or source.count(_WORKSPACE_NAME_MARKER) != 1
+            or source.count(_WORKSPACE_PATH_MARKER) != 2
         ):
             raise RuntimeError("invalid GUI bootstrap resource")
         rendered = source.replace(
             _ACCESS_TOKEN_MARKER,
             html.escape(access_policy.token, quote=True),
         )
-        rendered = rendered.replace(
-            _WORKSPACE_NAME_MARKER,
-            html.escape(controller.workspace.name or "workspace", quote=True),
+        workspace_path = html.escape(
+            str(controller.workspace.resolve(strict=False)),
+            quote=True,
         )
+        rendered = rendered.replace(_WORKSPACE_PATH_MARKER, workspace_path)
         return Response(
             rendered,
             media_type="text/html",
@@ -595,11 +611,20 @@ def create_web_app(
     def health() -> dict[str, object]:
         return {"schema_version": 1, "status": "ok"}
 
+    @app.get("/api/v1/models")
+    def list_models(
+        refresh: Literal["false", "true"] = "false",
+    ) -> dict[str, object]:
+        return _serialize_model_catalog(
+            controller.list_models(refresh=refresh == "true")
+        )
+
     @app.post("/api/v1/sessions", status_code=201)
     def create_session(payload: _CreateSessionRequest) -> dict[str, str]:
         handle = controller.create_session(
             payload.message,
             skill_ids=payload.skill_ids,
+            model_id=payload.model_id,
             run_mode=payload.run_mode,
             budget_profile=payload.budget_profile,
         )
@@ -608,6 +633,7 @@ def create_web_app(
             "run_id": handle.run_id,
             "run_mode": handle.run_mode.value,
             "budget_profile": handle.budget_profile.value,
+            "model_id": handle.model_id,
         }
 
     @app.get("/api/v1/sessions")
@@ -652,6 +678,7 @@ def create_web_app(
         handle = controller.submit_message(
             session_id,
             payload.message,
+            model_id=payload.model_id,
             run_mode=payload.run_mode,
             budget_profile=payload.budget_profile,
         )
@@ -660,6 +687,7 @@ def create_web_app(
             "run_id": handle.run_id,
             "run_mode": handle.run_mode.value,
             "budget_profile": handle.budget_profile.value,
+            "model_id": handle.model_id,
         }
 
     @app.get("/api/v1/skills")

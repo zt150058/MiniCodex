@@ -26,6 +26,7 @@ from coding_agent.streaming import ModelStreamHandler
 from coding_agent.termination import TerminationLimits, TerminationPolicy
 from coding_agent.tools.base import ExecutionContext
 from coding_agent.tools.filesystem import (
+    CreateDirectoryTool,
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
@@ -152,6 +153,7 @@ def execute_agent_run(
             tools = (
                 ListDirectoryTool(),
                 ReadFileTool(),
+                CreateDirectoryTool(),
                 ReplaceTextTool(),
                 WriteFileTool(),
                 RunCommandTool(authorized_executor=executor),

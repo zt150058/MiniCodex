@@ -328,6 +328,7 @@ def _make_run_record(
     *,
     run_mode: object = RunMode.MODIFY,
     budget_profile: object = BudgetProfile.STANDARD,
+    model_id: object = None,
 ) -> SessionRunRecord:
     return SessionRunRecord(
         run_id=RUN_ID,
@@ -343,6 +344,7 @@ def _make_run_record(
         termination_reason=None,
         audit_run_id=None,
         final_report=None,
+        model_id=model_id,  # type: ignore[arg-type]
     )
 
 
@@ -354,6 +356,14 @@ def test_session_run_record_requires_and_preserves_budget_profile(
     assert record.budget_profile is profile
     with pytest.raises(TypeError, match="budget_profile"):
         _make_run_record(budget_profile=profile.value)
+
+
+def test_session_run_record_preserves_valid_model_id_and_allows_legacy_null() -> None:
+    assert _make_run_record().model_id is None
+    assert _make_run_record(model_id="selected-model").model_id == "selected-model"
+
+    with pytest.raises(ValueError, match="model_id"):
+        _make_run_record(model_id=" selected-model")
 
 
 def _answered_report_input() -> dict[str, object]:

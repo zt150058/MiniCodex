@@ -13,6 +13,7 @@ from coding_agent.context import ContextLimits, ContextManager
 from coding_agent.logging import RunEventObserver
 from coding_agent.messages import JSONObject
 from coding_agent.messages import UserMessage
+from coding_agent.model_catalog import ModelCatalogError, require_model_id
 from coding_agent.run_mode import RunMode
 from coding_agent.session import (
     SessionError,
@@ -124,6 +125,7 @@ class SessionNarrativeRenderer:
 class SessionRunRequest:
     session_id: str
     run_id: str
+    model_id: str = field(repr=False)
     current_message: str = field(repr=False)
     initial_user_message: str = field(repr=False)
     skill_bundle: SkillInstructionBundle | None = field(default=None, repr=False)
@@ -131,6 +133,10 @@ class SessionRunRequest:
     budget_profile: BudgetProfile = BudgetProfile.STANDARD
 
     def __post_init__(self) -> None:
+        try:
+            require_model_id(self.model_id)
+        except ModelCatalogError:
+            raise ValueError("model_id must be a valid model identifier") from None
         if type(self.run_mode) is not RunMode:
             raise TypeError("run_mode must be RunMode")
         if type(self.budget_profile) is not BudgetProfile:
@@ -168,6 +174,9 @@ class SessionRunExecutor(Protocol):
     @property
     def workspace(self) -> Path: ...
 
+    @property
+    def default_model_id(self) -> str: ...
+
     def execute(
         self,
         request: SessionRunRequest,
@@ -201,6 +210,10 @@ class AgentSessionRunExecutor:
     def workspace(self) -> Path:
         return self._workspace
 
+    @property
+    def default_model_id(self) -> str:
+        return self._base_config.model
+
     def execute(
         self,
         request: SessionRunRequest,
@@ -217,6 +230,7 @@ class AgentSessionRunExecutor:
         config = replace(
             self._base_config,
             task=request.current_message,
+            model=request.model_id,
             run_mode=request.run_mode,
             budget_profile=request.budget_profile,
         )

@@ -34,6 +34,7 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     FatalModelError,
     InvalidModelResponseError,
     ModelCallBudget,
@@ -447,6 +448,7 @@ class _ChatToolAccumulator:
 @dataclass(slots=True)
 class _ChatStreamProgress:
     provider_delta: bool = False
+    public_text_delta: bool = False
 
 
 def _stable_fragment(
@@ -580,6 +582,7 @@ def _consume_chat_stream(
                 progress.provider_delta = True
                 text_parts.append(content)
                 emit(ModelStreamEvent(ModelStreamEventKind.TEXT_DELTA, content))
+                progress.public_text_delta = True
         if next_finish is not None:
             if finish_reason is not None:
                 raise _invalid_response("duplicate finish reason")
@@ -703,6 +706,7 @@ class ChatCompletionsModelClient:
                 api_key=api_key.strip(),
                 base_url=normalized_base_url,
                 max_retries=0,
+                timeout=DEFAULT_PROVIDER_TIMEOUT_SECONDS,
             )
             if sdk_client is None
             else sdk_client
@@ -718,10 +722,25 @@ class ChatCompletionsModelClient:
         request: ModelRequest,
         budget: ModelCallBudget,
     ) -> ModelResponse:
+        return self._complete_with_attempt_limit(
+            request,
+            budget,
+            max_attempts=3,
+            fallback=False,
+        )
+
+    def _complete_with_attempt_limit(
+        self,
+        request: ModelRequest,
+        budget: ModelCallBudget,
+        *,
+        max_attempts: int,
+        fallback: bool,
+    ) -> ModelResponse:
         request_kwargs = _request_kwargs(self._model, request, stream=False)
         purpose = budget.active_purpose
 
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             provider_attempt_index = budget.begin_provider_attempt(purpose)
             try:
                 response = self._client.chat.completions.create(**request_kwargs)
@@ -750,7 +769,7 @@ class ChatCompletionsModelClient:
                         retry_delay_ms=None,
                     )
                     raise FatalModelError(public_message) from None
-                if attempt == 2:
+                if attempt == max_attempts - 1:
                     budget.finish_provider_attempt(
                         purpose,
                         provider_attempt_index,
@@ -758,6 +777,11 @@ class ChatCompletionsModelClient:
                         retry_scheduled=False,
                         retry_delay_ms=None,
                     )
+                    if fallback:
+                        raise TransientModelError(
+                            "Chat Completions fallback request failed: "
+                            "transient provider error"
+                        ) from None
                     raise TransientModelError(
                         "Chat Completions request failed after 3 attempts: "
                         "transient provider error"
@@ -894,6 +918,13 @@ class ChatCompletionsModelClient:
                     retry_scheduled=False,
                     retry_delay_ms=None,
                 )
+                if not progress.public_text_delta:
+                    return self._complete_with_attempt_limit(
+                        request,
+                        budget,
+                        max_attempts=1,
+                        fallback=True,
+                    )
                 raise InvalidChatCompletionsResponseError(
                     "invalid Chat Completions payload: "
                     "provider response could not be decoded"
@@ -906,6 +937,13 @@ class ChatCompletionsModelClient:
                     retry_scheduled=False,
                     retry_delay_ms=None,
                 )
+                if not progress.public_text_delta:
+                    return self._complete_with_attempt_limit(
+                        request,
+                        budget,
+                        max_attempts=1,
+                        fallback=True,
+                    )
                 raise
             except ModelOutputLimitError:
                 budget.finish_provider_attempt(

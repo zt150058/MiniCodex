@@ -16,6 +16,7 @@ from coding_agent.tools.base import (
     ToolExecution,
 )
 from coding_agent.tools.filesystem import (
+    CreateDirectoryTool,
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
@@ -344,6 +345,84 @@ def _write_arguments(
         "path": path,
         "content": content,
     }  # type: ignore[return-value]
+
+
+def test_create_directory_schema_is_strict_and_complete() -> None:
+    assert CreateDirectoryTool.schema == {
+        "name": "create_directory",
+        "description": (
+            "Create exactly one new directory whose parent already exists."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "minLength": 1}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def test_create_directory_creates_one_level_and_reports_path(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "project").mkdir()
+
+    execution = CreateDirectoryTool().execute(
+        {"path": r"project\src"},
+        _context(tmp_path),
+    )
+
+    assert (tmp_path / "project" / "src").is_dir()
+    assert _json_output(execution) == {"path": "project/src"}
+    assert execution.metadata == ToolResultMetadata(
+        changed_paths=("project/src",)
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [{}, {"path": "one", "extra": True}, {"path": "missing/child"}],
+)
+def test_create_directory_rejects_invalid_arguments_without_side_effect(
+    tmp_path: Path,
+    arguments: JSONObject,
+) -> None:
+    with pytest.raises((ToolArgumentError, SafetyViolation)):
+        CreateDirectoryTool().execute(arguments, _context(tmp_path))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_create_directory_rejects_creation_race_without_changed_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "project"
+    parent.mkdir()
+    target = parent / "src"
+    real_mkdir = Path.mkdir
+
+    def raced_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        if path == target:
+            raise FileExistsError("private operating-system detail")
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", raced_mkdir)
+    registry = ToolRegistry((CreateDirectoryTool(),))
+
+    result = registry.execute(
+        ToolCall(
+            call_id="mkdir_race",
+            name="create_directory",
+            arguments={"path": "project/src"},
+        ),
+        _context(tmp_path),
+    )
+
+    assert result.status == "rejected"
+    assert result.error == "invalid_arguments: target already exists"
+    assert result.metadata.changed_paths == ()
+    assert target.exists() is False
 
 
 def test_write_file_schema_is_strict_and_complete() -> None:

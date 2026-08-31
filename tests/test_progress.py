@@ -42,7 +42,7 @@ def _finish_read_turn(
         call,
         result,
         mutation_advanced=False,
-        verification_recorded=False,
+        verification_advanced=False,
         mutation_epoch=epoch,
     )
     return ledger.finish_main_turn()
@@ -219,7 +219,7 @@ def _finish_checkpoint_read_batch(ledger: ProgressLedger, index: int) -> None:
         call,
         result,
         mutation_advanced=False,
-        verification_recorded=False,
+        verification_advanced=False,
     )
     ledger.finish_main_turn()
 
@@ -281,7 +281,7 @@ def test_strong_progress_clears_final_read_and_decision_latches() -> None:
         call,
         result,
         mutation_advanced=True,
-        verification_recorded=False,
+        verification_advanced=False,
     )
     ledger.finish_main_turn()
 
@@ -351,7 +351,7 @@ def test_novel_successful_inspection_is_weak_and_repeat_is_none() -> None:
         call,
         _result_for(call),
         mutation_advanced=False,
-        verification_recorded=False,
+        verification_advanced=False,
     ) is ProgressStrength.WEAK
     assert ledger.finish_main_turn() is ProgressStrength.WEAK
 
@@ -361,7 +361,7 @@ def test_novel_successful_inspection_is_weak_and_repeat_is_none() -> None:
         repeated,
         _result_for(repeated),
         mutation_advanced=False,
-        verification_recorded=False,
+        verification_advanced=False,
     ) is ProgressStrength.NONE
     assert ledger.finish_main_turn() is ProgressStrength.NONE
 
@@ -382,13 +382,33 @@ def test_mutation_or_verification_is_strong(
         call,
         _result_for(call),
         mutation_advanced=mutation,
-        verification_recorded=verification,
+        verification_advanced=verification,
     )
 
     assert strength is ProgressStrength.STRONG
     assert ledger.finish_main_turn() is ProgressStrength.STRONG
     assert ledger.epoch == 1
     assert ledger.main_turns_since_strong_progress == 0
+
+
+def test_repeated_verification_does_not_clear_active_checkpoint() -> None:
+    ledger = ProgressLedger(
+        checkpoint_active=True,
+        post_checkpoint_main_turns=1,
+    )
+    call = _read_call()
+    ledger.begin_main_turn()
+
+    strength = ledger.observe_tool(
+        call,
+        _result_for(call),
+        mutation_advanced=False,
+        verification_advanced=False,
+    )
+    ledger.finish_main_turn()
+
+    assert strength is not ProgressStrength.STRONG
+    assert ledger.checkpoint_active is True
 
 
 @pytest.mark.parametrize(
@@ -412,7 +432,7 @@ def test_errors_rejections_and_synthetic_results_are_not_progress(
         call,
         _result_for(call, status=status, output=output, error=error),
         mutation_advanced=False,
-        verification_recorded=False,
+        verification_advanced=False,
     ) is ProgressStrength.NONE
     assert ledger.finish_main_turn() is ProgressStrength.NONE
 
@@ -504,7 +524,7 @@ def test_strong_progress_clears_checkpoint_and_starts_new_epoch() -> None:
         call,
         _result_for(call, changed_paths=("src/a.py",)),
         mutation_advanced=True,
-        verification_recorded=False,
+        verification_advanced=False,
     )
     ledger.finish_main_turn()
 

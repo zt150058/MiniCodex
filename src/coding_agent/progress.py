@@ -430,7 +430,7 @@ class ProgressLedger:
         result: ToolResult,
         *,
         mutation_advanced: bool,
-        verification_recorded: bool,
+        verification_advanced: bool,
         mutation_epoch: int = 0,
     ) -> ProgressStrength:
         if not self._main_turn_active:
@@ -441,8 +441,8 @@ class ProgressLedger:
             raise TypeError("result must be ToolResult")
         if not isinstance(mutation_advanced, bool):
             raise TypeError("mutation_advanced must be bool")
-        if not isinstance(verification_recorded, bool):
-            raise TypeError("verification_recorded must be bool")
+        if not isinstance(verification_advanced, bool):
+            raise TypeError("verification_advanced must be bool")
         if type(mutation_epoch) is not int or mutation_epoch < 0:
             raise ValueError("mutation_epoch must be a non-negative integer")
         exploration_novelty = self.exploration.observe(
@@ -456,7 +456,7 @@ class ProgressLedger:
         fingerprint = self._observation_fingerprint(call, result)
         novel = fingerprint not in self._seen_observations
         self._seen_observations.add(fingerprint)
-        if mutation_advanced or verification_recorded:
+        if mutation_advanced or verification_advanced:
             self._record_strong_progress()
             return ProgressStrength.STRONG
         if exploration_novelty is ExplorationNovelty.DUPLICATE or not novel:

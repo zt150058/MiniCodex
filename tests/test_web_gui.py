@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 from html.parser import HTMLParser
 from importlib.resources import files
 from pathlib import Path
@@ -23,7 +24,7 @@ REQUIRED_IDS = {
     "skill-summary",
     "conversation-title",
     "run-status",
-    "run-phase",
+    "workspace-path",
     "run-elapsed",
     "cancel-run-button",
     "conversation-log",
@@ -34,9 +35,12 @@ REQUIRED_IDS = {
     "budget-profile-control",
     "budget-profile-standard",
     "budget-profile-deep",
+    "model-control",
+    "model-select",
+    "refresh-models-button",
+    "model-catalog-status",
     "connection-status",
     "coding-agent-bootstrap",
-    "workspace-name",
 }
 
 
@@ -67,6 +71,30 @@ def test_gui_contains_compact_accessible_budget_profile_control() -> None:
     assert "深入" in html
     assert "无限" not in html
     assert "budget-profile-control" in css
+
+
+def test_gui_contains_compact_accessible_model_control_inside_composer_actions() -> None:
+    html = gui_source("index.html")
+    css = gui_source("styles.css")
+    parser = GuiMarkupParser()
+    parser.feed(html)
+    attributes = {
+        attrs.get("id"): (tag, attrs)
+        for tag, attrs in parser.attributes
+        if attrs.get("id")
+    }
+
+    assert attributes["model-select"][0] == "select"
+    assert attributes["model-select"][1]["aria-label"]
+    assert attributes["refresh-models-button"][1]["type"] == "button"
+    assert attributes["refresh-models-button"][1]["aria-label"]
+    assert attributes["model-catalog-status"][1]["role"] == "status"
+    assert attributes["model-catalog-status"][1]["aria-live"] == "polite"
+    assert html.index('class="composer-actions"') < html.index('id="model-control"')
+    assert html.index('id="model-control"') < html.index("Enter 发送")
+    assert "model-control" in css
+    assert "model-select" in css
+    assert "innerHTML" not in gui_source("app.js")
 
 
 def test_gui_unverified_terminal_card_uses_safe_text_contract() -> None:
@@ -188,11 +216,15 @@ def test_document_bootstrap_html_escapes_the_access_token() -> None:
     assert "token&amp;quot;&lt;tag&gt;&quot;" in response.text
 
 
-def test_document_projects_only_the_escaped_workspace_folder_name() -> None:
+def test_document_projects_the_escaped_absolute_workspace_path(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "folder&'name"
+    workspace.mkdir()
     response = asyncio.run(
         request(
             make_app(
-                workspace=Path("private-parent") / 'folder<&"',
+                workspace=workspace,
             ),
             "GET",
             "/",
@@ -200,12 +232,12 @@ def test_document_projects_only_the_escaped_workspace_folder_name() -> None:
         )
     )
 
+    escaped = html.escape(str(workspace.resolve()), quote=True)
     assert response.status_code == 200
-    assert "private-parent" not in response.text
-    assert "folder&lt;&amp;&quot;" in response.text
-    assert "__CODING_AGENT_WORKSPACE_NAME__" not in response.text
+    assert response.text.count(escaped) == 2
+    assert "__CODING_AGENT_WORKSPACE_PATH__" not in response.text
     assert "MiniCodex" in response.text
-    assert "Coding Agent</p>" not in response.text
+    assert 'id="workspace-name"' not in response.text
 
 
 def test_document_rejects_invalid_host_and_origin_without_bearer() -> None:
@@ -361,10 +393,13 @@ def test_skill_panel_is_compact_collapsed_and_accessibly_expandable() -> None:
 
     toggle = attributes["skill-toggle"]
     panel = attributes["skill-panel"]
+    import_button = attributes["skill-import-button"]
     assert toggle["type"] == "button"
     assert toggle["aria-expanded"] == "false"
     assert toggle["aria-controls"] == "skill-panel"
     assert "hidden" in panel
+    assert import_button["class"] == "skill-import__button"
+    assert import_button["aria-label"] == "导入 Skill ZIP"
 
 
 def test_gui_palette_and_wide_central_layout_match_approved_design() -> None:
@@ -390,18 +425,42 @@ def test_gui_palette_and_wide_central_layout_match_approved_design() -> None:
     assert "https://" not in css.lower()
 
 
-def test_workspace_name_is_constrained_to_one_ellipsized_line() -> None:
+def test_workspace_path_is_folder_labeled_and_constrained_to_one_line() -> None:
+    source = gui_source("index.html")
     css = gui_source("styles.css")
 
-    assert ".brand-copy {" in css
-    brand_copy_rule = css.split(".brand-copy {", 1)[1].split("}", 1)[0]
-    assert "min-width: 0" in brand_copy_rule
-    assert ".workspace-name {" in css
-    workspace_rule = css.split(".workspace-name {", 1)[1].split("}", 1)[0]
-    assert "min-width: 0" in workspace_rule
-    assert "overflow: hidden" in workspace_rule
-    assert "text-overflow: ellipsis" in workspace_rule
-    assert "white-space: nowrap" in workspace_rule
+    assert 'id="workspace-path"' in source
+    assert 'class="workspace-path-icon"' in source
+    assert "workspace-path-fact" in source
+    assert 'id="workspace-name"' not in source
+    assert "#run-phase" not in css
+    brand_rule = css.split(".brand-name {", 1)[1].split("}", 1)[0]
+    assert "font-size: 20px" in brand_rule
+    workspace_rule = css.split("#workspace-path {", 1)[1].split("}", 1)[0]
+    for required in (
+        "min-width: 0",
+        "overflow: hidden",
+        "text-overflow: ellipsis",
+        "white-space: nowrap",
+    ):
+        assert required in workspace_rule
+
+
+def test_fenced_code_copy_control_is_compact_and_uses_safe_dom() -> None:
+    script = gui_source("app.js")
+    css = gui_source("styles.css")
+
+    assert "code-copy-button" in script
+    assert ".code-block {" in css
+    assert ".code-copy-button {" in css
+    code_block_rule = css.split(".code-block {", 1)[1].split("}", 1)[0]
+    assert "position: relative" in code_block_rule
+    copy_error_rule = css.split(
+        '.code-copy-button[data-copy-state="error"] {', 1
+    )[1].split("}", 1)[0]
+    assert "var(--color-failure)" in copy_error_rule
+    for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+        assert unsafe not in script
 
 
 def test_session_titles_are_larger_and_have_no_secondary_status_style() -> None:
@@ -443,3 +502,18 @@ def test_gui_responsive_drawer_focus_and_reduced_motion_are_explicit() -> None:
     assert "transform: translateX(-100%)" in css
     assert ":focus-visible" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
+
+
+def test_active_activity_indicator_is_scoped_and_honors_reduced_motion() -> None:
+    script = gui_source("app.js")
+    css = gui_source("styles.css")
+
+    assert "activity-card--active" in script
+    assert "activity-indicator" in script
+    assert "activity-indicator__dot" in script
+    assert ".activity-card--active {" in css
+    assert ".activity-indicator__dot {" in css
+    assert "@keyframes activity-indicator-pulse" in css
+    reduced_motion = css.split("@media (prefers-reduced-motion: reduce)", 1)[1]
+    assert ".activity-indicator__dot" in reduced_motion
+    assert "animation: none" in reduced_motion

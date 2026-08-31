@@ -29,6 +29,7 @@ from coding_agent.messages import (
 from coding_agent.model import (
     FatalModelError,
     ModelCallBudget,
+    ModelBudgetExceeded,
     ModelOutputLimitError,
     TransientModelError,
 )
@@ -151,6 +152,36 @@ def chunk(
 ) -> object:
     choice = ns(index=0, delta=delta, finish_reason=finish_reason)
     return ns(id=response_id, choices=[choice], usage=usage)
+
+
+def sync_response(
+    *,
+    text: str | None = "fallback answer",
+    tool_calls: list[object] | None = None,
+) -> object:
+    return ns(
+        id="chat-sync",
+        choices=[
+            ns(
+                finish_reason="tool_calls" if tool_calls else "stop",
+                message=ns(
+                    role="assistant",
+                    content=text,
+                    tool_calls=tool_calls,
+                    function_call=None,
+                ),
+            )
+        ],
+        usage=None,
+    )
+
+
+def sync_tool_call(call_id: str, name: str, arguments: str) -> object:
+    return ns(
+        id=call_id,
+        type="function",
+        function=ns(name=name, arguments=arguments),
+    )
 
 
 def tool_fragment(
@@ -308,6 +339,220 @@ def test_chat_complete_still_omits_stream() -> None:
     assert "stream" not in sdk.chat.completions.calls[0]
 
 
+def test_invalid_stream_before_public_text_uses_one_sync_attempt() -> None:
+    invalid_stream = FakeStream(
+        (chunk(delta=delta(), finish_reason=None),)
+    )
+    sdk = FakeSDK(invalid_stream, sync_response())
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=sdk,
+    )
+    budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=2)
+    events: list[ModelStreamEvent] = []
+
+    response = invoke_model_stream(
+        client,
+        ModelRequest(messages=(UserMessage("task"),)),
+        budget,
+        events.append,
+    )
+
+    assert response.text == "fallback answer"
+    assert (budget.logical_calls, budget.provider_attempts) == (1, 2)
+    assert [call.get("stream") for call in sdk.chat.completions.calls] == [
+        True,
+        None,
+    ]
+    assert [event.kind for event in events] == [
+        ModelStreamEventKind.RESPONSE_COMPLETED
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "raw_calls", "expected_calls"),
+    [
+        (
+            None,
+            [sync_tool_call("call-one", "read_file", '{"path":"a.py"}')],
+            (ToolCall("call-one", "read_file", {"path": "a.py"}),),
+        ),
+        (
+            None,
+            [
+                sync_tool_call("call-a", "read_file", '{"path":"a.py"}'),
+                sync_tool_call("call-b", "read_file", '{"path":"b.py"}'),
+            ],
+            (
+                ToolCall("call-a", "read_file", {"path": "a.py"}),
+                ToolCall("call-b", "read_file", {"path": "b.py"}),
+            ),
+        ),
+        (
+            "I will inspect.",
+            [sync_tool_call("call-one", "read_file", '{"path":"a.py"}')],
+            (ToolCall("call-one", "read_file", {"path": "a.py"}),),
+        ),
+    ],
+    ids=("single-tool", "multiple-tools", "text-and-tool"),
+)
+def test_hidden_invalid_stream_recovers_ordered_sync_tools(
+    text: str | None,
+    raw_calls: list[object],
+    expected_calls: tuple[ToolCall, ...],
+) -> None:
+    hidden_invalid_stream = FakeStream(
+        (
+            chunk(
+                delta=delta(
+                    tool_calls=[
+                        tool_fragment(
+                            0,
+                            call_type="function",
+                            name="read_file",
+                            arguments='{"path":"unfinished"}',
+                        )
+                    ]
+                ),
+                finish_reason="tool_calls",
+            ),
+        )
+    )
+    sdk = FakeSDK(
+        hidden_invalid_stream,
+        sync_response(text=text, tool_calls=raw_calls),
+    )
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=sdk,
+    )
+    budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=2)
+    events: list[ModelStreamEvent] = []
+
+    response = invoke_model_stream(
+        client,
+        ModelRequest(messages=(UserMessage("task"),)),
+        budget,
+        events.append,
+    )
+
+    assert response.text == text
+    assert response.tool_calls == expected_calls
+    assert (budget.logical_calls, budget.provider_attempts) == (1, 2)
+    assert [call.get("stream") for call in sdk.chat.completions.calls] == [
+        True,
+        None,
+    ]
+    assert [event.kind for event in events] == [
+        ModelStreamEventKind.RESPONSE_COMPLETED
+    ]
+
+
+def test_invalid_stream_and_invalid_sync_stop_after_two_attempts() -> None:
+    sdk = FakeSDK(
+        FakeStream((chunk(delta=delta(), finish_reason=None),)),
+        ns(id="bad", choices=[], usage=None),
+    )
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=sdk,
+    )
+
+    with pytest.raises(InvalidChatCompletionsResponseError):
+        client.stream(
+            ModelRequest(messages=(UserMessage("task"),)),
+            lambda event: None,
+        )
+
+    assert len(sdk.chat.completions.calls) == 2
+
+
+def test_invalid_stream_after_public_text_discards_without_sync() -> None:
+    stream = FakeStream(
+        (
+            chunk(delta=delta(content="partial")),
+            chunk(delta=delta(), finish_reason=None),
+        )
+    )
+    sdk = FakeSDK(stream, object())
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=sdk,
+    )
+    events: list[ModelStreamEvent] = []
+
+    with pytest.raises(InvalidChatCompletionsResponseError):
+        invoke_model_stream(
+            client,
+            ModelRequest(messages=(UserMessage("task"),)),
+            ModelCallBudget(),
+            events.append,
+        )
+
+    assert len(sdk.chat.completions.calls) == 1
+    assert events[-1].kind is ModelStreamEventKind.RESPONSE_DISCARDED
+
+
+def test_invalid_stream_sync_fallback_respects_provider_budget() -> None:
+    sdk = FakeSDK(
+        FakeStream((chunk(delta=delta(), finish_reason=None),)),
+        sync_response(),
+    )
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=sdk,
+    )
+    budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=1)
+
+    with pytest.raises(ModelBudgetExceeded):
+        invoke_model_stream(
+            client,
+            ModelRequest(messages=(UserMessage("task"),)),
+            budget,
+            lambda event: None,
+        )
+
+    assert len(sdk.chat.completions.calls) == 1
+    assert budget.provider_attempts == 1
+
+
+def test_invalid_stream_sync_fallback_transient_error_is_not_retried() -> None:
+    delays: list[float] = []
+    sdk = FakeSDK(
+        FakeStream((chunk(delta=delta(), finish_reason=None),)),
+        FakeTimeoutError("Authorization: Bearer private-provider-body"),
+        sync_response(text="unused"),
+    )
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=sdk,
+        sleeper=delays.append,
+    )
+
+    with pytest.raises(TransientModelError) as caught:
+        client.stream(
+            ModelRequest(messages=(UserMessage("task"),)),
+            lambda event: None,
+        )
+
+    assert len(sdk.chat.completions.calls) == 2
+    assert delays == []
+    assert "private" not in str(caught.value)
+    assert "private" not in repr(caught.value)
+
+
 def test_chat_stream_assembles_ordered_interleaved_tools_with_text_and_usage() -> None:
     stream = FakeStream(
         (
@@ -429,7 +674,7 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
 
 
 @pytest.mark.parametrize(
-    ("chunks", "reason"),
+    ("chunks", "reason", "has_public_text"),
     [
         (
             (
@@ -449,6 +694,7 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
                 ),
             ),
             "index",
+            False,
         ),
         (
             (
@@ -468,6 +714,7 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
                 ),
             ),
             "index",
+            False,
         ),
         (
             (
@@ -494,6 +741,7 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
                 ),
             ),
             "identifier",
+            False,
         ),
         (
             (
@@ -513,6 +761,7 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
                 ),
             ),
             "object",
+            False,
         ),
         (
             (
@@ -520,6 +769,7 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
                 chunk(delta=delta(), finish_reason="stop"),
             ),
             "duplicate finish",
+            True,
         ),
     ],
     ids=[
@@ -533,19 +783,49 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
 def test_chat_stream_rejects_invalid_tool_and_terminal_chunks(
     chunks: tuple[object, ...],
     reason: str,
+    has_public_text: bool,
 ) -> None:
+    stream = FakeStream(chunks)
+    sdk = FakeSDK(stream, sync_response())
     client = ChatCompletionsModelClient(
         model="test",
         api_key="not-real",
         base_url="https://example.test/v1",
-        sdk_client=FakeSDK(FakeStream(chunks)),
+        sdk_client=sdk,
     )
+    observations: list[object] = []
+    events: list[ModelStreamEvent] = []
+    budget = ModelCallBudget(observer=ns(observe_model=observations.append))
 
-    with pytest.raises(InvalidChatCompletionsResponseError, match=reason):
-        client.stream(
+    if has_public_text:
+        with pytest.raises(InvalidChatCompletionsResponseError, match=reason):
+            invoke_model_stream(
+                client,
+                ModelRequest(messages=(UserMessage("task"),)),
+                budget,
+                events.append,
+            )
+        assert len(sdk.chat.completions.calls) == 1
+        assert events[-1].kind is ModelStreamEventKind.RESPONSE_DISCARDED
+    else:
+        response = invoke_model_stream(
+            client,
             ModelRequest(messages=(UserMessage("task"),)),
-            lambda event: None,
+            budget,
+            events.append,
         )
+        assert response.text == "fallback answer"
+        assert len(sdk.chat.completions.calls) == 2
+        failed = [
+            item
+            for item in observations
+            if item.kind.value == "provider_failed"
+        ]
+        assert len(failed) == 1
+        assert failed[0].error_code == "invalid_model_response"
+        assert [event.kind for event in events] == [
+            ModelStreamEventKind.RESPONSE_COMPLETED
+        ]
 
 
 def test_chat_stream_rejects_legacy_refusal_and_non_function_tools() -> None:
@@ -566,21 +846,27 @@ def test_chat_stream_rejects_legacy_refusal_and_non_function_tools() -> None:
     )
 
     for invalid_delta in invalid_deltas:
+        sdk = FakeSDK(
+            FakeStream(
+                (
+                    chunk(delta=delta(content="public")),
+                    chunk(delta=invalid_delta, finish_reason="tool_calls"),
+                )
+            ),
+            sync_response(text="unused"),
+        )
         client = ChatCompletionsModelClient(
             model="test",
             api_key="not-real",
             base_url="https://example.test/v1",
-            sdk_client=FakeSDK(
-                FakeStream(
-                    (chunk(delta=invalid_delta, finish_reason="tool_calls"),)
-                )
-            ),
+            sdk_client=sdk,
         )
         with pytest.raises(InvalidChatCompletionsResponseError):
             client.stream(
                 ModelRequest(messages=(UserMessage("task"),)),
                 lambda event: None,
             )
+        assert len(sdk.chat.completions.calls) == 1
 
 
 def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
@@ -610,7 +896,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
 
 
 @pytest.mark.parametrize(
-    ("chunks", "reason"),
+    ("chunks", "reason", "has_public_text"),
     [
         (
             (
@@ -630,6 +916,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "index",
+            False,
         ),
         (
             (
@@ -648,6 +935,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "incomplete",
+            False,
         ),
         (
             (
@@ -666,6 +954,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "incomplete",
+            False,
         ),
         (
             (
@@ -690,6 +979,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "name",
+            False,
         ),
         (
             (
@@ -709,6 +999,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "valid JSON",
+            False,
         ),
         (
             (
@@ -735,10 +1026,12 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "duplicate function call id",
+            False,
         ),
         (
             (chunk(delta=delta(content="unterminated")),),
             "finish reason",
+            True,
         ),
         (
             (
@@ -750,6 +1043,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "response id",
+            True,
         ),
         (
             (
@@ -761,6 +1055,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "usage",
+            True,
         ),
         (
             (
@@ -774,6 +1069,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "choices",
+            False,
         ),
         (
             (
@@ -786,6 +1082,7 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
                 ),
             ),
             "choice index",
+            False,
         ),
     ],
     ids=[
@@ -805,20 +1102,49 @@ def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
 def test_chat_stream_rejects_additional_invalid_shapes(
     chunks: tuple[object, ...],
     reason: str,
+    has_public_text: bool,
 ) -> None:
     stream = FakeStream(chunks)
+    sdk = FakeSDK(stream, sync_response())
     client = ChatCompletionsModelClient(
         model="test",
         api_key="not-real",
         base_url="https://example.test/v1",
-        sdk_client=FakeSDK(stream),
+        sdk_client=sdk,
     )
+    observations: list[object] = []
+    events: list[ModelStreamEvent] = []
+    budget = ModelCallBudget(observer=ns(observe_model=observations.append))
 
-    with pytest.raises(InvalidChatCompletionsResponseError, match=reason):
-        client.stream(
+    if has_public_text:
+        with pytest.raises(InvalidChatCompletionsResponseError, match=reason):
+            invoke_model_stream(
+                client,
+                ModelRequest(messages=(UserMessage("task"),)),
+                budget,
+                events.append,
+            )
+        assert len(sdk.chat.completions.calls) == 1
+        assert events[-1].kind is ModelStreamEventKind.RESPONSE_DISCARDED
+    else:
+        response = invoke_model_stream(
+            client,
             ModelRequest(messages=(UserMessage("task"),)),
-            lambda event: None,
+            budget,
+            events.append,
         )
+        assert response.text == "fallback answer"
+        assert len(sdk.chat.completions.calls) == 2
+        failed = [
+            item
+            for item in observations
+            if item.kind.value == "provider_failed"
+        ]
+        assert len(failed) == 1
+        assert failed[0].error_code == "invalid_model_response"
+        assert [event.kind for event in events] == [
+            ModelStreamEventKind.RESPONSE_COMPLETED
+        ]
 
     assert stream.closed is True
 
@@ -1068,7 +1394,7 @@ def test_chat_stream_cleanup_failure_after_success_is_stable() -> None:
 
 def test_chat_stream_cleanup_failure_does_not_replace_primary_error() -> None:
     stream = FakeStream(
-        (InvalidChatCompletionsResponseError("primary stable"),),
+        (ModelOutputLimitError("primary stable"),),
         close_error=OSError("private cleanup path"),
     )
     client = ChatCompletionsModelClient(
@@ -1078,7 +1404,7 @@ def test_chat_stream_cleanup_failure_does_not_replace_primary_error() -> None:
         sdk_client=FakeSDK(stream),
     )
 
-    with pytest.raises(InvalidChatCompletionsResponseError, match="primary stable"):
+    with pytest.raises(ModelOutputLimitError, match="primary stable"):
         client.stream(
             ModelRequest(messages=(UserMessage("task"),)),
             lambda event: None,

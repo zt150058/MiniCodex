@@ -8,6 +8,7 @@ from coding_agent.cli import build_parser
 from coding_agent.report import FinalReport
 from coding_agent.run_mode import RunMode
 from coding_agent.tools.filesystem import (
+    CreateDirectoryTool,
     ListDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
@@ -175,6 +176,7 @@ def test_usage_matches_parser_tools_exit_codes_and_log_path() -> None:
     actual_modify_tools = [
         ListDirectoryTool.name,
         ReadFileTool.name,
+        CreateDirectoryTool.name,
         ReplaceTextTool.name,
         WriteFileTool.name,
         RunCommandTool.name,
@@ -250,6 +252,7 @@ def test_usage_documents_exact_run_modes_tools_and_terminal_meanings() -> None:
     modify_tools = (
         ListDirectoryTool.name,
         ReadFileTool.name,
+        CreateDirectoryTool.name,
         ReplaceTextTool.name,
         WriteFileTool.name,
         RunCommandTool.name,
@@ -264,6 +267,25 @@ def test_usage_documents_exact_run_modes_tools_and_terminal_meanings() -> None:
         assert f"`{tool}`" in usage
     assert "只读模式不会运行 `--verify`" in usage
     assert "同一会话的每条消息可以重新选择模式" in usage
+
+
+def test_docs_lock_directory_integrity_and_chat_stream_fallback_contracts() -> None:
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+    api = _read_utf8(ROOT / "docs" / "OPENAI_API.md")
+    agents = _read_utf8(ROOT / "AGENTS.md")
+
+    assert (
+        "| `create_directory` | 一次只创建一级目录，不递归创建父目录；"
+        in usage
+    )
+    assert "修改批次结束后" in usage
+    assert "本地结构完整性" in usage
+    assert "不代表测试、编译或用户指定验证已经通过" in usage
+    assert "尚未向用户公开文本" in api
+    assert "最多执行一次同步请求" in api
+    assert "已经公开任何文本后不会同步回退" in api
+    assert "exactly six" not in agents
+    assert "恰好六个" not in agents
 
 
 def test_readme_submission_stays_within_limit_and_names_read_only_mode() -> None:
@@ -373,6 +395,35 @@ def test_local_web_gui_is_documented_with_its_real_security_boundary() -> None:
 
     assert "安全诊断" not in usage
     assert "Skill 诊断" not in usage
+
+
+def test_public_docs_lock_web_chat_completions_model_selection_contract() -> None:
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+
+    for required in (
+        "只在 Chat Completions mode",
+        "所有返回且合法的模型 ID",
+        "启动参数指定的默认模型",
+        "只影响下一次提交",
+        "Responses mode 不显示",
+        "GET /models",
+        "浏览器不会接触 API key 或 base URL",
+    ):
+        assert required in usage
+
+
+def test_public_docs_explain_task31_local_gui_affordances_and_privacy_boundary() -> None:
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+
+    for required in (
+        "工作区绝对路径",
+        "代码块右上角",
+        "已复制",
+        "当前活动回复",
+        "减少动态效果",
+        "不写入 REST、SSE、SQLite、JSONL 或模型上下文",
+    ):
+        assert required in usage
 
 
 def test_public_docs_lock_local_skill_zip_import_contract() -> None:

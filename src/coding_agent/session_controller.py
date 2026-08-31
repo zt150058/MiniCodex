@@ -56,6 +56,11 @@ from coding_agent.skills import (
 from coding_agent.skill_packages import SkillPackageError, SkillPackageInstaller
 from coding_agent.logging import EventType, RunEvent
 from coding_agent.budget import BudgetProfile, limits_for_profile
+from coding_agent.model_catalog import (
+    ModelCatalog,
+    ModelCatalogError,
+    ModelCatalogView,
+)
 from coding_agent.run_mode import RunMode
 from coding_agent.safety import SafetyCode
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
@@ -109,6 +114,7 @@ class RunHandle:
     run_id: str
     run_mode: RunMode
     budget_profile: BudgetProfile
+    model_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +191,7 @@ class SessionController:
         store: SessionStore,
         lease: WorkspaceSessionLease,
         executor: SessionRunExecutor,
+        model_catalog: ModelCatalog,
         event_hub: SessionEventHub,
         narrative_renderer: SessionNarrativeRenderer = SessionNarrativeRenderer(),
         thread_factory: ThreadFactory = default_thread_factory,
@@ -199,12 +206,16 @@ class SessionController:
         if not callable(thread_factory):
             raise TypeError("thread_factory must be callable")
         try:
+            if not isinstance(model_catalog, ModelCatalog):
+                raise TypeError("model_catalog must implement ModelCatalog")
+            if model_catalog.default_model_id != executor.default_model_id:
+                raise ValueError("model catalog and executor defaults differ")
             identities = {
                 _workspace_identity(store.workspace),
                 _workspace_identity(lease.workspace),
                 _workspace_identity(executor.workspace),
             }
-        except (AttributeError, TypeError):
+        except (AttributeError, TypeError, ValueError, ModelCatalogError):
             raise SessionControllerError("invalid_session_state") from None
         if len(identities) != 1:
             raise SessionControllerError("invalid_session_state")
@@ -241,6 +252,7 @@ class SessionController:
         self._store = store
         self._lease = lease
         self._executor = executor
+        self._model_catalog = model_catalog
         self._event_hub = event_hub
         self._narrative_renderer = narrative_renderer
         self._thread_factory = thread_factory
@@ -260,6 +272,7 @@ class SessionController:
         workspace: Path,
         executor: SessionRunExecutor,
         *,
+        model_catalog: ModelCatalog,
         sensitive_values: tuple[str, ...] = (),
         utc_clock: Callable[[], datetime] = utc_now,
         thread_factory: ThreadFactory = default_thread_factory,
@@ -270,9 +283,13 @@ class SessionController:
         ),
     ) -> SessionController:
         try:
+            if not isinstance(model_catalog, ModelCatalog):
+                raise TypeError("model_catalog must implement ModelCatalog")
+            if model_catalog.default_model_id != executor.default_model_id:
+                raise ValueError("model catalog and executor defaults differ")
             requested_identity = _workspace_identity(workspace)
             executor_identity = _workspace_identity(executor.workspace)
-        except (AttributeError, TypeError):
+        except (AttributeError, TypeError, ValueError, ModelCatalogError):
             raise SessionControllerError("invalid_session_state") from None
         if requested_identity != executor_identity:
             raise SessionControllerError("invalid_session_state")
@@ -303,6 +320,7 @@ class SessionController:
                 store=store,
                 lease=lease,
                 executor=executor,
+                model_catalog=model_catalog,
                 event_hub=SessionEventHub(
                     utc_clock=utc_clock,
                     sensitive_values=sensitive_values,
@@ -328,6 +346,17 @@ class SessionController:
     @property
     def workspace(self) -> Path:
         return self._store.workspace
+
+    def list_models(self, *, refresh: bool = False) -> ModelCatalogView:
+        return self._model_catalog.list_models(refresh=refresh)
+
+    def _resolve_model(self, requested_model_id: str | None) -> str:
+        try:
+            return self._model_catalog.resolve(requested_model_id)
+        except ModelCatalogError as exc:
+            if exc.code == "model_not_available":
+                raise SessionControllerError("model_not_available") from None
+            raise
 
     @staticmethod
     def _translate_store_error(exc: SessionStoreError) -> SessionControllerError:
@@ -414,6 +443,7 @@ class SessionController:
         message: str,
         *,
         skill_ids: tuple[str, ...] = (),
+        model_id: str | None = None,
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
@@ -421,6 +451,7 @@ class SessionController:
             raise TypeError("run_mode must be RunMode")
         if type(budget_profile) is not BudgetProfile:
             raise TypeError("budget_profile must be BudgetProfile")
+        resolved_model_id = self._resolve_model(model_id)
         try:
             initial = self._narrative_renderer.render((), message)
         except (SessionError, TypeError, ValueError) as exc:
@@ -440,6 +471,7 @@ class SessionController:
             try:
                 submission = self._store.create_session(
                     message,
+                    model_id=resolved_model_id,
                     selected_skills=selected_skills,
                     run_mode=run_mode,
                     budget_profile=budget_profile,
@@ -449,6 +481,7 @@ class SessionController:
             request = SessionRunRequest(
                 session_id=submission.session.session_id,
                 run_id=submission.run.run_id,
+                model_id=resolved_model_id,
                 current_message=message,
                 initial_user_message=initial,
                 skill_bundle=bundle,
@@ -467,6 +500,7 @@ class SessionController:
         session_id: str,
         message: str,
         *,
+        model_id: str | None = None,
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
@@ -474,6 +508,7 @@ class SessionController:
             raise TypeError("run_mode must be RunMode")
         if type(budget_profile) is not BudgetProfile:
             raise TypeError("budget_profile must be BudgetProfile")
+        resolved_model_id = self._resolve_model(model_id)
         admission = self._reserve_admission()
         try:
             try:
@@ -504,6 +539,7 @@ class SessionController:
                 submission = self._store.submit_message(
                     session_id,
                     message,
+                    model_id=resolved_model_id,
                     selected_skills=selected_skills,
                     run_mode=run_mode,
                     budget_profile=budget_profile,
@@ -513,6 +549,7 @@ class SessionController:
             request = SessionRunRequest(
                 session_id=submission.session.session_id,
                 run_id=submission.run.run_id,
+                model_id=resolved_model_id,
                 current_message=message,
                 initial_user_message=initial,
                 skill_bundle=bundle,
@@ -585,10 +622,11 @@ class SessionController:
                 raise SessionControllerError("thread_start_failed") from None
             raise
         return RunHandle(
-            request.session_id,
-            request.run_id,
-            request.run_mode,
-            request.budget_profile,
+            session_id=request.session_id,
+            run_id=request.run_id,
+            run_mode=request.run_mode,
+            budget_profile=request.budget_profile,
+            model_id=request.model_id,
         )
 
     def _controller_failure(self, run_id: str) -> SessionRunResult:
@@ -947,8 +985,29 @@ class SessionController:
             self._await_cancellation_phase(active)
             return True
 
+        def run_event_handler(event: RunEvent) -> None:
+            if not isinstance(event, RunEvent):
+                raise TypeError("run event must be RunEvent")
+            if (
+                event.event_type is EventType.TOOL_CALL_STARTED
+                and pending_text
+            ):
+                pending_text.clear()
+                self._publish(
+                    active,
+                    SessionUpdateKind.ASSISTANT_TEXT_DISCARDED,
+                    {"reason": "tool_response_narration"},
+                )
+            self._run_event_handler(active, event)
+
         try:
-            self._store.start_run(active.request.run_id)
+            started = self._store.start_run(active.request.run_id)
+            if (
+                started.run_mode is not active.request.run_mode
+                or started.budget_profile is not active.request.budget_profile
+                or started.model_id != active.request.model_id
+            ):
+                raise SessionControllerError("invalid_session_state")
             self._event_hub.publish(
                 SessionUpdateKind.RUN_STARTED,
                 {"status": SessionRunStatus.RUNNING.value},
@@ -959,7 +1018,7 @@ class SessionController:
                 stream_handler=stream_handler,
                 confirmed_text_handler=confirmed_text_handler,
                 cancellation_requested=cancellation_requested,
-                run_event_handler=lambda event: self._run_event_handler(active, event),
+                run_event_handler=run_event_handler,
             )
             result = SessionRunResult(
                 run_id=active.request.run_id,

@@ -138,6 +138,24 @@ def test_decision_checkpoint_accepts_recovery_reasons(reason: str) -> None:
     assert update.data["reason"] == reason
 
 
+def test_decision_checkpoint_accepts_post_mutation_integrity() -> None:
+    update = SessionUpdate(
+        schema_version=SESSION_UPDATE_SCHEMA_VERSION,
+        session_id=SESSION_ID,
+        run_id=RUN_ID,
+        sequence=1,
+        timestamp_utc="2026-08-29T08:00:00.000000Z",
+        kind=SessionUpdateKind.DECISION_CHECKPOINT,
+        data={
+            "reason": "post_mutation_integrity",
+            "phase": "verify",
+            "main_calls_remaining": 20,
+        },
+    )
+
+    assert update.data["reason"] == "post_mutation_integrity"
+
+
 @pytest.mark.parametrize(
     ("kind", "data"),
     [

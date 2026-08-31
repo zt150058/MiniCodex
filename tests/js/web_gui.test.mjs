@@ -33,17 +33,27 @@ test("model markup remains text and cannot create an element", () => {
 test("closed fenced code creates explicit pre and code nodes", () => {
   const document = new TestDocument();
   const container = document.createElement("section");
+  const copies = [];
 
   gui.appendMessage(
     document,
     container,
     "assistant",
     "before\n```py\nprint(1)\n```\nafter",
+    null,
+    (_button, text) => copies.push(text),
   );
 
   assert.equal(findElements(container, "pre").length, 1);
   assert.equal(findElements(container, "code")[0].textContent, "print(1)\n");
-  assert.equal(container.textContent, "MiniCodexbefore\nprint(1)\nafter");
+  const copyButtons = findElements(container, "button").filter(
+    (button) => button.classList.contains("code-copy-button"),
+  );
+  assert.equal(copyButtons.length, 1);
+  assert.equal(copyButtons[0].textContent, "复制");
+  copyButtons[0].dispatchEvent({ type: "click" });
+  assert.deepEqual(copies, ["print(1)"]);
+  assert.equal(container.textContent, "MiniCodexbefore\n复制print(1)\nafter");
 });
 
 
@@ -54,6 +64,7 @@ test("an unclosed fence remains plain text", () => {
   gui.appendMessage(document, container, "assistant", "before\n```py\nsecret");
 
   assert.equal(findElements(container, "pre").length, 0);
+  assert.equal(findElements(container, "button").length, 0);
   assert.equal(container.textContent, "MiniCodexbefore\n```py\nsecret");
 });
 
@@ -194,6 +205,7 @@ test("user messages preserve Markdown source as plain text", () => {
   for (const tag of ["h1", "strong", "table", "p"]) {
     assert.equal(findElements(container, tag).length, 0);
   }
+  assert.equal(findElements(container, "button").length, 0);
 });
 
 
@@ -228,6 +240,80 @@ test("known activity renders only allowlisted safe fields", () => {
 });
 
 
+test("tool activity renders real exit codes", () => {
+  const document = new TestDocument();
+  const failed = document.createElement("section");
+  const passed = document.createElement("section");
+  const fileTool = document.createElement("section");
+
+  gui.appendActivity(document, failed, "tool_finished", {
+    tool_name: "run_command",
+    status: "ok",
+    duration_ms: 188,
+    exit_code: 1,
+  });
+  gui.appendActivity(document, passed, "tool_finished", {
+    tool_name: "run_command",
+    status: "ok",
+    duration_ms: 42,
+    exit_code: 0,
+  });
+  gui.appendActivity(document, fileTool, "tool_finished", {
+    tool_name: "read_file",
+    status: "ok",
+    duration_ms: 3,
+    exit_code: null,
+  });
+
+  assert.equal(failed.textContent.includes("exit 1"), true);
+  assert.equal(failed.textContent.includes("· ok ·"), false);
+  assert.equal(passed.textContent.includes("exit 0"), true);
+  assert.equal(passed.textContent.includes("· ok ·"), false);
+  assert.equal(fileTool.textContent.includes("· ok ·"), true);
+});
+
+
+test("only active activity cards include an inaccessible three-dot indicator", () => {
+  const document = new TestDocument();
+  const container = document.createElement("section");
+
+  const historyCard = gui.appendActivity(
+    document,
+    container,
+    "tool_finished",
+    { tool_name: "pytest", status: "ok", duration_ms: 27 },
+  );
+  const activeCard = gui.appendActivity(
+    document,
+    container,
+    "model_progress",
+    { content: "Still working" },
+    { active: true },
+  );
+
+  assert.equal(historyCard.classList.contains("activity-card--active"), false);
+  assert.equal(
+    findElements(historyCard, "span").some(
+      (element) => element.classList.contains("activity-indicator"),
+    ),
+    false,
+  );
+  assert.equal(activeCard.classList.contains("activity-card--active"), true);
+  const indicators = findElements(activeCard, "span").filter(
+    (element) => element.classList.contains("activity-indicator"),
+  );
+  assert.equal(indicators.length, 1);
+  assert.equal(indicators[0].getAttribute("aria-hidden"), "true");
+  assert.equal(
+    findElements(indicators[0], "span").filter(
+      (element) => element.classList.contains("activity-indicator__dot"),
+    ).length,
+    3,
+  );
+  assert.equal(container.textContent.includes("Still working"), true);
+});
+
+
 test("bootstrap token is consumed once and its node is removed", () => {
   const document = new TestDocument();
   const meta = document.createElement("meta");
@@ -248,16 +334,14 @@ test("run header uses only server status and never invents success", () => {
   const document = new TestDocument();
   const elements = {
     runStatus: document.createElement("span"),
-    runPhase: document.createElement("span"),
     cancelButton: document.createElement("button"),
   };
 
-  gui.renderRunHeader(document, elements, { status: "running" }, "tool");
+  gui.renderRunHeader(document, elements, { status: "running" });
   assert.equal(elements.runStatus.textContent, "运行中");
-  assert.equal(elements.runPhase.textContent, "执行工具");
   assert.equal(elements.cancelButton.disabled, false);
 
-  gui.renderRunHeader(document, elements, { status: "future_status" }, "future");
+  gui.renderRunHeader(document, elements, { status: "future_status" });
   assert.equal(elements.runStatus.textContent, "状态未知");
   assert.equal(elements.runStatus.textContent.includes("成功"), false);
   assert.equal(elements.cancelButton.disabled, true);
@@ -306,11 +390,18 @@ test("mutation API methods send exact paths and JSON bodies once", async () => {
       ["workspace:review"],
       "read_only",
       "deep",
+      "chat-selected",
     ),
     responses[0],
   );
   assert.deepEqual(
-    await api.submitFollowUp("s1", "continue", "modify", "standard"),
+    await api.submitFollowUp(
+      "s1",
+      "continue",
+      "modify",
+      "standard",
+      "chat-follow",
+    ),
     responses[1],
   );
   assert.deepEqual(
@@ -336,8 +427,14 @@ test("mutation API methods send exact paths and JSON bodies once", async () => {
         skill_ids: ["workspace:review"],
         run_mode: "read_only",
         budget_profile: "deep",
+        model_id: "chat-selected",
       },
-      { message: "continue", run_mode: "modify", budget_profile: "standard" },
+      {
+        message: "continue",
+        run_mode: "modify",
+        budget_profile: "standard",
+        model_id: "chat-follow",
+      },
       { skill_ids: ["workspace:review"] },
       {},
     ],
@@ -400,7 +497,7 @@ test("delete session failure is stable and is never retried", async () => {
 });
 
 
-test("session and skill reads use exact authenticated routes", async () => {
+test("session skill and model reads use exact authenticated routes", async () => {
   const calls = [];
   const api = gui.createApiClient({
     accessToken: "fixed-test-token",
@@ -412,12 +509,14 @@ test("session and skill reads use exact authenticated routes", async () => {
 
   await api.loadSession("session/value");
   await api.listSkills();
+  await api.listModels(true);
 
   assert.deepEqual(
     calls.map((request) => request.url),
     [
       "http://local.invalid/api/v1/sessions/session%2Fvalue",
       "http://local.invalid/api/v1/skills",
+      "http://local.invalid/api/v1/models?refresh=true",
     ],
   );
   assert.equal(
@@ -684,6 +783,14 @@ test("initial UI state is safe exact and independent", () => {
     selectedSkillIds: [],
     selectedRunMode: "modify",
     selectedBudgetProfile: "standard",
+    modelCatalog: {
+      enabled: false,
+      status: "disabled",
+      defaultModelId: null,
+      modelIds: [],
+      errorCode: null,
+    },
+    selectedModelId: null,
     activeRunId: null,
     lastSequence: 0,
     provisionalText: "",
@@ -729,7 +836,7 @@ function controllerFixture() {
     skillImportStatus: ["p", "skill-import-status"],
     conversationTitle: ["h1", "conversation-title"],
     runStatus: ["span", "run-status"],
-    runPhase: ["span", "run-phase"],
+    workspacePath: ["span", "workspace-path"],
     runElapsed: ["span", "run-elapsed"],
     cancelButton: ["button", "cancel-run-button"],
     conversationLog: ["section", "conversation-log"],
@@ -744,6 +851,10 @@ function controllerFixture() {
     budgetProfileControl: ["div", "budget-profile-control"],
     budgetProfileStandardButton: ["button", "budget-profile-standard"],
     budgetProfileDeepButton: ["button", "budget-profile-deep"],
+    modelControl: ["div", "model-control"],
+    modelSelect: ["select", "model-select"],
+    refreshModelsButton: ["button", "refresh-models-button"],
+    modelCatalogStatus: ["span", "model-catalog-status"],
   })) {
     elements[name] = document.createElement(tag);
     elements[name].setAttribute("id", id);
@@ -763,6 +874,9 @@ function controllerFixture() {
   elements.runModeReadOnlyButton.dataset.runMode = "read_only";
   elements.budgetProfileStandardButton.dataset.budgetProfile = "standard";
   elements.budgetProfileDeepButton.dataset.budgetProfile = "deep";
+  elements.workspacePath.replaceChildren(
+    document.createTextNode("D:\\code\\coding_agent"),
+  );
   elements.emptyState = document.createElement("div");
   elements.emptyState.setAttribute("id", "empty-state");
   elements.emptyState.className = "empty-state";
@@ -770,6 +884,327 @@ function controllerFixture() {
   elements.conversationLog.append(elements.emptyState);
   return { document, elements };
 }
+
+
+function readyModelCatalog(modelIds = ["chat-default", "other-model"]) {
+  return {
+    enabled: true,
+    status: "ready",
+    default_model_id: "chat-default",
+    model_ids: modelIds,
+    error_code: null,
+  };
+}
+
+
+test("initialization loads the model catalog and selects its default", async () => {
+  const { document, elements } = controllerFixture();
+  const calls = [];
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async (refresh) => {
+      calls.push(refresh);
+      return readyModelCatalog();
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+
+  await controller.initialize();
+
+  assert.deepEqual(calls, [false]);
+  assert.equal(controller.getState().selectedModelId, "chat-default");
+  assert.equal(elements.modelControl.hidden, false);
+  assert.equal(elements.modelSelect.value, "chat-default");
+  assert.deepEqual(
+    findElements(elements.modelSelect, "option").map((option) => option.textContent),
+    ["chat-default", "other-model"],
+  );
+  controller.destroy();
+});
+
+
+test("unchanged model catalogs reuse existing options across control renders", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => readyModelCatalog(),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  const originalOptions = findElements(elements.modelSelect, "option");
+
+  elements.modelSelect.value = "other-model";
+  elements.modelSelect.dispatchEvent({ type: "change" });
+
+  assert.equal(findElements(elements.modelSelect, "option")[0], originalOptions[0]);
+  assert.equal(findElements(elements.modelSelect, "option")[1], originalOptions[1]);
+  controller.destroy();
+});
+
+
+test("Responses mode hides model controls", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => ({
+      enabled: false,
+      status: "disabled",
+      default_model_id: "responses-default",
+      model_ids: ["responses-default"],
+      error_code: null,
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+
+  await controller.initialize();
+
+  assert.equal(elements.modelControl.hidden, true);
+  assert.equal(controller.getState().selectedModelId, null);
+  controller.destroy();
+});
+
+
+test("refresh replaces options and falls back when selection disappeared", async () => {
+  const { document, elements } = controllerFixture();
+  let calls = 0;
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => {
+      calls += 1;
+      return calls === 1
+        ? readyModelCatalog(["chat-default", "other-model"])
+        : readyModelCatalog(["chat-default", "new-model"]);
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.modelSelect.value = "other-model";
+  elements.modelSelect.dispatchEvent({ type: "change" });
+
+  elements.refreshModelsButton.dispatchEvent({ type: "click" });
+  await controller.whenIdle();
+
+  assert.equal(calls, 2);
+  assert.equal(controller.getState().selectedModelId, "chat-default");
+  assert.deepEqual(
+    findElements(elements.modelSelect, "option").map((option) => option.textContent),
+    ["chat-default", "new-model"],
+  );
+  controller.destroy();
+});
+
+
+test("failed refresh keeps the last good model choices and selection", async () => {
+  const { document, elements } = controllerFixture();
+  let calls = 0;
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => {
+      calls += 1;
+      if (calls === 1) return readyModelCatalog();
+      throw new Error("provider unavailable");
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.modelSelect.value = "other-model";
+  elements.modelSelect.dispatchEvent({ type: "change" });
+
+  elements.refreshModelsButton.dispatchEvent({ type: "click" });
+  await controller.whenIdle();
+
+  assert.equal(controller.getState().selectedModelId, "other-model");
+  assert.deepEqual(
+    findElements(elements.modelSelect, "option").map((option) => option.textContent),
+    ["chat-default", "other-model"],
+  );
+  assert.match(elements.modelCatalogStatus.textContent, /过期/);
+  controller.destroy();
+});
+
+
+test("stale and unavailable catalogs keep safe usable choices", async () => {
+  for (const status of ["stale", "unavailable"]) {
+    const { document, elements } = controllerFixture();
+    const api = {
+      listSessions: async () => ({ sessions: [] }),
+      listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+      listModels: async () => ({
+        ...readyModelCatalog(["chat-default"]),
+        status,
+        error_code: "model_catalog_unavailable",
+      }),
+    };
+    const controller = gui.createUiController({ document, elements, api });
+    await controller.initialize();
+
+    assert.equal(elements.modelControl.hidden, false);
+    assert.equal(elements.modelSelect.value, "chat-default");
+    assert.equal(elements.modelCatalogStatus.textContent.length > 0, true);
+    controller.destroy();
+  }
+});
+
+
+test("selected model is snapshotted into create requests", async () => {
+  const { document, elements } = controllerFixture();
+  const calls = [];
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => readyModelCatalog(),
+    createSession: async (...args) => {
+      calls.push(args);
+      return { session_id: "s1", run_id: "r1", model_id: args.at(-1) };
+    },
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Run", status: "running", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "running", model_id: "other-model" }],
+      events: [],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer: async () => "terminal",
+  });
+  await controller.initialize();
+  elements.modelSelect.value = "other-model";
+  elements.modelSelect.dispatchEvent({ type: "change" });
+  elements.messageInput.value = "Inspect";
+  elements.messageComposer.dispatchEvent(submitEvent());
+  await controller.whenIdle();
+
+  assert.equal(calls[0].at(-1), "other-model");
+  assert.equal(controller.getState().selectedModelId, "other-model");
+  controller.destroy();
+});
+
+
+test("selected model is snapshotted into follow-up requests", async () => {
+  const { document, elements } = controllerFixture();
+  const calls = [];
+  let loads = 0;
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Existing", status: "idle", last_run_id: "r0" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => readyModelCatalog(),
+    loadSession: async () => {
+      loads += 1;
+      return {
+        session: {
+          session_id: "s1",
+          title: "Existing",
+          status: loads === 1 ? "idle" : "running",
+          last_run_id: loads === 1 ? "r0" : "r1",
+        },
+        runs: [{
+          run_id: loads === 1 ? "r0" : "r1",
+          status: loads === 1 ? "succeeded" : "running",
+        }],
+        events: [],
+        skill_ids: [],
+      };
+    },
+    submitFollowUp: async (...args) => {
+      calls.push(args);
+      return { session_id: "s1", run_id: "r1", model_id: args.at(-1) };
+    },
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer: async () => "terminal",
+  });
+  await controller.initialize();
+  elements.modelSelect.value = "other-model";
+  elements.modelSelect.dispatchEvent({ type: "change" });
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: sessionSelectButtons(elements.sessionList)[0],
+  });
+  await controller.whenIdle();
+  assert.equal(controller.getState().selectedModelId, "other-model");
+  elements.messageInput.value = "Continue";
+  elements.messageComposer.dispatchEvent(submitEvent());
+  await controller.whenIdle();
+
+  assert.equal(calls[0].at(-1), "other-model");
+  controller.destroy();
+});
+
+
+test("initial model request failure does not block sessions or skills", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Visible", status: "idle", last_run_id: null }],
+    }),
+    listSkills: async () => ({
+      skills: [{ skill_id: "review", name: "Review", description: "Review", source: "user" }],
+      diagnostics: [],
+      usable: true,
+    }),
+    listModels: async () => {
+      throw new gui.WebClientError("model_catalog_unavailable");
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+
+  await controller.initialize();
+
+  assert.equal(elements.sessionList.textContent.includes("Visible"), true);
+  assert.equal(elements.skillList.textContent.includes("Review"), true);
+  assert.equal(elements.modelControl.hidden, true);
+  controller.destroy();
+});
+
+
+test("active sessions disable select and refresh", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", status: "running", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => readyModelCatalog(),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+
+  assert.equal(elements.modelSelect.disabled, true);
+  assert.equal(elements.refreshModelsButton.disabled, true);
+  controller.destroy();
+});
+
+
+test("provider IDs render as text and never as HTML", async () => {
+  const { document, elements } = controllerFixture();
+  const malicious = "<img src=x onerror=alert(1)>";
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    listModels: async () => ({
+      ...readyModelCatalog(["chat-default", malicious]),
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+
+  assert.equal(elements.modelSelect.textContent.includes(malicious), true);
+  assert.deepEqual(findElements(elements.modelSelect, "img"), []);
+  controller.destroy();
+});
 
 
 function sessionSelectButtons(root) {
@@ -1797,6 +2232,135 @@ test("successful runs render only their last confirmed assistant text", async ()
 });
 
 
+test("code copy is single-flight and copies exact fenced text", async () => {
+  const { document, elements } = controllerFixture();
+  const writes = [];
+  const timers = [];
+  let resolveWrite;
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Code", status: "idle", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Code", status: "idle", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "succeeded", termination_reason: "completed" }],
+      events: [
+        { run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Show code" } },
+        {
+          run_id: "r1",
+          sequence: 2,
+          kind: "assistant_text_committed",
+          data: { content: "```js\nconst value = \"<img onerror=secret()>\";\n```" },
+        },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    clipboardWrite: (text) => {
+      writes.push(text);
+      return new Promise((resolve) => { resolveWrite = resolve; });
+    },
+    setTimeoutImpl: (callback, delay) => {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimeoutImpl: () => {},
+  });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+  const button = findElements(elements.conversationLog, "button").find(
+    (candidate) => candidate.classList.contains("code-copy-button"),
+  );
+
+  button.dispatchEvent({ type: "click" });
+  button.dispatchEvent({ type: "click" });
+  await Promise.resolve();
+
+  assert.deepEqual(writes, ['const value = "<img onerror=secret()>";']);
+  assert.equal(button.disabled, true);
+  assert.equal(button.textContent, "复制中…");
+  assert.equal(findElements(elements.conversationLog, "img").length, 0);
+
+  resolveWrite();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(button.textContent, "已复制");
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 1500);
+  timers[0].callback();
+  assert.equal(button.textContent, "复制");
+  assert.equal(button.disabled, false);
+  controller.destroy();
+});
+
+
+test("clipboard failure stays local and clears its reset timer on redraw", async () => {
+  const { document, elements } = controllerFixture();
+  const timers = [];
+  const cleared = [];
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Code", status: "idle", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Code", status: "idle", last_run_id: "r1" },
+      runs: [{ run_id: "r1", status: "succeeded", termination_reason: "completed" }],
+      events: [
+        { run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Show code" } },
+        { run_id: "r1", sequence: 2, kind: "assistant_text_committed", data: { content: "```py\nprint(1)\n```" } },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    clipboardWrite: async () => {
+      throw new Error("private clipboard detail");
+    },
+    setTimeoutImpl: (callback, delay) => {
+      timers.push({ callback, delay });
+      return 77;
+    },
+    clearTimeoutImpl: (timerId) => cleared.push(timerId),
+  });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+  const button = findElements(elements.conversationLog, "button").find(
+    (candidate) => candidate.classList.contains("code-copy-button"),
+  );
+
+  button.dispatchEvent({ type: "click" });
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(button.textContent, "复制失败");
+  assert.equal(button.textContent.includes("private"), false);
+  assert.equal(elements.connectionStatus.textContent, "");
+  assert.equal(timers[0].delay, 1500);
+  await controller.selectSession("s1");
+  assert.deepEqual(cleared, [77]);
+  controller.destroy();
+  assert.deepEqual(cleared, [77]);
+});
+
+
 test("historical user messages show inline mode badges without activity cards", async () => {
   const { document, elements } = controllerFixture();
   const api = {
@@ -2043,6 +2607,81 @@ test("skill panel starts compact and toggles without rendering diagnostics", asy
 });
 
 
+test("skill rows keep a compact preview and expand only one description", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({
+      skills: [
+        {
+          skill_id: "workspace:review",
+          name: "Review",
+          description: "Review every changed file and report actionable findings.",
+          source: "workspace",
+          sha256: "a".repeat(64),
+          char_count: 120,
+        },
+        {
+          skill_id: "workspace:test",
+          name: "Test",
+          description: "Run focused tests before the full regression suite.",
+          source: "workspace",
+          sha256: "b".repeat(64),
+          char_count: 96,
+        },
+      ],
+      diagnostics: [],
+      usable: true,
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+
+  let toggles = findElements(elements.skillList, "button");
+  let details = findElements(elements.skillList, "div").filter(
+    (element) => element.classList.contains("skill-option__details"),
+  );
+  const previews = findElements(elements.skillList, "span").filter(
+    (element) => element.classList.contains("skill-option__preview"),
+  );
+  assert.equal(toggles.length, 2);
+  assert.equal(details.length, 2);
+  assert.equal(previews[0].textContent, "Review every changed file and report actionable findings.");
+  assert.equal(previews[0].getAttribute("title"), previews[0].textContent);
+  assert.equal(toggles[0].getAttribute("aria-expanded"), "false");
+  assert.equal(details[0].hidden, true);
+
+  elements.skillList.dispatchEvent({ type: "click", target: toggles[0] });
+  toggles = findElements(elements.skillList, "button");
+  details = findElements(elements.skillList, "div").filter(
+    (element) => element.classList.contains("skill-option__details"),
+  );
+  assert.equal(toggles[0].getAttribute("aria-expanded"), "true");
+  assert.equal(details[0].hidden, false);
+  assert.equal(details[0].textContent.includes("workspace"), true);
+
+  elements.skillList.dispatchEvent({ type: "click", target: toggles[1] });
+  toggles = findElements(elements.skillList, "button");
+  details = findElements(elements.skillList, "div").filter(
+    (element) => element.classList.contains("skill-option__details"),
+  );
+  assert.equal(toggles[0].getAttribute("aria-expanded"), "false");
+  assert.equal(details[0].hidden, true);
+  assert.equal(toggles[1].getAttribute("aria-expanded"), "true");
+  assert.equal(details[1].hidden, false);
+
+  const inputs = findElements(elements.skillList, "input");
+  inputs[0].checked = true;
+  elements.skillList.dispatchEvent({ type: "change", target: inputs[0] });
+  assert.deepEqual(controller.getState().selectedSkillIds, ["workspace:review"]);
+  assert.equal(
+    findElements(elements.skillList, "button")[1].getAttribute("aria-expanded"),
+    "true",
+  );
+  controller.destroy();
+});
+
+
 function updateFrame(id, kind, data) {
   return `id: ${id}\nevent: ${kind}\ndata: ${JSON.stringify({
     schema_version: 1,
@@ -2154,7 +2793,7 @@ test("SSE reducer handles provisional confirmed discarded activity and terminal 
 });
 
 
-test("active header projects phase budgets and checkpoint without an activity bubble", () => {
+test("active header keeps workspace path and hides call counters", () => {
   const { document, elements } = controllerFixture();
   const state = gui.createInitialUiState();
   const run = {
@@ -2190,12 +2829,12 @@ test("active header projects phase budgets and checkpoint without an activity bu
     document,
     elements,
     run,
-    state.phase,
-    state.runProgress,
     state.transientStatus,
   );
 
-  assert.match(elements.runPhase.textContent, /调查中.*标准.*8\/24.*17\/80/);
+  assert.equal(elements.workspacePath.textContent, "D:\\code\\coding_agent");
+  assert.equal(elements.workspacePath.textContent.includes("8/24"), false);
+  assert.equal(elements.workspacePath.textContent.includes("17/80"), false);
   assert.equal(elements.runStatus.textContent, "根据已有信息作出决策");
   assert.deepEqual(state.activities, []);
 });
@@ -2557,6 +3196,7 @@ test("browser startup consumes bootstrap and initializes the real controller", a
     [
       "http://127.0.0.1:43123/api/v1/sessions?limit=50",
       "http://127.0.0.1:43123/api/v1/skills",
+      "http://127.0.0.1:43123/api/v1/models?refresh=false",
     ].sort(),
   );
   assert.equal(
@@ -2664,6 +3304,9 @@ test("conversation hides durable activity and shows one live card before the rep
   const childClasses = elements.conversationLog.childNodes.map(
     (element) => element.className,
   );
+  const indicators = findElements(elements.conversationLog, "span").filter(
+    (element) => element.classList.contains("activity-indicator"),
+  );
   controller.destroy();
 
   assert.equal(rendered.includes("read_file"), false);
@@ -2673,8 +3316,15 @@ test("conversation hides durable activity and shows one live card before the rep
     childClasses,
     [
       "message message--user",
-      "activity-card",
+      "activity-card activity-card--active",
     ],
+  );
+  assert.equal(indicators.length, 1);
+  assert.equal(
+    findElements(indicators[0], "span").filter(
+      (element) => element.classList.contains("activity-indicator__dot"),
+    ).length,
+    3,
   );
   assert.equal(rendered.includes("list_directory"), false);
   assert.equal(rendered.includes("Writing the answer"), true);

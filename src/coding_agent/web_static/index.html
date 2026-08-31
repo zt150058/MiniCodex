@@ -17,7 +17,6 @@
             </svg>
           </div>
           <div class="brand-copy">
-            <p id="workspace-name" class="eyebrow workspace-name">__CODING_AGENT_WORKSPACE_NAME__</p>
             <p class="brand-name">MiniCodex</p>
           </div>
           <button id="sidebar-close" class="icon-button sidebar-close" type="button" aria-label="关闭会话栏">×</button>
@@ -44,7 +43,10 @@
           <div id="skill-panel" class="skill-panel" hidden>
             <p class="section-copy">选择用于下一次运行的本地声明式指令。</p>
             <div class="skill-import">
-              <button id="skill-import-button" class="secondary-button skill-import__button" type="button" aria-label="导入 Skill ZIP">导入 Skill ZIP</button>
+              <button id="skill-import-button" class="skill-import__button" type="button" aria-label="导入 Skill ZIP">
+                <span aria-hidden="true">＋</span>
+                导入 Skill
+              </button>
               <input id="skill-file-input" class="visually-hidden" type="file" accept=".zip,application/zip" aria-label="选择 Skill ZIP 文件">
               <p id="skill-import-status" class="skill-import__status" role="status" aria-live="polite"></p>
             </div>
@@ -73,9 +75,14 @@
               <span class="fact-label">状态</span>
               <span id="run-status" class="status-pill status-pill--idle">空闲</span>
             </div>
-            <div class="run-fact phase-fact">
-              <span class="fact-label">当前阶段</span>
-              <span id="run-phase">等待任务</span>
+            <div class="run-fact workspace-path-fact">
+              <span class="fact-label">工作区</span>
+              <span class="workspace-path-value">
+                <svg class="workspace-path-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M3.5 6.5h6l2 2h9v9A2.5 2.5 0 0 1 18 20H6a2.5 2.5 0 0 1-2.5-2.5Z" />
+                </svg>
+                <span id="workspace-path" title="__CODING_AGENT_WORKSPACE_PATH__">__CODING_AGENT_WORKSPACE_PATH__</span>
+              </span>
             </div>
             <div class="run-fact">
               <span class="fact-label">已运行</span>
@@ -113,6 +120,12 @@
               <div id="budget-profile-control" class="budget-profile-control" role="group" aria-label="运行预算">
                 <button id="budget-profile-standard" class="budget-profile-option" type="button" data-budget-profile="standard" aria-label="使用标准运行预算" aria-pressed="true">标准</button>
                 <button id="budget-profile-deep" class="budget-profile-option" type="button" data-budget-profile="deep" aria-label="使用深入运行预算" aria-pressed="false">深入</button>
+              </div>
+              <div id="model-control" class="model-control" hidden>
+                <label for="model-select">模型</label>
+                <select id="model-select" aria-label="选择下一次运行使用的模型"></select>
+                <button id="refresh-models-button" class="model-refresh-button" type="button" aria-label="刷新模型列表" title="刷新模型列表">↻</button>
+                <span id="model-catalog-status" class="model-catalog-status" role="status" aria-live="polite"></span>
               </div>
               <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
               <button id="send-message-button" class="send-button" type="submit" aria-label="发送消息">

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import io
 import math
@@ -24,6 +25,11 @@ from coding_agent.session import (
 )
 from coding_agent.session_controller import CancellationResult, SessionController
 from coding_agent.logging import EventType, RunEvent
+from coding_agent.model_catalog import (
+    ModelCatalogError,
+    ModelCatalogStatus,
+    ModelCatalogView,
+)
 from coding_agent.run_mode import RunMode
 from coding_agent.session_events import SessionEventHub, SessionUpdateKind
 from coding_agent.session_deletion import (
@@ -42,7 +48,41 @@ from coding_agent.skills import (
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 
 
+MODEL_ID = "test-model"
+SELECTED_MODEL_ID = "selected-model"
+
+
+class RecordingModelCatalog:
+    def __init__(
+        self,
+        default_model_id: str = MODEL_ID,
+        model_ids: tuple[str, ...] = (MODEL_ID, SELECTED_MODEL_ID),
+    ) -> None:
+        self.default_model_id = default_model_id
+        self.model_ids = model_ids
+        self.calls: list[tuple[str, object]] = []
+
+    def list_models(self, *, refresh: bool = False) -> ModelCatalogView:
+        self.calls.append(("list_models", refresh))
+        return ModelCatalogView(
+            enabled=True,
+            status=ModelCatalogStatus.READY,
+            default_model_id=self.default_model_id,
+            model_ids=self.model_ids,
+            error_code=None,
+        )
+
+    def resolve(self, requested_model_id: str | None) -> str:
+        self.calls.append(("resolve", requested_model_id))
+        selected = self.default_model_id if requested_model_id is None else requested_model_id
+        if selected not in self.model_ids:
+            raise ModelCatalogError("model_not_available")
+        return selected
+
+
 class BlockingExecutor:
+    default_model_id = MODEL_ID
+
     def __init__(
         self,
         workspace: Path,
@@ -167,6 +207,7 @@ def make_controller(
     skill_catalog: SkillCatalog | None = None,
     skill_installer: SkillPackageInstaller | None = None,
     session_deletion: SessionDeletionService | None = None,
+    model_catalog: RecordingModelCatalog | None = None,
 ) -> SessionController:
     lease = WorkspaceSessionLease.acquire(tmp_path)
     selected_store = store or SQLiteSessionStore(tmp_path)
@@ -176,6 +217,9 @@ def make_controller(
         user_root=tmp_path / "user-skills",
         workspace_root=tmp_path / ".coding-agent" / "skills",
     )
+    selected_model_catalog = model_catalog or RecordingModelCatalog()
+    if not hasattr(executor, "default_model_id"):
+        executor.default_model_id = MODEL_ID
     kwargs: dict[str, object] = {}
     if thread_factory is not None:
         kwargs["thread_factory"] = thread_factory
@@ -188,6 +232,7 @@ def make_controller(
             store=selected_store,
             lease=lease,
             executor=executor,  # type: ignore[arg-type]
+            model_catalog=selected_model_catalog,
             event_hub=SessionEventHub(),
             skill_catalog=selected_catalog,
             **kwargs,  # type: ignore[arg-type]
@@ -195,6 +240,123 @@ def make_controller(
     except BaseException:
         lease.close()
         raise
+
+
+def test_controller_rejects_catalog_executor_default_mismatch(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SessionControllerError) as captured:
+        make_controller(
+            tmp_path,
+            BlockingExecutor(tmp_path, (failed_outcome(),)),
+            model_catalog=RecordingModelCatalog(
+                default_model_id="different-default",
+                model_ids=("different-default",),
+            ),
+        )
+
+    assert captured.value.code == "invalid_session_state"
+
+
+def test_create_resolves_default_before_persisting_and_starting_worker(
+    tmp_path: Path,
+) -> None:
+    catalog = RecordingModelCatalog()
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, model_catalog=catalog)
+    handle = controller.create_session("inspect")
+
+    assert executor.started.wait(timeout=1.0)
+    request = executor.requests[0]
+    assert isinstance(request, SessionRunRequest)
+    assert catalog.calls[0] == ("resolve", None)
+    assert handle.model_id == MODEL_ID
+    assert request.model_id == MODEL_ID
+    assert controller._store.get_run(handle.run_id).model_id == MODEL_ID
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_followup_can_snapshot_a_different_available_model(tmp_path: Path) -> None:
+    catalog = RecordingModelCatalog()
+    executor = BlockingExecutor(tmp_path, (failed_outcome(), failed_outcome()))
+    controller = make_controller(tmp_path, executor, model_catalog=catalog)
+    first = controller.create_session("first")
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(first.run_id, timeout_seconds=2.0)
+
+    second = controller.submit_message(
+        first.session_id,
+        "second",
+        model_id=SELECTED_MODEL_ID,
+    )
+    controller.wait_for_run(second.run_id, timeout_seconds=2.0)
+
+    assert second.model_id == SELECTED_MODEL_ID
+    assert isinstance(executor.requests[1], SessionRunRequest)
+    assert executor.requests[1].model_id == SELECTED_MODEL_ID
+    assert controller._store.get_run(second.run_id).model_id == SELECTED_MODEL_ID
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_unknown_model_is_rejected_without_admission_side_effects(
+    tmp_path: Path,
+) -> None:
+    catalog = RecordingModelCatalog()
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, model_catalog=catalog)
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.create_session("inspect", model_id="unknown-model")
+
+    assert captured.value.code == "model_not_available"
+    assert controller.list_sessions() == ()
+    assert executor.requests == []
+    assert executor.started.is_set() is False
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_catalog_refresh_does_not_mutate_active_request(tmp_path: Path) -> None:
+    catalog = RecordingModelCatalog()
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, model_catalog=catalog)
+    handle = controller.create_session("inspect", model_id=SELECTED_MODEL_ID)
+    assert executor.started.wait(timeout=1.0)
+    request = executor.requests[0]
+    assert isinstance(request, SessionRunRequest)
+
+    view = controller.list_models(refresh=True)
+
+    assert view.model_ids == (MODEL_ID, SELECTED_MODEL_ID)
+    assert request.model_id == SELECTED_MODEL_ID
+    assert handle.model_id == SELECTED_MODEL_ID
+    assert catalog.calls[-1] == ("list_models", True)
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_persisted_request_model_mismatch_fails_before_executor(
+    tmp_path: Path,
+) -> None:
+    class MismatchingStore(SQLiteSessionStore):
+        def start_run(self, run_id: str) -> SessionRunRecord:
+            return replace(super().start_run(run_id), model_id="other-model")
+
+    store = MismatchingStore(tmp_path)
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, store=store)
+    handle = controller.create_session("inspect")
+
+    terminal = controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+
+    assert terminal.status is SessionRunStatus.FAILED
+    assert terminal.termination_reason == "controller_error"
+    assert executor.requests == []
+    assert executor.started.is_set() is False
+    assert controller.shutdown(timeout_seconds=1.0) is True
 
 
 def test_session_deletion_open_uses_exact_factory_service_and_recovers(
@@ -220,6 +382,7 @@ def test_session_deletion_open_uses_exact_factory_service_and_recovers(
     controller = SessionController.open(
         tmp_path,
         BlockingExecutor(tmp_path, (failed_outcome(),)),
+        model_catalog=RecordingModelCatalog(),
         session_deletion_factory=factory,  # type: ignore[arg-type]
     )
 
@@ -237,6 +400,7 @@ def test_session_deletion_open_default_composes_exact_dependency(
     controller = SessionController.open(
         tmp_path,
         BlockingExecutor(tmp_path, (failed_outcome(),)),
+        model_catalog=RecordingModelCatalog(),
     )
 
     assert type(controller._session_deletion) is SessionDeletionService
@@ -264,6 +428,7 @@ def test_session_deletion_open_rejects_dependency_identity_and_closes_lease(
         SessionController.open(
             tmp_path,
             BlockingExecutor(tmp_path, (failed_outcome(),)),
+            model_catalog=RecordingModelCatalog(),
             session_deletion_factory=factory,  # type: ignore[arg-type]
         )
 
@@ -283,6 +448,7 @@ def test_session_deletion_recovery_failure_is_stable_and_closes_lease(
         SessionController.open(
             tmp_path,
             BlockingExecutor(tmp_path, (failed_outcome(),)),
+            model_catalog=RecordingModelCatalog(),
             session_deletion_factory=lambda workspace, store: (
                 FailingRecoveryService(workspace, store)
             ),
@@ -304,6 +470,7 @@ def test_session_deletion_factory_failure_is_stable_and_closes_lease(
         SessionController.open(
             tmp_path,
             BlockingExecutor(tmp_path, (failed_outcome(),)),
+            model_catalog=RecordingModelCatalog(),
             session_deletion_factory=failing_factory,  # type: ignore[arg-type]
         )
 
@@ -359,7 +526,9 @@ def test_delete_session_rejects_non_idle_session(tmp_path: Path) -> None:
         BlockingExecutor(tmp_path, (failed_outcome(),)),
         store=store,
     )
-    submission = store.create_session("queued outside controller")
+    submission = store.create_session(
+        "queued outside controller", model_id=MODEL_ID
+    )
 
     with pytest.raises(SessionControllerError) as captured:
         controller.delete_session(submission.session.session_id)
@@ -666,6 +835,7 @@ def test_controller_rejects_catalog_for_different_workspace(
                 store=store,
                 lease=lease,
                 executor=executor,
+                model_catalog=RecordingModelCatalog(),
                 event_hub=SessionEventHub(),
                 skill_catalog=catalog,
             )
@@ -985,6 +1155,7 @@ def test_controller_rejects_mismatched_workspace_components(
                 store=store,
                 lease=lease,
                 executor=executor,
+                model_catalog=RecordingModelCatalog(),
                 event_hub=SessionEventHub(),
             )
         assert captured.value.code == "invalid_session_state"
@@ -999,11 +1170,15 @@ def test_open_rejects_executor_workspace_before_recovery(tmp_path: Path) -> None
     second.mkdir()
     store = SQLiteSessionStore(first)
     store.initialize()
-    submission = store.create_session("must remain queued")
+    submission = store.create_session("must remain queued", model_id=MODEL_ID)
     executor = BlockingExecutor(second, (failed_outcome(),))
 
     with pytest.raises(SessionControllerError) as captured:
-        SessionController.open(first, executor)
+        SessionController.open(
+            first,
+            executor,
+            model_catalog=RecordingModelCatalog(),
+        )
 
     assert captured.value.code == "invalid_session_state"
     unchanged = SQLiteSessionStore(first)
@@ -1164,6 +1339,23 @@ def _safe_tool_completed_event(safe_error_code: str | None = None) -> RunEvent:
             "mutation_index_before": 0,
             "mutation_index_after": 0,
             "executed": safe_error_code is None,
+        },
+    )
+
+
+def _safe_tool_started_event() -> RunEvent:
+    return RunEvent(
+        schema_version=1,
+        run_id="8" * 32,
+        sequence=1,
+        timestamp_utc="2026-08-29T00:00:00.000000Z",
+        elapsed_ms=1,
+        event_type=EventType.TOOL_CALL_STARTED,
+        data={
+            "ordinal": 1,
+            "tool_name": "read_file",
+            "call_id_hash": "a" * 64,
+            "mutation_index": 0,
         },
     )
 
@@ -1334,6 +1526,65 @@ def test_stream_commit_discard_and_audit_event_mapping(tmp_path: Path) -> None:
     assert controller.shutdown(timeout_seconds=1.0) is True
 
 
+def test_tool_response_narration_is_discarded_before_tool_started(
+    tmp_path: Path,
+) -> None:
+    class ToolNarrationExecutor:
+        workspace = tmp_path.resolve(strict=True)
+
+        def execute(
+            self,
+            request: object,
+            *,
+            stream_handler: object,
+            confirmed_text_handler: object,
+            cancellation_requested: object,
+            run_event_handler: object,
+        ) -> SessionRunOutcome:
+            del request, confirmed_text_handler, cancellation_requested
+            stream = stream_handler  # type: ignore[assignment]
+            audit = run_event_handler  # type: ignore[assignment]
+            stream(
+                ModelStreamEvent(
+                    ModelStreamEventKind.TEXT_DELTA,
+                    "I will inspect",
+                )
+            )
+            audit(_safe_tool_started_event())
+            return failed_outcome()
+
+    controller = make_controller(tmp_path, ToolNarrationExecutor())
+    handle = controller.create_session("inspect")
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+
+    selected_updates = [
+        update
+        for update in controller.read_updates(handle.run_id).events
+        if update.kind
+        in {
+            SessionUpdateKind.ASSISTANT_TEXT_DELTA,
+            SessionUpdateKind.ASSISTANT_TEXT_DISCARDED,
+            SessionUpdateKind.TOOL_STARTED,
+        }
+    ]
+    assert [update.kind for update in selected_updates] == [
+        SessionUpdateKind.ASSISTANT_TEXT_DELTA,
+        SessionUpdateKind.ASSISTANT_TEXT_DISCARDED,
+        SessionUpdateKind.TOOL_STARTED,
+    ]
+    assert selected_updates[1].data == {
+        "reason": "tool_response_narration"
+    }
+    durable_kinds = [
+        event.kind for event in controller.get_session(handle.session_id).events
+    ]
+    assert (
+        PersistedSessionEventKind.ASSISTANT_TEXT_COMMITTED
+        not in durable_kinds
+    )
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
 def test_convergence_audit_events_project_safe_progress_updates(
     tmp_path: Path,
 ) -> None:
@@ -1469,6 +1720,50 @@ def test_convergence_audit_events_project_safe_progress_updates(
     assert controller.shutdown(timeout_seconds=1.0) is True
 
 
+def test_post_mutation_checkpoint_does_not_cancel_or_degrade_controller(
+    tmp_path: Path,
+) -> None:
+    class PostMutationCheckpointExecutor:
+        workspace = tmp_path.resolve(strict=True)
+
+        def execute(self, request: object, **handlers: object) -> SessionRunOutcome:
+            del request
+            publish = handlers["run_event_handler"]  # type: ignore[assignment]
+            cancellation_requested = handlers[  # type: ignore[assignment]
+                "cancellation_requested"
+            ]
+            publish(  # type: ignore[operator]
+                RunEvent(
+                    schema_version=3,
+                    run_id="8" * 32,
+                    sequence=1,
+                    timestamp_utc="2026-08-31T12:10:10.988545Z",
+                    elapsed_ms=17_561,
+                    event_type=EventType.DECISION_CHECKPOINT,
+                    data={
+                        "reason": "post_mutation_integrity",
+                        "phase": "verify",
+                        "main_calls_remaining": 20,
+                    },
+                )
+            )
+            if cancellation_requested():  # type: ignore[operator]
+                return interrupted_outcome()
+            return failed_outcome("empty_model_response")
+
+    controller = make_controller(tmp_path, PostMutationCheckpointExecutor())
+    first = controller.create_session("create a game")
+    first_terminal = controller.wait_for_run(first.run_id, timeout_seconds=2.0)
+
+    assert first_terminal.status is SessionRunStatus.FAILED
+    assert first_terminal.termination_reason == "empty_model_response"
+
+    second = controller.submit_message(first.session_id, "continue")
+    second_terminal = controller.wait_for_run(second.run_id, timeout_seconds=2.0)
+    assert second_terminal.status is SessionRunStatus.FAILED
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
 def test_old_run_read_cannot_cross_new_run_hub_reset(tmp_path: Path) -> None:
     class BlockingReadHub(SessionEventHub):
         def __init__(self) -> None:
@@ -1505,6 +1800,7 @@ def test_old_run_read_cannot_cross_new_run_hub_reset(tmp_path: Path) -> None:
         store=store,
         lease=lease,
         executor=executor,
+        model_catalog=RecordingModelCatalog(),
         event_hub=event_hub,
     )
     first = controller.create_session("first")
@@ -1545,6 +1841,7 @@ def test_old_run_waiter_is_invalidated_when_new_run_begins(tmp_path: Path) -> No
 
     class FollowUpEventExecutor:
         workspace = tmp_path.resolve(strict=True)
+        default_model_id = MODEL_ID
 
         def __init__(self) -> None:
             self.calls = 0
@@ -1565,6 +1862,7 @@ def test_old_run_waiter_is_invalidated_when_new_run_begins(tmp_path: Path) -> No
         store=store,
         lease=lease,
         executor=FollowUpEventExecutor(),
+        model_catalog=RecordingModelCatalog(),
         event_hub=event_hub,
     )
     first = controller.create_session("first")
@@ -1798,6 +2096,7 @@ def test_shutdown_timeout_includes_blocked_session_admission(tmp_path: Path) -> 
             self,
             message: str,
             *,
+            model_id: str,
             selected_skills: tuple[SkillDescriptor, ...] = (),
             run_mode: RunMode = RunMode.MODIFY,
             budget_profile: BudgetProfile = BudgetProfile.STANDARD,
@@ -1806,6 +2105,7 @@ def test_shutdown_timeout_includes_blocked_session_admission(tmp_path: Path) -> 
             assert self.release_create.wait(timeout=2.0)
             return super().create_session(
                 message,
+                model_id=model_id,
                 selected_skills=selected_skills,
                 run_mode=run_mode,
                 budget_profile=budget_profile,
@@ -1855,6 +2155,7 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
             session_id: str,
             message: str,
             *,
+            model_id: str,
             selected_skills: tuple[SkillDescriptor, ...] = (),
             run_mode: RunMode = RunMode.MODIFY,
             budget_profile: BudgetProfile = BudgetProfile.STANDARD,
@@ -1864,6 +2165,7 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
             return super().submit_message(
                 session_id,
                 message,
+                model_id=model_id,
                 selected_skills=selected_skills,
                 run_mode=run_mode,
                 budget_profile=budget_profile,
@@ -1871,7 +2173,7 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
 
     store = BlockingSubmitStore(tmp_path)
     store.initialize()
-    first = store.create_session("first")
+    first = store.create_session("first", model_id=MODEL_ID)
     store.finish_run(
         SessionRunResult(
             run_id=first.run.run_id,
@@ -2065,6 +2367,7 @@ def test_cancel_queued_run_waits_for_durable_start_without_degrading(
 
     class CancellationAwareExecutor:
         workspace = tmp_path.resolve(strict=True)
+        default_model_id = MODEL_ID
 
         def __init__(self) -> None:
             self.calls = 0
@@ -2141,6 +2444,7 @@ def test_cancel_waits_for_started_publication_and_preserves_live_order(
 
     class CancellationAwareExecutor:
         workspace = tmp_path.resolve(strict=True)
+        default_model_id = MODEL_ID
 
         def execute(self, request: object, **handlers: object) -> SessionRunOutcome:
             del request
@@ -2157,6 +2461,7 @@ def test_cancel_waits_for_started_publication_and_preserves_live_order(
         store=store,
         lease=lease,
         executor=CancellationAwareExecutor(),
+        model_catalog=RecordingModelCatalog(),
         event_hub=event_hub,
     )
     handle = controller.create_session("cancel during started publication")
@@ -2271,6 +2576,7 @@ def test_system_exit_after_cancellation_commit_does_not_deadlock_or_lose_live_ev
 
     class CancellationAwareExecutor:
         workspace = tmp_path.resolve(strict=True)
+        default_model_id = MODEL_ID
 
         def __init__(self) -> None:
             self.started = Event()
@@ -2346,6 +2652,7 @@ def test_cancellation_live_event_is_not_duplicated_after_publish_system_exit(
 
     class CancellationAwareExecutor:
         workspace = tmp_path.resolve(strict=True)
+        default_model_id = MODEL_ID
 
         def __init__(self) -> None:
             self.started = Event()
@@ -2368,6 +2675,7 @@ def test_cancellation_live_event_is_not_duplicated_after_publish_system_exit(
         store=store,
         lease=lease,
         executor=executor,
+        model_catalog=RecordingModelCatalog(),
         event_hub=event_hub,
     )
     handle = controller.create_session("cancel publish exits")
@@ -2449,6 +2757,7 @@ def test_initial_live_publish_failure_converges_queued_row(tmp_path: Path) -> No
         store=store,
         lease=lease,
         executor=BlockingExecutor(tmp_path, (failed_outcome(),)),
+        model_catalog=RecordingModelCatalog(),
         event_hub=SessionEventHub(max_bytes=1),
     )
 
@@ -2661,9 +2970,13 @@ def test_shutdown_after_finalization_admission_does_not_publish_cancelling(
 def test_open_recovers_before_accepting_new_work(tmp_path: Path) -> None:
     store = SQLiteSessionStore(tmp_path)
     store.initialize()
-    submission = store.create_session("left queued")
+    submission = store.create_session("left queued", model_id=MODEL_ID)
     executor = BlockingExecutor(tmp_path, (failed_outcome(),))
-    controller = SessionController.open(tmp_path, executor)
+    controller = SessionController.open(
+        tmp_path,
+        executor,
+        model_catalog=RecordingModelCatalog(),
+    )
     recovered = controller.wait_for_run(submission.run.run_id, timeout_seconds=None)
     assert recovered.status is SessionRunStatus.INTERRUPTED
     assert controller.get_session(submission.session.session_id).session.status is SessionStatus.IDLE

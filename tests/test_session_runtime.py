@@ -76,6 +76,7 @@ def test_session_run_request_accepts_frozen_skill_bundle_and_hides_body(
     request = SessionRunRequest(
         session_id="1" * 32,
         run_id="2" * 32,
+        model_id="fake-model",
         current_message="inspect",
         initial_user_message="inspect",
         skill_bundle=bundle,
@@ -86,6 +87,7 @@ def test_session_run_request_accepts_frozen_skill_bundle_and_hides_body(
         SessionRunRequest(
             session_id="1" * 32,
             run_id="2" * 32,
+            model_id="fake-model",
             current_message="inspect",
             initial_user_message="inspect",
             skill_bundle="invalid",  # type: ignore[arg-type]
@@ -99,6 +101,7 @@ def test_session_run_request_preserves_budget_profile(
     request = SessionRunRequest(
         session_id="1" * 32,
         run_id="2" * 32,
+        model_id="fake-model",
         current_message="inspect",
         initial_user_message="inspect",
         budget_profile=profile,
@@ -108,9 +111,31 @@ def test_session_run_request_preserves_budget_profile(
         SessionRunRequest(
             session_id="1" * 32,
             run_id="2" * 32,
+            model_id="fake-model",
             current_message="inspect",
             initial_user_message="inspect",
             budget_profile=profile.value,  # type: ignore[arg-type]
+        )
+
+
+def test_session_run_request_requires_valid_hidden_model_id() -> None:
+    request = SessionRunRequest(
+        session_id="1" * 32,
+        run_id="2" * 32,
+        model_id="selected-model",
+        current_message="inspect",
+        initial_user_message="inspect",
+    )
+
+    assert request.model_id == "selected-model"
+    assert "selected-model" not in repr(request)
+    with pytest.raises(ValueError, match="model_id"):
+        SessionRunRequest(
+            session_id="1" * 32,
+            run_id="2" * 32,
+            model_id=" selected-model",
+            current_message="inspect",
+            initial_user_message="inspect",
         )
 
 
@@ -254,18 +279,17 @@ def test_runtime_executes_with_request_mode_and_maps_terminal_status(
         command_executor=PassingExecutor,
         clock=lambda: 0.0,
     )
+    executor = AgentSessionRunExecutor(base_config, factories=factories)
     request = SessionRunRequest(
         session_id="1" * 32,
         run_id="2" * 32,
+        model_id="selected-model",
         current_message="inspect",
         initial_user_message="inspect",
         run_mode=mode,
     )
 
-    outcome = AgentSessionRunExecutor(
-        base_config,
-        factories=factories,
-    ).execute(
+    outcome = executor.execute(
         request,
         stream_handler=lambda event: None,
         confirmed_text_handler=lambda text: None,
@@ -274,6 +298,9 @@ def test_runtime_executes_with_request_mode_and_maps_terminal_status(
     )
 
     assert captured_configs[0].run_mode is mode
+    assert captured_configs[0].model == "selected-model"
+    assert executor.default_model_id == "fake-model"
+    assert base_config.model == "fake-model"
     assert outcome.status is session_status
     assert outcome.agent_status == agent_status
 
@@ -323,6 +350,7 @@ def test_web_base_verify_runs_for_modify_but_not_read_only(tmp_path: Path) -> No
         SessionRunRequest(
             session_id="1" * 32,
             run_id="2" * 32,
+            model_id="fake-model",
             current_message="change it",
             initial_user_message="change it",
             run_mode=RunMode.MODIFY,
@@ -333,6 +361,7 @@ def test_web_base_verify_runs_for_modify_but_not_read_only(tmp_path: Path) -> No
         SessionRunRequest(
             session_id="1" * 32,
             run_id="3" * 32,
+            model_id="fake-model",
             current_message="explain it",
             initial_user_message="explain it",
             run_mode=RunMode.READ_ONLY,
@@ -349,6 +378,7 @@ def test_session_run_request_mode_is_strict_and_sensitive_fields_stay_hidden() -
     request = SessionRunRequest(
         session_id="1" * 32,
         run_id="2" * 32,
+        model_id="fake-model",
         current_message="private current message",
         initial_user_message="private initial history",
         run_mode=RunMode.READ_ONLY,
@@ -360,6 +390,7 @@ def test_session_run_request_mode_is_strict_and_sensitive_fields_stay_hidden() -
         SessionRunRequest(
             session_id="1" * 32,
             run_id="2" * 32,
+            model_id="fake-model",
             current_message="inspect",
             initial_user_message="inspect",
             run_mode="read_only",  # type: ignore[arg-type]
@@ -392,6 +423,7 @@ def test_agent_session_executor_returns_sdk_free_terminal_outcome(
     request = SessionRunRequest(
         session_id="1" * 32,
         run_id="2" * 32,
+        model_id="fake-model",
         current_message="actual follow-up",
         initial_user_message="current request\nactual follow-up",
     )
@@ -458,6 +490,7 @@ def test_agent_session_executor_passes_skill_bundle_without_persisting_body(
     request = SessionRunRequest(
         session_id="1" * 32,
         run_id="2" * 32,
+        model_id="fake-model",
         current_message="actual follow-up",
         initial_user_message="current request\nactual follow-up",
         skill_bundle=bundle,
@@ -511,7 +544,7 @@ def test_fresh_run_has_fresh_model_budget_and_no_prior_continuation(
     )
     renderer = SessionNarrativeRenderer()
     first_initial = renderer.render((), "first")
-    first = SessionRunRequest(RUN_1, RUN_1, "first", first_initial)
+    first = SessionRunRequest(RUN_1, RUN_1, "fake-model", "first", first_initial)
     executor.execute(
         first,
         stream_handler=lambda event: None,
@@ -523,7 +556,7 @@ def test_fresh_run_has_fresh_model_budget_and_no_prior_continuation(
         (_entry(RUN_1, SessionNarrativeKind.USER, "first"),),
         "second",
     )
-    second = SessionRunRequest(RUN_1, RUN_2, "second", second_initial)
+    second = SessionRunRequest(RUN_1, RUN_2, "fake-model", "second", second_initial)
     executor.execute(
         second,
         stream_handler=lambda event: None,

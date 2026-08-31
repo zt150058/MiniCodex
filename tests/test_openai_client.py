@@ -34,6 +34,7 @@ from coding_agent.messages import (
     UserMessage,
 )
 from coding_agent.model import (
+    DEFAULT_PROVIDER_TIMEOUT_SECONDS,
     FatalModelError,
     ModelBudgetExceeded,
     ModelBudgetReason,
@@ -166,7 +167,11 @@ def test_constructor_disables_sdk_retries_and_does_not_store_key(
         sleeper=lambda delay: None,
     )
 
-    assert observed == {"api_key": FAKE_KEY, "max_retries": 0}
+    assert observed == {
+        "api_key": FAKE_KEY,
+        "max_retries": 0,
+        "timeout": DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+    }
     assert FAKE_KEY not in repr(client)
     assert FAKE_KEY not in repr(vars(client) if hasattr(client, "__dict__") else ())
 

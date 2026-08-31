@@ -1,4 +1,4 @@
-MiniCodex 是 Windows 本地 Coding Agent；自行实现循环、上下文、工具、安全、验证和会话。
+MiniCodex 是 Windows 本地 Coding Agent；自研循环、安全与验证。
 https://github.com/zt150058/MiniCodex
 要求 Python 3.11+。安装：py -3.11 -m venv .venv；.\.venv\Scripts\Activate.ps1；pip install -e ".[test]"
 
@@ -7,8 +7,8 @@ https://github.com/zt150058/MiniCodex
 只读问答：coding-agent "介绍项目" --workspace . --read-only
 GUI：coding-agent-web --workspace .。
 
-预算是硬上限，standard/deep可选；探索账本不存正文。只读模式仅列目录、读文件、查Git；modify零修改可ANSWERED。修改后执行合法验证；无--verify时可做UTF-8完整性检查（不代表编译或测试）。最后一次修改的validation_index == mutation_index才成功，否则保留文件并退出1。
+预算是硬上限，standard/deep可选；探索账本不存正文。只读仅列目录、读文件、查Git；modify可单级建目录，零修改可ANSWERED。无--verify时修改批次后可做结构完整性检查（不代表编译或测试）。最后一次修改的validation_index == mutation_index才成功，否则保留文件并退出1。
 
-GUI支持空闲会话逐条删除和Skill ZIP导入；删除有标题确认，不执行Skill，不删除任意工作区文件。
+GUI支持删会话、Skill ZIP导入；Skill不执行且不删工作区文件。
 
-不支持任意 Shell、下载或 Git 写入。JSONL位于.coding-agent/logs/<run_id>.jsonl。不是操作系统级沙箱。详见docs/USAGE.md和docs/OPENAI_API.md。
+SDK单次等待30秒；GUI命令卡显示exit N。无PTY，交互需测试或人工验证，一次性脚本不得绕过策略。不支持任意Shell、下载或Git写入。JSONL位于.coding-agent/logs/<run_id>.jsonl。不是操作系统级沙箱。详见docs/USAGE.md和docs/OPENAI_API.md。

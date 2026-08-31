@@ -61,6 +61,7 @@ from coding_agent.tools.base import (
     ToolExecution,
 )
 from coding_agent.tools.filesystem import (
+    CreateDirectoryTool,
     ReadFileTool,
     ReplaceTextTool,
     WriteFileTool,
@@ -153,6 +154,34 @@ def test_has_unverified_changes_is_derived_from_freshness(tmp_path: Path) -> Non
         error=None,
     )
     assert state.has_unverified_changes is False
+
+
+def test_parent_not_found_feedback_names_create_directory(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall(
+        "write",
+        "write_file",
+        {"path": "missing/main.cpp", "content": "int main() {}\n"},
+    )
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(call,)), ModelResponse(text="blocked")),
+        tools=(WriteFileTool(),),
+    )
+
+    runner.run("create a nested project")
+
+    result = next(
+        item
+        for item in client.requests[1].messages
+        if isinstance(item, ToolResult) and item.call_id == "write"
+    )
+    assert result.error == (
+        "security_rejected:parent_not_found: parent directory does not "
+        "exist; call create_directory once for each missing parent, from "
+        "shallowest to deepest"
+    )
 
 
 def test_forced_verification_pending_remains_independent_of_derived_state(
@@ -297,11 +326,11 @@ def test_rendered_initial_message_is_strict(tmp_path: Path, initial: object) -> 
         )
 
 
-def test_confirmed_text_handler_receives_each_complete_main_text(
+def test_confirmed_text_handler_receives_only_tool_free_final_text(
     tmp_path: Path,
 ) -> None:
     seen: list[str] = []
-    runner, _ = _runner(
+    runner, client = _runner(
         tmp_path,
         (
             ModelResponse(text="I will inspect", tool_calls=(_record_call(1),)),
@@ -312,7 +341,13 @@ def test_confirmed_text_handler_receives_each_complete_main_text(
     )
     state = runner.run("repair")
     assert state.completion_text == "Finished"
-    assert seen == ["I will inspect", "Finished"]
+    assert seen == ["Finished"]
+    assert any(
+        isinstance(message, AssistantMessage)
+        and message.content == "I will inspect"
+        and len(message.tool_calls) == 1
+        for message in client.requests[1].messages
+    )
 
 
 def test_confirmed_text_handler_ignores_empty_and_failed_responses(
@@ -361,7 +396,7 @@ def test_cooperative_cancel_before_model_starts_no_operation(tmp_path: Path) -> 
     assert state.tool_call_count == 0
 
 
-def test_cancel_after_model_confirms_text_and_pairs_unexecuted_tools(
+def test_cancel_after_model_discards_tool_narration_and_pairs_unexecuted_tools(
     tmp_path: Path,
 ) -> None:
     cancel = Event()
@@ -388,9 +423,15 @@ def test_cancel_after_model_confirms_text_and_pairs_unexecuted_tools(
         confirmed_text_handler=seen.append,
     )
     state = runner.run("stop after model")
-    assert seen == ["complete text"]
+    assert seen == []
     assert tool.executions == []
     assert state.status is AgentStatus.INTERRUPTED
+    assert any(
+        isinstance(item, AssistantMessage)
+        and item.content == "complete text"
+        and len(item.tool_calls) == 2
+        for item in state.messages
+    )
     results = [item for item in state.messages if isinstance(item, ToolResult)]
     assert [result.call_id for result in results] == ["call-1", "call-2"]
     assert all(result.status == "rejected" for result in results)
@@ -1032,18 +1073,18 @@ def test_second_failed_decision_stops_without_extra_model_request(
     assert len(client.requests) == 4
 
 
-def test_unverified_mutation_rejects_exploration_on_next_model_turn(
+def test_mutation_batch_runs_local_integrity_before_readback(
     tmp_path: Path,
 ) -> None:
     write = ToolCall(
         "write",
         "write_file",
-        {"path": "task.py", "content": "print('ok')\n"},
+        {"path": "AGENTS.md", "content": "# Instructions\n"},
     )
     read = ToolCall(
-        "read-after-write",
+        "read",
         "read_file",
-        {"path": "task.py", "start_line": 1, "end_line": None},
+        {"path": "AGENTS.md", "start_line": 1, "end_line": None},
     )
     gate = VerificationGate(
         required_command=None,
@@ -1054,34 +1095,318 @@ def test_unverified_mutation_rejects_exploration_on_next_model_turn(
         (
             ModelResponse(tool_calls=(write,)),
             ModelResponse(tool_calls=(read,)),
-            ModelResponse(text="cannot verify safely"),
+            ModelResponse(text="AGENTS.md created and reviewed."),
         ),
         tools=(WriteFileTool(), ReadFileTool()),
         verification_gate=gate,
     )
 
-    state = runner.run("write a Python file")
+    state = runner.run("create AGENTS.md")
 
     result = next(
         item
-        for item in state.messages
-        if isinstance(item, ToolResult) and item.call_id == "read-after-write"
+        for item in client.requests[2].messages
+        if isinstance(item, ToolResult) and item.call_id == "read"
     )
-    control = client.requests[1].instructions
-    assert control is not None
-    assert "unverified changes: active" in control
-    assert (
-        "required action: verify, repair failed verification, or report blocker"
-        in control
-    )
-    assert result.error is not None
-    assert result.error.startswith("agent_rejected:verification_required")
+    assert result.status == "ok"
     assert state.status is AgentStatus.SUCCESS
-    assert state.termination_reason is None
-    assert state.mutation_index == 1
     assert state.verification_attempt_count == 1
+    assert state.validation_index == state.mutation_index == 1
+    assert state.tool_call_count == 3
+    checkpoint_instructions = client.requests[1].instructions or ""
+    assert "already passed deterministic local integrity" in checkpoint_instructions
+    assert (
+        "Do not use unrelated Python, pytest, unittest, ruff, mypy, or Git "
+        "commands to claim C/C++ build verification"
+    ) in checkpoint_instructions
+    assert "Do not repeatedly read the same files" in checkpoint_instructions
+    assert "give the user the exact external build command" in checkpoint_instructions
+    assert "report the blocker accurately" in checkpoint_instructions
+
+
+def test_post_mutation_integrity_activates_checkpoint(
+    tmp_path: Path,
+) -> None:
+    write = ToolCall(
+        "write-checkpoint",
+        "write_file",
+        {"path": "AGENTS.md", "content": "# Instructions\n"},
+    )
+    logger = RunEventLogger.create(tmp_path, run_id="b" * 32)
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=(write,)),),
+        tools=(WriteFileTool(),),
+        limits=TerminationLimits(max_main_logical_calls=1),
+        verification_gate=VerificationGate(
+            required_command=None,
+            execution_context=ExecutionContext(tmp_path),
+        ),
+        event_sink=logger,
+    )
+
+    state = runner.run("create AGENTS.md")
+    logger.close()
+
+    events = [
+        json.loads(line)
+        for line in (
+            tmp_path / ".coding-agent" / "logs" / ("b" * 32 + ".jsonl")
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert state.progress.checkpoint_active is True
+    assert state.progress.post_checkpoint_read_batches == 0
+    assert any(
+        event["event_type"] == "decision_checkpoint"
+        and event["data"]["reason"] == "post_mutation_integrity"
+        for event in events
+    )
+
+
+def test_two_mutations_in_one_batch_run_local_integrity_once(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write-a",
+                        "write_file",
+                        {"path": "a.txt", "content": "a\n"},
+                    ),
+                    ToolCall(
+                        "write-b",
+                        "write_file",
+                        {"path": "b.txt", "content": "b\n"},
+                    ),
+                )
+            ),
+            ModelResponse(),
+        ),
+        tools=(WriteFileTool(),),
+        verification_gate=gate,
+    )
+
+    state = runner.run("create two files")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.EMPTY_MODEL_RESPONSE
+    assert state.mutation_index == 2
+    assert state.validation_index == 2
+    assert state.verification_attempt_count == 1
+    assert state.tool_call_count == 3
+    assert len(client.requests) == 2
+
+
+def test_eager_local_integrity_does_not_complete_without_final_text(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write",
+                        "write_file",
+                        {"path": "README.md", "content": "# Demo\n"},
+                    ),
+                )
+            ),
+            ModelResponse(),
+        ),
+        tools=(WriteFileTool(),),
+        verification_gate=gate,
+    )
+
+    state = runner.run("create README")
+
+    assert len(client.requests) == 2
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.EMPTY_MODEL_RESPONSE
+    assert state.verification_status is VerificationStatus.PASSED
+    assert state.validation_index == state.mutation_index == 1
+
+
+def test_failed_eager_local_integrity_allows_repair_and_rechecks(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write-broken",
+                        "write_file",
+                        {"path": "broken.py", "content": "def broken(:\n"},
+                    ),
+                )
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "repair",
+                        "replace_text",
+                        {
+                            "path": "broken.py",
+                            "old_text": "def broken(:\n",
+                            "new_text": "def fixed():\n    pass\n",
+                            "expected_count": 1,
+                        },
+                    ),
+                )
+            ),
+            ModelResponse(text="syntax repaired"),
+        ),
+        tools=(WriteFileTool(), ReplaceTextTool()),
+        verification_gate=gate,
+    )
+
+    state = runner.run("create a valid Python file")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.mutation_index == 2
+    assert state.validation_index == 2
+    assert state.verification_attempt_count == 2
     assert state.last_verification is not None
-    assert state.last_verification.source is CommandSource.LOCAL_INTEGRITY
+    assert state.last_verification.status is VerificationStatus.PASSED
+    assert len(client.requests) == 3
+
+
+def test_failed_eager_integrity_allows_create_directory_in_repair_batch(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write-broken",
+                        "write_file",
+                        {"path": "broken.py", "content": "def broken(:\n"},
+                    ),
+                )
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "create-source",
+                        "create_directory",
+                        {"path": "src"},
+                    ),
+                    ToolCall(
+                        "repair-python",
+                        "replace_text",
+                        {
+                            "path": "broken.py",
+                            "old_text": "def broken(:\n",
+                            "new_text": "def fixed():\n    pass\n",
+                            "expected_count": 1,
+                        },
+                    ),
+                )
+            ),
+            ModelResponse(text="directory and syntax repaired"),
+        ),
+        tools=(CreateDirectoryTool(), WriteFileTool(), ReplaceTextTool()),
+        verification_gate=gate,
+    )
+
+    state = runner.run("repair project layout and Python syntax")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert (tmp_path / "src").is_dir()
+    assert state.mutation_index == state.validation_index == 3
+    assert state.verification_attempt_count == 2
+    assert len(client.requests) == 3
+
+
+def test_required_verification_does_not_run_at_mutation_batch_end(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write",
+                        "write_file",
+                        {"path": "README.md", "content": "# Demo\n"},
+                    ),
+                )
+            ),
+            FatalModelError("stop before completion candidate"),
+        ),
+        tools=(WriteFileTool(),),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("create README")
+
+    assert state.termination_reason is TerminationReason.FATAL_MODEL_ERROR
+    assert len(client.requests) == 2
+    assert executor.calls == []
+    assert state.verification_attempt_count == 0
+
+
+def test_eager_local_integrity_respects_exact_tool_budget(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write",
+                        "write_file",
+                        {"path": "README.md", "content": "# Demo\n"},
+                    ),
+                )
+            ),
+            ModelResponse(text="must not run"),
+        ),
+        tools=(WriteFileTool(),),
+        verification_gate=gate,
+        limits=TerminationLimits(
+            max_tool_calls=1,
+            verification_tool_reserve=0,
+        ),
+    )
+
+    state = runner.run("create README")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.TOOL_CALL_LIMIT
+    assert state.verification_attempt_count == 0
+    assert state.validation_index is None
+    assert len(client.requests) == 1
 
 
 def test_changed_file_completion_runs_local_integrity_and_succeeds(
@@ -1365,14 +1690,12 @@ def test_three_security_rejections_after_mutation_end_changes_unverified(
         )
         for index in range(3)
     )
+    executor = FakeVerificationExecutor()
     runner, client = _runner(
         tmp_path,
         tuple(responses),
         tools=(WriteFileTool(), command),
-        verification_gate=VerificationGate(
-            required_command=None,
-            execution_context=ExecutionContext(tmp_path),
-        ),
+        verification_gate=_verification_gate(tmp_path, executor),
     )
 
     state = runner.run("write and verify")
@@ -1383,6 +1706,7 @@ def test_three_security_rejections_after_mutation_end_changes_unverified(
     assert state.mutation_index == 1
     assert state.validation_index is None
     assert state.verification_attempt_count == 0
+    assert executor.calls == []
     assert len(command.executions) == 3
     assert len(client.requests) == 4
 
@@ -1875,10 +2199,15 @@ def test_output_limit_gets_one_temporary_small_tool_recovery_instruction(
     assert state.status is AgentStatus.COMPLETION_CANDIDATE
     assert state.consecutive_output_limit_errors == 0
     assert len(client.requests) == 2
+    assert client.requests[0].max_output_tokens == 16_384
+    assert client.requests[1].max_output_tokens == 32_768
     assert client.requests[0].instructions is None
     recovery = client.requests[1].instructions
     assert recovery is not None
-    assert "one file per response" in recovery
+    assert "exactly one complete action" in recovery
+    assert "12,000 characters" in recovery
+    assert "2,000 characters" in recovery
+    assert recovery.endswith("Do not include prose together with a tool call.")
     assert "private partial" not in recovery
     assert not any(
         isinstance(message, (UserMessage, AssistantMessage))
@@ -2081,6 +2410,87 @@ def test_three_security_rejections_use_security_reason(tmp_path: Path) -> None:
     assert state.consecutive_tool_errors == 0
     assert len(tool.executions) == 3
     assert len(client.requests) == 3
+
+
+def test_three_safety_rejections_in_one_response_count_once(
+    tmp_path: Path,
+) -> None:
+    denied = lambda: SafetyViolation(SafetyCode.PARENT_NOT_FOUND, "missing")
+    tool = RecordingTool(denied(), denied(), denied())
+    calls = tuple(
+        ToolCall(
+            call_id=f"call-{index}",
+            name="record",
+            arguments={"value": f"path-{index}"},
+        )
+        for index in range(3)
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=calls),
+            ModelResponse(text="corrected after one rejected response"),
+        ),
+        tools=(tool,),
+    )
+
+    state = runner.run("create files under a missing directory")
+
+    assert state.consecutive_safety_rejections == 1
+    assert len(client.requests) == 2
+    paired = [
+        message
+        for message in client.requests[1].messages
+        if isinstance(message, ToolResult)
+    ]
+    assert [item.call_id for item in paired] == [call.call_id for call in calls]
+
+
+def test_three_separate_safety_only_responses_still_stop_at_three(
+    tmp_path: Path,
+) -> None:
+    denied = lambda: SafetyViolation(SafetyCode.ARGUMENT_DENIED, "denied")
+    tool = RecordingTool(denied(), denied(), denied())
+    runner, client = _runner(
+        tmp_path,
+        tuple(
+            ModelResponse(tool_calls=(_record_call(index),))
+            for index in range(3)
+        ),
+        tools=(tool,),
+    )
+
+    state = runner.run("three rejected turns")
+
+    assert (
+        state.termination_reason
+        is TerminationReason.CONSECUTIVE_SAFETY_REJECTIONS
+    )
+    assert state.consecutive_safety_rejections == 3
+    assert len(client.requests) == 3
+
+
+def test_mixed_safety_rejection_and_success_resets_safety_count(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingTool(
+        SafetyViolation(SafetyCode.ARGUMENT_DENIED, "denied"),
+        ToolExecution(output="ok"),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(_record_call(1), _record_call(2))),
+            ModelResponse(text="done"),
+        ),
+        tools=(tool,),
+    )
+
+    state = runner.run("recover in one response")
+
+    assert state.consecutive_safety_rejections == 0
+    assert state.consecutive_tool_errors == 0
+    assert len(client.requests) == 2
 
 
 def test_fatal_model_error_stops_immediately_without_second_logical_call(
@@ -2906,6 +3316,60 @@ def test_model_verification_evidence_allows_success_without_second_execution(
     assert state.last_verification is not None
     assert state.last_verification.source is CommandSource.MODEL
     assert executor.calls == []
+
+
+def test_repeated_model_verification_is_not_strong_progress(
+    tmp_path: Path,
+) -> None:
+    first = ToolCall(
+        "model-verification-1",
+        "run_command",
+        {"command": "python -m pytest -q", "purpose": "verification"},
+    )
+    second = ToolCall(
+        "model-verification-2",
+        "run_command",
+        {"command": "python -m pytest -q", "purpose": "verification"},
+    )
+    logger = RunEventLogger.create(tmp_path, run_id="a" * 32)
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(first,)),
+            ModelResponse(tool_calls=(second,)),
+            ModelResponse(text="done"),
+        ),
+        tools=(OfflineVerificationTool(),),
+        verification_gate=_verification_gate(
+            tmp_path,
+            FakeVerificationExecutor(),
+            required=False,
+        ),
+        event_sink=logger,
+    )
+
+    state = runner.run("record repeated model verification")
+    logger.close()
+
+    events = [
+        json.loads(line)
+        for line in (
+            tmp_path / ".coding-agent" / "logs" / ("a" * 32 + ".jsonl")
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    tool_progress = [
+        event["data"]["strength"]
+        for event in events
+        if event["event_type"] == "progress_observed"
+        and event["data"]["source"] == "tool"
+    ]
+
+    assert state.verification_attempt_count == 2
+    assert sum(
+        event["event_type"] == "verification_evidence_recorded"
+        for event in events
+    ) == 2
+    assert tool_progress == ["strong", "none"]
 
 
 def test_modify_capability_prose_without_mutation_becomes_answered(

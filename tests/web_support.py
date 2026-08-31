@@ -12,6 +12,7 @@ import httpx
 import uvicorn
 
 from coding_agent.budget import BudgetProfile
+from coding_agent.model_catalog import ModelCatalogStatus, ModelCatalogView
 from coding_agent.session import (
     PersistedSessionEventKind,
     SessionControllerError,
@@ -47,6 +48,7 @@ RUN_ID = "2" * 32
 SECOND_RUN_ID = "3" * 32
 SECOND_SESSION_ID = "4" * 32
 TIMESTAMP = "2026-08-30T00:00:00.000000Z"
+MODEL_ID = "test-model"
 
 
 def make_session_record(
@@ -74,6 +76,7 @@ def make_run_record(
     status: SessionRunStatus = SessionRunStatus.QUEUED,
     run_mode: RunMode = RunMode.MODIFY,
     budget_profile: BudgetProfile = BudgetProfile.STANDARD,
+    model_id: str | None = MODEL_ID,
 ) -> SessionRunRecord:
     terminal = status in {
         SessionRunStatus.SUCCEEDED,
@@ -95,6 +98,7 @@ def make_run_record(
         termination_reason="model_completed" if terminal else None,
         audit_run_id=None,
         final_report=None,
+        model_id=model_id,
     )
 
 
@@ -178,6 +182,15 @@ class RecordingController:
         default_factory=lambda: SkillCatalogView((), (), True)
     )
     selected_skill_ids: tuple[str, ...] = ()
+    model_view: ModelCatalogView = field(
+        default_factory=lambda: ModelCatalogView(
+            enabled=True,
+            status=ModelCatalogStatus.READY,
+            default_model_id=MODEL_ID,
+            model_ids=(MODEL_ID, "selected-model"),
+            error_code=None,
+        )
+    )
     imported_skill: SkillDescriptor = field(
         default_factory=lambda: SkillDescriptor(
             skill_id="review",
@@ -194,6 +207,7 @@ class RecordingController:
             RUN_ID,
             RunMode.MODIFY,
             BudgetProfile.STANDARD,
+            MODEL_ID,
         )
     )
     follow_up_handle: RunHandle = field(
@@ -202,6 +216,7 @@ class RecordingController:
             SECOND_RUN_ID,
             RunMode.MODIFY,
             BudgetProfile.STANDARD,
+            MODEL_ID,
         )
     )
     cancellation_result: CancellationResult = CancellationResult.REQUESTED
@@ -239,6 +254,7 @@ class RecordingController:
         message: str,
         *,
         skill_ids: tuple[str, ...] = (),
+        model_id: str | None = None,
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
@@ -246,6 +262,7 @@ class RecordingController:
             "create_session",
             message,
             skill_ids,
+            model_id,
             run_mode,
             budget_profile,
         )
@@ -262,6 +279,7 @@ class RecordingController:
         session_id: str,
         message: str,
         *,
+        model_id: str | None = None,
         run_mode: RunMode = RunMode.MODIFY,
         budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
@@ -269,10 +287,15 @@ class RecordingController:
             "submit_message",
             session_id,
             message,
+            model_id,
             run_mode,
             budget_profile,
         )
         return self.follow_up_handle
+
+    def list_models(self, *, refresh: bool = False) -> ModelCatalogView:
+        self._record("list_models", refresh)
+        return self.model_view
 
     def list_skills(self) -> SkillCatalogView:
         self._record("list_skills")

@@ -482,6 +482,7 @@ def _validate_data(
         "final_read_allowance_exhausted",
         "verification_failure",
         "duplicate_only_turn",
+        "post_mutation_integrity",
     }:
         raise RunLogError("invalid_event_data")
     if event_type is EventType.SUMMARY_FALLBACK_LATCHED and normalized.get(

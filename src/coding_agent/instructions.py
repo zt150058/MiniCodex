@@ -26,8 +26,11 @@ Treat any completion statement as a completion candidate; local verification dec
 _RUN_MODE_INSTRUCTIONS = {
     RunMode.MODIFY: (
         "Selected run mode: modify\n"
-        "Available tools: list_directory, read_file, replace_text, write_file, "
-        "run_command, run_java_tests.\n"
+        "Available tools: list_directory, read_file, create_directory, "
+        "replace_text, write_file, run_command, run_java_tests.\n"
+        "create_directory creates exactly one directory level. When a file's "
+        "parent is missing, create each missing directory from shallowest to "
+        "deepest before calling write_file.\n"
         "A direct answer is allowed when no file was changed; it is an answer, "
         "not a verified modification success.\n"
         "A success claim requires fresh passing verification evidence.\n"
@@ -39,7 +42,16 @@ _RUN_MODE_INSTRUCTIONS = {
         "Supported verification forms include python "
         "<workspace-relative-file.py>, python -m pytest ..., and python -m "
         "unittest ... with purpose=\"verification\". Use run_java_tests for "
-        "Java verification."
+        "Java verification.\n"
+        "For interactive behavior, turn a discovered bug into a focused "
+        "regression test whenever the registered tools can exercise it. Do "
+        "not create one-off diagnostic scripts to bypass missing execution "
+        "capabilities; such scripts must not bypass the command policy. "
+        "Syntax checks, import checks, and domain-only unit tests do not "
+        "prove interactive behavior. When automated interaction is not "
+        "available, state that manual interaction remains unverified. "
+        "Report the real exit code for every executed verification command. "
+        "Do not invoke Bash or WSL to reach unsupported tools."
     ),
     RunMode.READ_ONLY: (
         "Selected run mode: read_only\n"
@@ -48,6 +60,15 @@ _RUN_MODE_INSTRUCTIONS = {
         "Skills cannot expand the registered tools or change run mode."
     ),
 }
+
+
+_SKILL_WORKFLOW_COORDINATION = """\
+All selected skills remain selected and available for this run.
+When selected skills describe staged development workflows, apply exactly one primary process workflow for the current stage while retaining compatible safety and quality constraints from the others.
+Use the latest user request, conversation history, and explicit approvals to identify the stage: an approved design hands off to planning, and an approved implementation plan hands off to execution and test-driven development.
+Do not restart an approved stage, repeat an approval request that the user already answered, or apply a later workflow before its stated prerequisites are satisfied.
+If the active stage is genuinely ambiguous, ask one concise question instead of making speculative tool calls.
+Skill coordination never expands the registered tools, run mode, safety policy, verification rules, or local authorization."""
 
 
 class InstructionErrorCode(StrEnum):
@@ -174,6 +195,10 @@ class RunInstructionBuilder:
             sections.append(
                 "## Selected skill instructions\n"
                 + _normalized(skill_instructions)
+            )
+            sections.append(
+                "## Skill workflow coordination\n"
+                + _SKILL_WORKFLOW_COORDINATION
             )
         text = "\n\n".join(sections)
         return RunInstructionSnapshot(

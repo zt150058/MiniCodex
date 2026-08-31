@@ -115,7 +115,7 @@ Chat 适配器不依赖服务端状态。每次 provider 调用都接收 Context
 
 logical call 和 provider attempt 共享 run-scoped `ModelCallBudget`。每次真实请求前领取 provider 额度，预算不足时不会调用 SDK。authentication、permission、not-found、bad request、unprocessable、请求映射错误和响应解析错误不重试。畸形 SDK payload 与解析拒绝统一为稳定的 `invalid_model_response`，不复制异常正文或响应体。
 
-流式请求只有在**首个 delta 前**发生 429、5xx、timeout 或 connection error 才按相同的 0.25、0.50 秒规则重试。文本或函数参数 delta 一旦到达，**delta 后不重试**，也不回退到同步请求；已经展示的部分文本会收到 discarded 生命周期事件。只有适配器明确抛出的结构化“不支持流式”且尚无 provider delta 时，核心才在同一次 logical call、下一次 provider attempt 上自动退回同步 `complete`。普通 400/认证错误和解析错误绝不会触发能力回退。
+流式请求只有在**首个 delta 前**发生 429、5xx、timeout 或 connection error 才按相同的 0.25、0.50 秒规则重试。文本或函数参数 delta 一旦到达，**delta 后不重试**；已经展示的部分文本会收到 discarded 生命周期事件。结构化“不支持流式”且尚无 provider delta 时，核心可在同一次 logical call、下一次 provider attempt 上退回同步 `complete`。此外，Chat Completions 流在尚未向用户公开文本时若结构非法，适配器最多执行一次同步请求，并使用同一严格映射和解析器；已经公开任何文本后不会同步回退。该恢复不放宽 call ID、arguments、finish reason、usage 或消息配对规则，普通 400/认证错误也不会触发回退。
 
 Responses 只允许已知的文本、函数调用、response/output/content 和 reasoning 生命周期事件。reasoning、encrypted content 与函数参数片段不会作为流事件暴露；Chat 同样只暴露文本。两个适配器都尽力关闭流，清理失败使用稳定脱敏错误，且不能覆盖 `KeyboardInterrupt`、`SystemExit` 或既有主异常。
 

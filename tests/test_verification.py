@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 
@@ -24,6 +25,7 @@ from coding_agent.verification import (
     VerificationOutcome,
     VerificationResult,
     is_credible_verification_command,
+    verification_advances_progress,
 )
 
 
@@ -43,6 +45,73 @@ def _result(**overrides: object) -> VerificationResult:
     }
     values.update(overrides)
     return VerificationResult(**values)  # type: ignore[arg-type]
+
+
+def _progress_evidence(
+    *,
+    status: VerificationStatus = VerificationStatus.PASSED,
+    validation_index: int = 1,
+    source: CommandSource = CommandSource.MODEL,
+    command: str = "python -m pytest -q",
+) -> VerificationResult:
+    return VerificationResult(
+        status=status,
+        validation_index=validation_index,
+        command=command,
+        source=source,
+        exit_code=0 if status is VerificationStatus.PASSED else 1,
+        stdout="",
+        stderr="",
+        timed_out=False,
+        truncated=False,
+        duration_ms=1,
+        error=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("previous", "current", "expected"),
+    [
+        (None, _progress_evidence(), True),
+        (
+            _progress_evidence(validation_index=1),
+            _progress_evidence(validation_index=2),
+            True,
+        ),
+        (
+            _progress_evidence(status=VerificationStatus.FAILED),
+            _progress_evidence(status=VerificationStatus.PASSED),
+            True,
+        ),
+        (
+            _progress_evidence(source=CommandSource.LOCAL_INTEGRITY),
+            _progress_evidence(source=CommandSource.MODEL),
+            True,
+        ),
+        (_progress_evidence(), _progress_evidence(), False),
+        (
+            _progress_evidence(command="python -m pytest -q"),
+            _progress_evidence(command="python -m unittest"),
+            False,
+        ),
+        (
+            _progress_evidence(source=CommandSource.MODEL),
+            _progress_evidence(source=CommandSource.LOCAL_INTEGRITY),
+            False,
+        ),
+        (
+            _progress_evidence(validation_index=2),
+            _progress_evidence(validation_index=1),
+            False,
+        ),
+    ],
+)
+def test_verification_progress_is_monotonic(
+    previous: VerificationResult | None,
+    current: VerificationResult,
+    expected: bool,
+) -> None:
+    assert verification_advances_progress(previous, current) is expected
 
 
 def test_verification_and_agent_status_values_are_exact() -> None:
@@ -1035,6 +1104,91 @@ def test_optional_gate_validates_changed_markdown_locally(tmp_path: Path) -> Non
     assert executor.calls == []
 
 
+def test_local_integrity_accepts_safe_directory_and_file_paths(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "snake").mkdir()
+    (tmp_path / "snake" / "main.cpp").write_text(
+        "int main() { return 0; }\n",
+        encoding="utf-8",
+    )
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    state = _candidate_state(tmp_path)
+    state.mutation_index = 2
+    state.modified_paths = ("snake", "snake/main.cpp")
+    state.verification_status = VerificationStatus.STALE
+
+    decision = gate.evaluate(state)
+
+    assert decision.outcome is VerificationOutcome.SUCCESS
+    assert decision.result is not None
+    assert json.loads(decision.result.stdout) == {
+        "checked_paths": ["snake", "snake/main.cpp"],
+        "syntax_checked": [],
+    }
+
+
+def test_local_integrity_rejects_removed_directory_changed_path(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "removed"
+    target.mkdir()
+    target.rmdir()
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    state = _candidate_state(tmp_path)
+    state.modified_paths = ("removed",)
+    state.verification_status = VerificationStatus.STALE
+
+    decision = gate.evaluate(state)
+
+    assert decision.outcome is VerificationOutcome.CONTINUE
+    assert decision.result is not None
+    assert json.loads(decision.result.stdout)["failure"] == {
+        "path": "",
+        "reason": "invalid_changed_path",
+    }
+
+
+def test_local_integrity_rejects_reparse_directory_changed_path(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "linked"
+    try:
+        os.symlink(real, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.fail(
+            "real Windows directory symlink is required; "
+            f"winerror={getattr(exc, 'winerror', None)}"
+        )
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    state = _candidate_state(tmp_path)
+    state.modified_paths = ("linked",)
+    state.verification_status = VerificationStatus.STALE
+
+    decision = gate.evaluate(state)
+
+    assert decision.outcome is VerificationOutcome.CONTINUE
+    assert decision.result is not None
+    assert json.loads(decision.result.stdout)["failure"] == {
+        "path": "",
+        "reason": "invalid_changed_path",
+    }
+
+
 @pytest.mark.parametrize(
     ("name", "content", "syntax_checked"),
     [
@@ -1174,6 +1328,41 @@ def test_current_failed_model_evidence_is_not_replaced_by_local_integrity(
     assert decision.outcome is VerificationOutcome.CONTINUE
     assert decision.command_executed is False
     assert state.last_verification is failed
+
+
+@pytest.mark.parametrize(
+    "source",
+    [CommandSource.MODEL, CommandSource.USER_VERIFY],
+)
+def test_stale_model_evidence_or_user_evidence_blocks_local_integrity(
+    tmp_path: Path,
+    source: CommandSource,
+) -> None:
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    state = _candidate_state(tmp_path)
+    state.mutation_index = 2
+    state.modified_paths = ("README.md",)
+    stale = _result(
+        status=VerificationStatus.PASSED,
+        validation_index=1,
+        source=source,
+        exit_code=0,
+    )
+    state.last_verification = stale
+    state.verification_status = VerificationStatus.STALE
+
+    decision = gate.evaluate(state)
+
+    assert gate.requires_local_integrity(state) is False
+    assert decision.outcome is VerificationOutcome.CONTINUE
+    assert decision.command_executed is False
+    assert state.last_verification is stale
+    assert state.verification_attempt_count == 0
 
 
 def test_fresh_model_pass_succeeds_and_is_reusable_without_execution(

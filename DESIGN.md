@@ -185,7 +185,9 @@ Agent 使用同步、显式的 `while` 循环。每轮按以下顺序执行：
 
 `status` 只能是 `ok`、`error` 或 `rejected`。工具调用和结果必须通过 `call_id` 一一对应。任何可空字段都显式使用 `null`，不靠字段缺失表达含义。
 
-`ModelRequest.instructions` 是独立于消息历史的可空运行指令字段。`RunInstructionBuilder` 在每次应用运行开始时只构建一次不可变 `RunInstructionSnapshot`，顺序固定为内置基础指令、工作区根目录 `AGENTS.md`、可选的已选择 Skill 指令。根 `AGENTS.md` 和 Skill 指令分别限制为 65,536 个 UTF-8 字节；根文件使用 `PathGuard` 拒绝 reparse/symlink 逃逸，只接受 UTF-8（可带 BOM），并统一换行。快照正文不进入 repr、日志、工具或 FinalReport，只把 SHA-256 和字符数作为可安全比较的元数据。
+`ModelRequest.instructions` 是独立于消息历史的可空运行指令字段。`RunInstructionBuilder` 在每次应用运行开始时只构建一次不可变 `RunInstructionSnapshot`，顺序固定为内置基础指令、工作区根目录 `AGENTS.md`、可选的已选择 Skill 指令，以及仅在选择了 Skill 时追加的一份通用工作流协调指令。根 `AGENTS.md` 和 Skill 指令分别限制为 65,536 个 UTF-8 字节；根文件使用 `PathGuard` 拒绝 reparse/symlink 逃逸，只接受 UTF-8（可带 BOM），并统一换行。快照正文不进入 repr、日志、工具或 FinalReport，只把 SHA-256 和字符数作为可安全比较的元数据。
+
+工作流协调不会取消同时选择的 Skill，而是根据最新用户请求、当前对话和已经明确给出的批准，为当前阶段指定一个主流程：设计批准后交给计划，实施计划批准后交给执行与测试驱动开发。其他 Skill 的兼容安全和质量约束仍然有效。协调指令不引入持久化 Planner、不声称能确定性解析任意自然语言批准，也不能注册工具、改变运行模式、扩大授权或绕过验证；阶段确实不明确时只允许提出一个简短问题。
 
 `ModelResponse` 包含：
 
@@ -201,7 +203,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 
 两个生产适配器都实现既有 `ModelClient.complete(ModelRequest) -> ModelResponse` 边界，使用官方 SDK 作为 HTTP 客户端，但不让 SDK 类型越过各自适配层。Agent、消息、工具、上下文、验证和报告层不感知 API 模式。
 
-`StreamingModelClient` 是加法式、可选的 provider-neutral 协议；它不会改变 `ModelClient.complete` 的公共签名。主模型调用在配置了内存回调时通过 `invoke_model_stream` 发送 `TEXT_DELTA`、`RESPONSE_COMPLETED` 或 `RESPONSE_DISCARDED`。没有回调时保持原有同步路径；上下文摘要始终使用同步调用并且不接收运行指令或流事件。结构化“不支持流式”只允许在首个 provider delta 前回退到同步请求，且流式尝试与回退共享同一次 logical call 和 run-scoped provider attempt 预算。
+`StreamingModelClient` 是加法式、可选的 provider-neutral 协议；它不会改变 `ModelClient.complete` 的公共签名。主模型调用在配置了内存回调时通过 `invoke_model_stream` 发送 `TEXT_DELTA`、`RESPONSE_COMPLETED` 或 `RESPONSE_DISCARDED`。没有回调时保持原有同步路径；上下文摘要始终使用同步调用并且不接收运行指令或流事件。结构化“不支持流式”只允许在首个 provider delta 前回退到同步请求。Chat Completions 的结构非法流还可在没有公开文本时执行一次同步恢复；任一恢复均与流式尝试共享同一次 logical call 和 run-scoped provider attempt 预算，且不放宽严格解析。
 
 `OpenAIResponsesClient` 的既有行为保持不变：
 
@@ -212,7 +214,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - 保存当前响应中续接所需的 `response.output` 项。
 - 把本地工具结果转换成具有匹配 `call_id` 的 `function_call_output`。
 - 上下文压缩后，用结构化摘要和最近消息开启新的无状态上下文段。
-- 默认最大输出为 4096 tokens，并计入真实用量日志。
+- 主模型请求默认最大输出为 16384 tokens，并计入真实用量日志；上下文摘要仍显式限制为 4096 tokens。若一次主响应因输出上限被完整丢弃，下一次且仅下一次恢复请求使用 32768 tokens，同时获得确定性的单动作约束：只能返回一个完整工具调用（全部参数内容最多 12,000 字符）或最多 2,000 字符的最终文本，不能把说明文字和工具调用混在同一响应中。第二次连续输出超限会在第三次 provider 请求前稳定终止为 `model_output_limit`；恢复指令不包含供应商异常正文、被丢弃的部分输出、Skill 正文、凭据或本地路径。
 - 不记录认证头、隐藏推理或加密推理载荷。
 
 `ChatCompletionsModelClient` 是独立、加法式适配器：
@@ -227,6 +229,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - SDK 在返回对象前抛出的 `APIResponseValidationError` 或 `json.JSONDecodeError` 与解析器拒绝一样归为非致命 `invalid_model_response`，不重试，并丢弃异常文本、响应体和 JSON doc。
 - 不使用服务端 conversation、`previous_response_id` 或其他持久状态；`ModelResponse.continuation` 始终为空。
 - 流式路径使用 `stream=True`，按 tool index 聚合可交错的函数调用参数片段，保持 call ID、名称、类型和响应 ID 稳定，再复用同步解析器生成内部响应。
+- 流在尚未公开文本时若结构非法，最多使用一次非流式请求重新获取完整响应；同步结果继续通过同一严格解析器。公开文本之后的非法流只丢弃本轮并失败，不再回退。
 
 配置组合在任何 SDK 构造或网络请求前验证：Responses 使用官方默认 endpoint 且拒绝 `--base-url`；Chat Completions 要求合法 HTTPS `--base-url`。两种模式使用互不回退的环境变量凭据。可配置 base URL 不代表任意服务兼容，目标 endpoint 还必须正确实现标准 Chat Completions 函数工具调用、call ID 和 tool result 语义。
 
@@ -259,6 +262,12 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - 只读取 UTF-8 文本。
 - `start_line` 从 1 开始；`end_line` 可以为 `null`。
 - 单次最多读取 256 KiB，返回实际行号和截断状态。
+
+### `create_directory`
+
+- 参数：`path`。
+- 只创建一个尚不存在的工作区相对目录；直接父目录必须已经存在。
+- 不递归创建父目录；成功后把规范化目录路径写入修改账本并使旧验证失效。
 
 ### `replace_text`
 
@@ -410,7 +419,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - `echo`、目录查看、`git status` 等纯检查命令不能作为验证证据。
 - Java `purpose="test"`、不完整用例、编译失败、程序失败、输出不匹配、截断、超时或清理失败均不能形成通过证据。
 - 最新可信验证必须在最后修改之后执行且退出码为 `0`。
-- 本地完整性验证使用最后一次修改的精确 `changed_paths`，限制每个文件最多 524,288 原始字节，只读 UTF-8 文本；`.py`、`.json`、`.toml` 还必须通过确定性语法解析。其他文本类型只进行完整性检查，因此 C/C++ 等项目的 `SUCCESS` 不表示已经编译。
+- 未配置强制验证且没有过期的模型/用户验证证据时，每个成功修改响应结束后最多运行一次本地结构完整性检查，覆盖该批次结束时的最终 `mutation_index`。安全目录可以作为 changed path；文件限制为 524,288 原始字节和 UTF-8，`.py`、`.json`、`.toml` 还必须通过确定性语法解析。该证据不会自行结束循环，必须等待后续非空最终文本；其他文本类型只进行完整性检查，因此 C/C++ 等项目的 `SUCCESS` 不表示已经编译。
 
 模型文本中的“完成”“通过”或类似声明都不是验证证据。
 
@@ -504,6 +513,8 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 22. **分层预算而非单纯提高总轮次**：主调用与摘要调用独立计数、共享 provider 硬上限，并给摘要设置更小的 provider 子预算；这避免维护性摘要挤占核心推理，同时仍有全局成本边界。
 23. **确定性进度账本而非模型自报进展**：首次检查属于弱进展，修改、验证和阶段转换属于强进展；决策检查点先帮助模型收敛，持续探索才以准确的 `no_progress` 终止。
 24. **门控恢复而非自动命令改写**：最后只读额度让复杂调查保留有限收尾空间；额度或命令规则触发拒绝时，只返回安全、精确的纠正约束，绝不替模型重写或执行命令。无法形成新鲜证据时，用 `changes_unverified` 准确表达“文件已改但未验证”。
+25. **多 Skill 保持选择、阶段流程单一**：同一次 run 可以保留 brainstorming、writing-plans 和 test-driven-development 等全部已选择 Skill，但通用协调指令根据最新请求和显式批准只激活一个阶段主流程，避免重复设计、重复索要批准或在计划前提前实施；该协调只影响提示组合，不增加权限、工具或持久化状态。
+26. **一次性扩大输出恢复而非无限加长**：普通主请求保持 16384 tokens；首次完整截断后只允许一次 32768-token 恢复，并用单动作与字符上限促使模型拆分工作。第二次连续截断仍失败关闭，在提高复杂 Skill 工作流可用性的同时保持成本和循环终止可解释。
 
 ## 18. 本地 Web 里程碑
 
@@ -515,7 +526,7 @@ REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果�
 
 每个 run 携带不可变、供应商无关的 `RunMode`，只接受 `modify` 与 `read_only`，默认值为 `modify`。模式由 CLI 或 Web 用户显式选择，不能根据提示词推断，也不固定在整个会话上；同一会话的后续消息可以重新选择。
 
-`modify` 保留现有六个工具和新鲜验证门槛。`read_only` 只注册 `list_directory`、`read_file` 与专用 `inspect_git`；后者只能执行既有安全策略批准的本地 Git `status`、`diff`、`log`、`show` 和 `ls-files`。只读模式不注册文件修改、通用命令、Java 或验证工具。
+`modify` 提供 `list_directory`、`read_file`、`create_directory`、`replace_text`、`write_file`、`run_command` 和 `run_java_tests` 七个工具及新鲜验证门槛。`read_only` 只注册 `list_directory`、`read_file` 与专用 `inspect_git`；后者只能执行既有安全策略批准的本地 Git `status`、`diff`、`log`、`show` 和 `ls-files`。只读模式不注册文件修改、通用命令、Java 或验证工具。
 
 任一模式的非空、无工具最终文本在零修改、零验证的不变量成立时进入 `ANSWERED`，退出码为 `0`；这体现 `modify` 是能力而非意图。`SUCCESS` 仍只表示修改能力运行获得了最后一次修改后的新鲜通过证据。模式随 run 写入 SQLite、REST/SSE、审计和最终报告；历史数据库迁移时保守标记为 `modify`。
 
@@ -533,7 +544,7 @@ REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果�
 
 稳定终止优先级为：内部不变量、安全拒绝、时间、全局 provider 预算、无进展、主调用预算、工具预算、连续模型错误、连续工具错误、精确重复调用。用户中断、审计失败、致命模型错误、上下文预算耗尽和空响应继续作为即时原因处理。摘要成功不能重置主模型连续错误；摘要普通失败只触发当前 run 的摘要熔断。
 
-`standard`/`deep` 选择从 CLI 或 Web 进入 `RunConfig`，随每个 run 写入 Session、SQLite、REST/SSE、审计和最终报告；历史 run 缺少该字段时迁移为 `standard`。follow-up 可为新 run 选择不同档位，正在运行的 run 不可改变。GUI 只展示档位、阶段、安全计数、剩余额度、压缩来源和检查点，不展示隐藏指令、完整工具参数、绝对路径、摘要正文或 continuation。
+`standard`/`deep` 选择从 CLI 或 Web 进入 `RunConfig`，随每个 run 写入 Session、SQLite、REST/SSE、审计和最终报告；历史 run 缺少该字段时迁移为 `standard`。follow-up 可为新 run 选择不同档位，正在运行的 run 不可改变。GUI 不展示隐藏指令、完整工具参数、运行事件中的绝对路径、摘要正文或 continuation。Task31 唯一允许的绝对路径投影是用户明确要求的“当前配置工作区根路径”，它只进入受现有 loopback、Host/Origin、CSP 与 no-store 边界保护的首页顶部，不进入运行状态、REST/SSE、SQLite、JSONL、模型上下文或报告。
 
 ## 21. 本地 Skill 导入与会话删除
 
@@ -541,7 +552,33 @@ Task27–Task28 按 `docs/superpowers/specs/2026-08-31-local-skill-import-sessio
 
 Task28 允许 GUI 逐条确认删除空闲会话及其精确 `audit_run_id` JSONL。专用删除服务以不可变数据库 manifest、精确日志路径、可逆暂存清单、显式 SQLite 子表删除顺序和启动恢复协调文件系统与数据库；不使用 glob、数据库路径文本或用户给定文件目标。活动 run 期间禁止导入或删除。两项能力只属于本地控制面，不暴露为模型工具，也不允许任意工作区删除。
 
-## 22. 首版不实现的功能
+## 22. Chat Completions Web 模型发现与逐 Run 选择
+
+Task30 按 `docs/superpowers/specs/2026-08-31-chat-completions-dynamic-model-selection-design.md` 实施。仅 Chat Completions Web 模式通过服务端 Models API 获取有界、完整的模型 ID 快照；浏览器不接触凭据或 base URL。Controller 从配置默认值或最后一次成功快照中解析模型，并在 admission 时把精确 ID 固化进 Run、SQLite 和每次新建的 `RunConfig`。刷新失败保留 last-good 快照或启动默认值，Responses 与一次性 CLI 保持原行为。
+
+模型目录完整接受供应商返回的合法 ID，不按名称推断能力；单个 ID 最多 256 个 UTF-8 字节，完整快照最多 2,048 个唯一 ID，超限时整次刷新失败而不静默截断。目录读取与刷新不消耗 Agent 运行预算，也不写入运行 JSONL。模型选择器位于 GUI 输入框操作栏，活动 run 期间禁用；切换只影响下一次新 run，不能改变正在运行或历史 run。
+
+每个新 run 把解析后的非空模型 ID 同时写入不可变请求、SQLite、REST 投影和实际执行配置。历史 SQLite 行迁移为 `model_id = NULL`，因为当前启动配置不能证明旧 run 使用了哪个模型。Models API 只证明 ID 对当前凭据可见，不保证文本、流式或函数工具调用兼容；不兼容模型沿用现有稳定 provider/model 失败路径。
+
+## 23. Web GUI 代码复制、工作区路径与活动动画
+
+Task31 按 `docs/superpowers/specs/2026-08-31-web-gui-copy-workspace-path-activity-animation-design.md` 实施。左侧品牌区只保留并放大 MiniCodex；主区顶部用内联文件夹图标和单行省略文本展示规范化工作区绝对路径，替换模型、摘要、provider 请求和工具调用次数。路径在服务端进入首页前同时按文本/attribute 规则转义，完整值只属于本地页面展示边界。
+
+确定性 Markdown renderer 为每个闭合 fenced code block 创建显式 `pre/code` 与复制按钮；剪贴板正文只来自围栏内文本节点，不进入 attribute，不使用 HTML 字符串解析。成功和失败只显示固定本地状态，clipboard 异常不会进入连接提示或日志。当前活动回复卡使用低对比度三点脉冲表示 run 仍在进行，terminal/history 卡不动画，`prefers-reduced-motion` 下停止循环。上述改动不改变 SSE 事实、run 预算、Agent 权限或完成语义。
+
+### 23.1 修改后收敛、临时叙述与 Provider 等待边界
+
+验证门继续记录每次可信证据，但进度账本只接受单调前进：首次证据、`validation_index` 增加、同一 index 的终态变化，或来源按 `LOCAL_INTEGRITY < MODEL < USER_VERIFY` 升级时才算强进展。相同 index、状态和来源的重复结果，以及仅命令、输出或耗时变化，不得重置 checkpoint；较低 index 和来源降级也不得倒退状态。
+
+符合条件的修改批次通过 eager local integrity 后，立即激活 `post_mutation_integrity` checkpoint，再保留既有 **Standard 1 / Deep 2** 个普通最终读取批次。完整性检查只证明受保护路径仍可读取且支持的结构可解析，不是交互测试、编译或行为验证，也不能单独形成 `SUCCESS`。
+
+同时含文本和工具调用的模型响应仍以一条 `AssistantMessage(content, tool_calls)` 留在内部历史，保证 provider 的调用配对合法；该文本不调用 confirmed handler、不写入 SQLite。流式 delta 可以临时显示，但首个工具启动事件会先发出 `assistant_text_discarded/tool_response_narration`，再显示工具活动。只有不含工具调用的最终文本可以成为持久会话回复。
+
+项目自行构造的 Responses 与 Chat Completions SDK client 显式设置 30.0 秒网络操作 timeout，并保持 SDK `max_retries=0`；适配器既有最多三次物理 attempt、共享预算和错误脱敏语义不变。GUI 对具有整数 `exit_code` 的命令活动显示 `exit N`，不再用工具调度层的 `ok` 暗示子进程成功。
+
+交互程序的缺陷应在现有授权能力可覆盖时写成正式聚焦回归测试。不得创建一次性诊断脚本来绕过命令策略；语法检查和纯领域测试不能冒充人工交互验证，无法自动执行时必须明确说明“人工交互未验证”并报告真实退出码。本阶段没有增加 PTY、C/C++ 编译、Bash/WSL、文件删除工具、依赖或新的安全权限。
+
+## 24. 首版不实现的功能
 
 - 多智能体、子 Agent 和独立 Planner。
 - 向量数据库、长期记忆和语义检索。
@@ -551,6 +588,7 @@ Task28 允许 GUI 逐条确认删除空闲会话及其精确 `audit_run_id` JSON
 - macOS、Linux 正式支持。
 - 自定义 Responses endpoint、Azure 专用协议或供应商专用非标准 API。
 - 自动 endpoint 探测、按 URL 猜测 API 模式或凭据回退。
+- Responses API 模型发现或动态切换、活动 run 中途换模、模型能力探测、按名称过滤、定时自动刷新和浏览器持久化模型偏好。
 - WebSocket、异步客户端、多个 choices、旧式 `function_call` 或非函数工具。
 - TUI、桌面 GUI、账户系统和多会话并发执行。
 - 可执行 Skill、远程 Skill、用户级 Skill 安装、Skill 更新/覆盖/编辑/卸载、市场和 Skill 自定义工具；Task27 只增加当前工作区单个纯声明式 zip 的显式本地导入。
@@ -561,7 +599,7 @@ Task28 允许 GUI 逐条确认删除空闲会话及其精确 `audit_run_id` JSON
 - Git 写操作、自动提交、自动推送或远程仓库操作。
 - 对恶意工作区代码的操作系统级隔离保证。
 
-## 23. 当前方案的局限性
+## 25. 当前方案的局限性
 
 - 有限命令白名单只覆盖 Python 演示场景，不是通用 Coding Agent 的完整命令生态。
 - `replace_text` 不适合大规模重构或重复片段复杂编辑。
@@ -572,6 +610,7 @@ Task28 允许 GUI 逐条确认删除空闲会话及其精确 `audit_run_id` JSON
 - 会话支持顺序 follow-up，但不支持多个 run 并发执行，也不恢复上次进程中的可执行 Agent 状态，因此仍不适合无人值守的超长开发任务。
 - OpenAI-compatible 只是协议目标而非兼容性保证；第三方 endpoint 必须实现标准 Chat Completions 工具调用、call ID 和 tool result 配对语义。
 - Chat Completions 使用 `max_tokens` 以覆盖目标兼容服务；只接受 `max_completion_tokens` 的 endpoint 不在 Task15 范围内。
+- Chat Completions Models API 返回的 ID 只表示对当前凭据可见；列表中的模型仍可能不支持本 Agent 要求的文本、流式或函数工具调用语义。
 - 真实模型行为具有非确定性，自动测试主要依赖 FakeModelClient；真实 API 测试只能作为单独记录的人工证据。
 - `standard` 与 `deep` 是可解释的固定档位，并不保证适合所有仓库；确定性进度启发式仍可能要求用户为异常复杂的只读调查选择 `deep`。
 - 最终只读额度和命令纠正都是有限启发式；复杂仓库仍可能以 `decision_required` 或 `changes_unverified` 停止。此时修改文件会保留，不提供事务回滚。

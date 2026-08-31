@@ -67,11 +67,14 @@ def test_builder_layers_sources_once_in_deterministic_order(tmp_path: Path) -> N
 
     assert snapshot == repeated
     assert snapshot.text.count("## MiniCodex base instructions") == 1
-    assert snapshot.text.endswith(
+    assert (
         "## Workspace instructions (AGENTS.md)\n"
         "workspace\ninstruction\n\n"
-        "## Selected skill instructions\nskill\ninstruction"
+        "## Selected skill instructions\nskill\ninstruction\n\n"
+        "## Skill workflow coordination\n"
+        in snapshot.text
     )
+    assert snapshot.text.endswith("or local authorization.")
     assert "must not load" not in snapshot.text
     assert snapshot.char_count == len(snapshot.text)
     assert snapshot.sha256 == hashlib.sha256(
@@ -81,7 +84,31 @@ def test_builder_layers_sources_once_in_deterministic_order(tmp_path: Path) -> N
     assert "skill" not in repr(snapshot)
 
 
-def test_modify_instructions_name_only_modify_capabilities(tmp_path: Path) -> None:
+def test_selected_development_skills_receive_one_authoritative_handoff_section(
+    tmp_path: Path,
+) -> None:
+    selected = "brainstorming rules\n\nwriting-plans rules\n\ntdd rules"
+
+    snapshot = RunInstructionBuilder().build(
+        tmp_path,
+        skill_instructions=selected,
+    )
+
+    assert snapshot.text.count("## Skill workflow coordination") == 1
+    assert snapshot.text.index(
+        "## Selected skill instructions"
+    ) < snapshot.text.index("## Skill workflow coordination")
+    coordination = snapshot.text.split("## Skill workflow coordination\n", 1)[1]
+    assert "remain selected" in coordination
+    assert "one primary process workflow" in coordination
+    assert "approved design" in coordination
+    assert "approved implementation plan" in coordination
+    assert "Do not restart" in coordination
+
+
+def test_modify_instructions_name_create_directory_and_only_modify_capabilities(
+    tmp_path: Path,
+) -> None:
     snapshot = RunInstructionBuilder().build(
         tmp_path,
         run_mode=RunMode.MODIFY,
@@ -90,6 +117,7 @@ def test_modify_instructions_name_only_modify_capabilities(tmp_path: Path) -> No
     assert "Selected run mode: modify" in snapshot.text
     assert "list_directory" in snapshot.text
     assert "read_file" in snapshot.text
+    assert "create_directory" in snapshot.text
     assert "replace_text" in snapshot.text
     assert "write_file" in snapshot.text
     assert "run_command" in snapshot.text
@@ -112,6 +140,26 @@ def test_modify_instructions_publish_exact_safe_verification_forms(
     assert 'purpose="verification"' in text
     assert "run_java_tests" in text
     assert "&&" in text and "pipes" in text
+
+
+def test_modify_instructions_require_honest_interactive_verification(
+    tmp_path: Path,
+) -> None:
+    text = RunInstructionBuilder().build(
+        tmp_path,
+        run_mode=RunMode.MODIFY,
+    ).text
+
+    assert "focused regression test" in text
+    assert "one-off diagnostic scripts" in text
+    assert "must not bypass the command policy" in text
+    assert "interactive behavior" in text
+    assert "manual interaction remains unverified" in text
+    assert "real exit code" in text
+    assert "python <workspace-relative-file.py>" in text
+    assert "python -m pytest" in text
+    assert "run_java_tests" in text
+    assert "Bash or WSL" in text
 
 
 def test_modify_instructions_distinguish_answers_from_changed_success(
@@ -140,6 +188,7 @@ def test_read_only_instructions_name_only_read_capabilities(
     assert "read_file" in snapshot.text
     assert "inspect_git" in snapshot.text
     for unavailable in (
+        "create_directory",
         "replace_text",
         "write_file",
         "run_command",

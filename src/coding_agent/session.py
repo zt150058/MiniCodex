@@ -12,6 +12,7 @@ import uuid
 
 from coding_agent.budget import BudgetProfile
 from coding_agent.messages import JSONObject, JSONValue
+from coding_agent.model_catalog import ModelCatalogError, require_model_id
 from coding_agent.run_mode import RunMode
 
 
@@ -434,6 +435,7 @@ class SessionRunRecord:
     termination_reason: str | None
     audit_run_id: str | None
     final_report: JSONObject | None = field(repr=False)
+    model_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _require_id(self.run_id, "run_id")
@@ -453,6 +455,11 @@ class SessionRunRecord:
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"{field_name} must be a non-empty string or null")
         _require_optional_id(self.audit_run_id, "audit_run_id")
+        if self.model_id is not None:
+            try:
+                require_model_id(self.model_id)
+            except ModelCatalogError:
+                raise ValueError("model_id must be a valid model identifier or null") from None
 
         terminal = self.status in {
             SessionRunStatus.SUCCEEDED,

@@ -19,6 +19,7 @@ from coding_agent.tools.base import (
 
 _LIST_ARGUMENTS = {"path", "recursive", "max_depth", "max_entries"}
 _READ_ARGUMENTS = {"path", "start_line", "end_line"}
+_CREATE_DIRECTORY_ARGUMENTS = {"path"}
 _REPLACE_ARGUMENTS = {"path", "old_text", "new_text", "expected_count"}
 _WRITE_ARGUMENTS = {"path", "content"}
 _MAX_READ_BYTES = 256 * 1024
@@ -292,6 +293,49 @@ class ReadFileTool:
         return _json_execution(
             {"lines": lines},
             truncated=size_truncated or omitted_before or omitted_after,
+        )
+
+
+class CreateDirectoryTool:
+    name = "create_directory"
+    schema: JSONObject = {
+        "name": "create_directory",
+        "description": (
+            "Create exactly one new directory whose parent already exists."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string", "minLength": 1}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }
+
+    def execute(
+        self,
+        arguments: JSONObject,
+        context: ExecutionContext,
+    ) -> ToolExecution:
+        values = _require_exact_arguments(
+            arguments,
+            _CREATE_DIRECTORY_ARGUMENTS,
+            self.name,
+        )
+        guarded = PathGuard(context.workspace).new_directory(values["path"])
+        try:
+            guarded.absolute.mkdir()
+        except FileExistsError as exc:
+            raise ToolArgumentError("target already exists") from exc
+        except FileNotFoundError as exc:
+            raise ToolArgumentError("parent directory does not exist") from exc
+        except NotADirectoryError as exc:
+            raise ToolArgumentError("parent path is not a directory") from exc
+        except OSError as exc:
+            raise ToolArgumentError("directory could not be created") from exc
+        return _json_execution(
+            {"path": guarded.relative},
+            changed_paths=(guarded.relative,),
         )
 
 

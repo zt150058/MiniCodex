@@ -1179,6 +1179,187 @@
 
 `已完成`
 
+## 29. 目录修改、验证收敛与 Chat 流式兼容回退
+
+**任务目标**
+
+在不扩大既有文件安全边界和公共 provider 接口的前提下，增加安全的单级目录创建、按模型响应结算的安全拒绝计数、修改批次后的确定性本地完整性验证，以及 Chat Completions 流在尚未公开文本时发生结构错误后的单次同步兼容回退。
+
+**涉及模块**
+
+- `src/coding_agent/safety.py`
+- `src/coding_agent/tools/filesystem.py`
+- `src/coding_agent/app.py`
+- `src/coding_agent/instructions.py`
+- `src/coding_agent/agent.py`
+- `src/coding_agent/verification.py`
+- `src/coding_agent/chat_completions_client.py`
+- 对应路径、工具、Agent、验证、Chat 适配器、集成和文档测试
+
+**验收标准**
+
+- `create_directory` 只创建一个不存在的工作区相对目录，要求直接父目录已经存在；拒绝覆盖、递归父目录创建、保留目录和 reparse/symlink/junction 逃逸。
+- `write_file` 保持 create-only 和直接父目录必须存在，不增加删除、移动、重命名或递归目录能力。
+- 同一模型响应中的多个纯安全拒绝最多增加一次连续安全拒绝计数；三个独立的纯拒绝响应仍按既有阈值稳定终止。
+- `parent_not_found` 返回确定且脱敏的模型反馈，要求从最浅缺失父目录开始调用 `create_directory`。
+- 未配置强制验证且没有禁止降级的真实验证证据时，成功修改批次结束后只对最终 mutation epoch 执行一次本地完整性验证；通过后继续等待模型最终文本，不能直接进入 `SUCCESS`。
+- 强制 `--verify`、过期或失败的真实验证证据、预算、取消和验证失败仍保持既有严格语义。
+- Chat Completions 流在未公开任何文本时出现结构无效，可在同一 logical call 和共享 provider attempt 预算内执行恰好一次同步请求；同步结果仍使用严格解析器。
+- 已公开文本后的流错误禁止同步回退，部分文本被丢弃；Responses API、continuation 和现有 provider-neutral 公共接口保持不变。
+- 默认测试完全离线，不读取真实密钥、不访问网络、不新增依赖或 Agent 框架。
+
+**需要编写的测试**
+
+- `PathGuard.new_directory` 的相对路径、缺失父目录、已存在目标、保留目录和 Windows reparse/junction/symlink 测试。
+- `CreateDirectoryTool` strict schema、成功创建、失败零副作用、修改账本和 Registry 组合测试。
+- 单响应多拒绝、独立响应阈值、混合成功重置和确定性父目录纠错测试。
+- 修改批次后即时完整性验证、强制/真实证据排除、验证预算、取消、失败修复和最终文本完成测试。
+- Chat 流无公开文本回退、公开文本后不回退、同步响应非法、provider budget、回调、输出限制、清理和 `BaseException` 测试。
+- 创建多文件目录项目、选择 Skill、创建 `AGENTS.md` 和只读问答四类离线集成回归。
+- Task1—Task28、Windows reparse point、timeout 和进程树完整回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: add directory mutation and safe chat stream recovery`
+
+**当前状态**
+
+`已完成`
+
+## 30. Chat Completions 动态模型选择
+
+**任务目标**
+
+仅在 Chat Completions Web 模式下，通过服务端安全读取兼容 API 返回的全部合法模型 ID，并在输入框操作栏提供逐 run 模型选择与显式刷新；选择在准入时固化、持久化并用于构造该 run 的模型客户端，不改变 Responses 或一次性 CLI 行为。
+
+**涉及模块**
+
+- 新增 `src/coding_agent/model_catalog.py`
+- `src/coding_agent/session.py`
+- `src/coding_agent/session_runtime.py`
+- `src/coding_agent/session_store.py`
+- `src/coding_agent/session_controller.py`
+- `src/coding_agent/web.py`
+- `src/coding_agent/web_cli.py`
+- `src/coding_agent/web_static/index.html`
+- `src/coding_agent/web_static/styles.css`
+- `src/coding_agent/web_static/app.js`
+- 对应 Catalog、Session、SQLite、Controller、REST、Web CLI、GUI 和文档测试
+
+**验收标准**
+
+- 仅 Chat Completions Web 模式通过现有官方 OpenAI Python 客户端调用配置 base URL 下的 Models API；Responses 模式不联网发现模型并隐藏切换控件，一次性 CLI 保持原行为。
+- 目录接受供应商返回的全部合法模型 ID，不按名称或能力过滤；单个 ID 最多 256 UTF-8 字节，完整快照最多 2,048 个唯一 ID，超限或畸形响应整次失败而不返回部分列表。
+- 启动配置模型始终作为 fallback；首次失败返回默认值，刷新失败保留 last-good 快照，Web 服务启动和默认模型运行不依赖目录成功。
+- API Key 和 base URL 只驻留服务端；GUI、REST、SQLite、JSONL、错误、日志和 repr 不暴露凭据、provider body、SDK exception 或环境内容。
+- Controller 只接受配置默认值或最后一次成功快照中的精确 ID，并在任何 Session event、run row、worker 或 provider 调用前拒绝未知模型。
+- 每个新 run 的模型 ID 在准入后不可变，并在 `RunHandle`、`SessionRunRequest`、`SessionRunRecord`、SQLite、REST 和实际 `RunConfig` 中保持一致；follow-up 可选择不同模型，活动与历史 run 不受刷新或后续选择影响。
+- SQLite schema v5 为旧 run 保留 `model_id = NULL`，不使用当前启动配置伪造历史；新 run 必须持久化经过验证的非空 ID，既有报告 JSONL 不重写。
+- GUI 模型选择器与刷新按钮位于输入框操作栏，桌面端不挤占对话区；长 ID 省略显示但完整 option 可访问，活动 run 或刷新期间锁定，页面重载回到启动默认值。
+- 目录读取、刷新、选择、失败回退和 DOM 渲染由完全离线的 fake SDK、Python 与 Node 测试覆盖；不新增依赖、Agent 框架、网络测试或不安全 HTML sink。
+
+**需要编写的测试**
+
+- 模型 ID grammar、完整分页、排序去重、默认插入、大小边界、超量失败、last-good、并发刷新、错误脱敏和 Responses disabled 测试。
+- Run 领域类型、执行器配置替换、Controller 默认/切换/未知拒绝/一致性和零副作用测试。
+- SQLite fresh schema、v1/v2/v3/v4→v5、历史 NULL、新 run 精确持久化、恢复和删除回归测试。
+- REST 目录状态、严格 query/body、认证/no-store、错误映射、create/follow-up 和 legacy projection 测试。
+- GUI 初始化、刷新、fallback、长 ID、Responses 隐藏、活动锁、精确提交、安全 DOM、Enter 和布局回归测试。
+- 全量离线 Python、Node、provider、Session、Web、安全、依赖、凭据和 `git diff --check` 验证。
+
+**建议的 Git 提交说明**
+
+`feat: add dynamic chat model selection`
+
+**当前状态**
+
+`已完成`
+
+## 31. Web GUI 代码复制、工作区路径与活动动画
+
+**任务目标**
+
+为 MiniCodex 回复中的 fenced code block 增加安全复制按钮，移除顶部运行调用计数并用文件夹图标和当前工作区规范化绝对路径替换；左侧只保留放大的 MiniCodex，并在当前活动回复卡左侧增加尊重 reduced-motion 的轻量等待动画。
+
+**涉及模块**
+
+- `src/coding_agent/web.py`
+- `src/coding_agent/web_static/index.html`
+- `src/coding_agent/web_static/styles.css`
+- `src/coding_agent/web_static/app.js`
+- `tests/test_web_gui.py`
+- `tests/js/web_gui.test.mjs`
+- `docs/USAGE.md`
+- `tests/test_docs.py`
+
+**验收标准**
+
+- 左侧不再显示工作区文件夹名，只保留现有代码图标和放大的 MiniCodex；不改变会话栏宽度、开关或滚动行为。
+- 顶部不再渲染模型、摘要、provider 请求或工具调用次数；原位置展示带内联文件夹 SVG 的规范化绝对工作区路径，视觉单行省略且完整 text/title 可访问。
+- 绝对路径只进入经过 HTML text/attribute 转义的 loopback/no-store 首页，不进入 REST、SSE、SQLite、JSONL、模型上下文、报告或异常。
+- 每个已闭合的 assistant fenced code block 只有一个复制按钮；复制正文不含围栏、语言标签或展示用尾换行，用户消息、inline code 和未闭合围栏不增加按钮。
+- Clipboard 成功、失败和不可用都使用固定本地状态；pending 防重复，1.5 秒恢复，不显示异常文本，不污染连接状态。
+- 只有当前活动/provisional 回复卡显示三点脉冲；历史、terminal、取消和 changes-unverified 卡不动画，run 结束或切换会话后立即清除。
+- 动画为纯 CSS、低对比度且不伪造百分比；`prefers-reduced-motion: reduce` 下停止循环。
+- 全部 DOM 继续使用安全 node API，不新增依赖、inline handler/style、不安全 HTML sink、网络请求或 Agent/Session/预算行为变化。
+- Python/Node 测试覆盖路径转义、布局、复制 red/green、动画生命周期、安全 DOM 和所有既有 GUI 回归；完整离线 suite、策略扫描与 `git diff --check` 通过。
+
+**需要编写的测试**
+
+- 首页绝对路径 text/title 双重转义、marker 完整性、品牌简化、路径 ellipsis、folder SVG 和安全头测试。
+- fenced code 单按钮、精确复制、pending、成功恢复、稳定失败、恶意文本和未闭合围栏测试。
+- active-only indicator、terminal/history 无动画、reduced-motion、header 无调用计数测试。
+- Markdown/table/link、会话、Skill、删除、模型选择、Enter、SSE 和响应式布局完整回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: refine web workspace and activity UI`
+
+**当前状态**
+
+`已完成`
+
+## 32. 修改后收敛、验证诚实性与 Provider 等待上限
+
+**任务目标**
+
+修复同一 mutation 上重复验证不断重置收敛、带工具文本污染会话、命令非零退出被 GUI 显示为 `ok`、交互式程序验证范围被夸大，以及生产 provider attempt 继承长默认等待的问题。
+
+**涉及模块**
+
+- `verification.py`、`progress.py`、`agent.py` 和严格审计事件
+- `session_controller.py` 的 provisional/confirmed/discarded 生命周期
+- `model.py`、Responses 与 Chat Completions 生产 SDK 构造
+- 固定运行指令和本地 GUI 工具活动投影
+- 对应离线 Python、Node、Session、provider 和文档测试
+
+**验收标准**
+
+- 验证事实仍完整记录，但同一 mutation、状态和来源的重复证据不构成强进展；validation index 前进、状态变化或来源升级仍构成强进展。
+- eager local integrity 成功后立即激活 `post_mutation_integrity` checkpoint，继续保持 Standard 1 / Deep 2 个普通最终只读批次。
+- 带工具调用的文本保留在 provider 历史中但不写入 `assistant_text_committed`；流式临时叙述在首个工具活动前确定性清除。
+- 两个生产 SDK 客户端显式使用 30.0 秒网络操作 timeout，既有三次物理尝试上限、预算、流式 discard 和隐私语义保持不变。
+- 固定指令要求缺陷进入正式回归测试，禁止创建仅用于绕过命令策略的一次性诊断脚本，并准确区分自动测试与未执行的人工交互验证。
+- GUI 对整数退出码显示 `exit N`，非零退出不得再以工具层 `ok` 暗示命令成功；REST、SSE 和 SQLite schema 不变。
+- 不新增 PTY、WSL、Shell、C/C++ 编译、删除工具、依赖、Agent 框架或预算额度。
+
+**需要编写的测试**
+
+- 验证来源等级、状态、validation index 和重复证据的参数化测试。
+- 修改后 checkpoint、档位边界、重复验证和端到端收敛测试。
+- Agent confirmed handler、Controller 临时叙述 discard 和 SQLite narrative 测试。
+- 两个 SDK factory 的 timeout、重试、流式和脱敏回归测试。
+- 交互验证指令合同、GUI `exit 0`/`exit 1`/无退出码投影测试。
+- 完整 Python、Node、Windows reparse point、timeout 和进程树回归及安全审计。
+
+**建议的 Git 提交说明**
+
+`fix: make debugging runs converge honestly`
+
+**当前状态**
+
+`进行中`
+
 ## 任务完成规则
 
 每项任务只有在以下条件同时满足时才能标记为 `已完成`：

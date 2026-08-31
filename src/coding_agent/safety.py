@@ -317,6 +317,37 @@ class PathGuard:
         absolute = resolved_parent / candidate.name
         return GuardedPath(absolute, "/".join(parts))
 
+    def new_directory(self, raw_path: object) -> GuardedPath:
+        parts = self._relative_parts(raw_path)
+        self._reject_protected(parts)
+        self._reject_reparse_components(parts)
+        if not parts:
+            raise SafetyViolation(
+                SafetyCode.PATH_TYPE_MISMATCH,
+                "new directory path must name a directory",
+            )
+        candidate = self._workspace.joinpath(*parts)
+        self._contained(candidate)
+        if candidate.exists() or candidate.is_symlink():
+            raise SafetyViolation(
+                SafetyCode.PATH_TYPE_MISMATCH,
+                "target already exists",
+            )
+        parent = candidate.parent
+        if not parent.exists():
+            raise SafetyViolation(
+                SafetyCode.PARENT_NOT_FOUND,
+                "parent directory does not exist",
+            )
+        if not parent.is_dir():
+            raise SafetyViolation(
+                SafetyCode.PATH_TYPE_MISMATCH,
+                "parent path is not a directory",
+            )
+        resolved_parent = parent.resolve(strict=True)
+        self._contained(resolved_parent)
+        return GuardedPath(resolved_parent / candidate.name, "/".join(parts))
+
 
 class CommandSource(StrEnum):
     MODEL = "model"
