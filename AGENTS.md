@@ -77,14 +77,17 @@ Before completing a task, verify:
 
 ## Design and approval gates
 
-- Read `DESIGN.md` and `TASKS.md` before changing production behavior.
-- `DESIGN.md` is the approved architectural source of truth.
-- `TASKS.md` defines the implementation order and per-task acceptance criteria.
-- Do not create production source code until the user approves `DESIGN.md`,
-  `TASKS.md`, and `AGENTS.md`, then approves the detailed implementation plan.
+- Read `docs/project/DESIGN.md` and `docs/project/TASKS.md` before changing
+  production behavior.
+- `docs/project/DESIGN.md` is the approved architectural source of truth.
+- `docs/project/TASKS.md` defines the implementation order and per-task
+  acceptance criteria.
+- Do not create production source code until the user approves
+  `docs/project/DESIGN.md`, `docs/project/TASKS.md`, and `AGENTS.md`, then
+  approves the detailed implementation plan.
 - Do not invoke an implementation workflow while a required approval is
   pending.
-- Work on one `TASKS.md` item at a time and keep its status accurate.
+- Work on one `docs/project/TASKS.md` item at a time and keep its status accurate.
 - If implementation reveals a design conflict, stop and return to
   brainstorming rather than silently changing the architecture.
 - Do not commit, push, rewrite Git history, or operate on a remote repository
@@ -165,7 +168,7 @@ Before completing a task, verify:
   evidence for the latest mutation, preserve the files and terminate as
   `changes_unverified`; do not claim rollback or `SUCCESS`.
 - Every run has an immutable `BudgetProfile`. Keep `standard` aligned with
-  `DESIGN.md`: 24 main model calls, 4 summary calls, 48 provider attempts,
+  `docs/project/DESIGN.md`: 24 main model calls, 4 summary calls, 48 provider attempts,
   8 summary provider attempts, 80 tool calls, and 20 minutes. Keep `deep` at
   40 main calls, 6 summary calls, 80 provider attempts, 12 summary provider
   attempts, 140 tool calls, and 30 minutes. These are hard caps, not promised
@@ -205,5 +208,5 @@ Before completing a task, verify:
   verification invariant.
 - A model statement that work is complete is not proof. Report only local
   execution evidence and actual exit codes.
-- Do not mark a `TASKS.md` item complete until its acceptance criteria and
+- Do not mark a `docs/project/TASKS.md` item complete until its acceptance criteria and
   required tests have actually been satisfied.

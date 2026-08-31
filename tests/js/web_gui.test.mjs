@@ -6,7 +6,7 @@ import { TestDocument, findElements } from "./dom_harness.mjs";
 
 
 const appSource = await readFile(
-  new URL("../../src/coding_agent/web_static/app.js", import.meta.url),
+  new URL("../../src/coding_agent/web/static/app.js", import.meta.url),
   "utf8",
 );
 const gui = await import(

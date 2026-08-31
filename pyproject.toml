@@ -13,14 +13,14 @@ dependencies = ["openai", "fastapi", "uvicorn"]
 test = ["pytest", "httpx"]
 
 [project.scripts]
-coding-agent = "coding_agent.cli:entrypoint"
-coding-agent-web = "coding_agent.web_cli:entrypoint"
+coding-agent = "coding_agent.application.cli:entrypoint"
+coding-agent-web = "coding_agent.web.cli:entrypoint"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-coding_agent = ["web_static/*.html", "web_static/*.css", "web_static/*.js"]
+"coding_agent.web" = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

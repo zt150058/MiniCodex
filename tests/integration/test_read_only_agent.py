@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from coding_agent.agent import AgentRunner
-from coding_agent.messages import ModelResponse, ToolCall
-from coding_agent.model import FakeModelClient
-from coding_agent.run_mode import RunMode
-from coding_agent.state import AgentStatus, VerificationStatus
-from coding_agent.tools.base import ExecutionContext
-from coding_agent.tools.filesystem import ListDirectoryTool, ReadFileTool
-from coding_agent.tools.registry import ToolRegistry
+from coding_agent.engine.agent import AgentRunner
+from coding_agent.engine.messages import ModelResponse, ToolCall
+from coding_agent.engine.model import FakeModelClient
+from coding_agent.engine.run_mode import RunMode
+from coding_agent.engine.state import AgentStatus, VerificationStatus
+from coding_agent.operations.tools.base import ExecutionContext
+from coding_agent.operations.tools.filesystem import ListDirectoryTool, ReadFileTool
+from coding_agent.operations.tools.registry import ToolRegistry
 
 
 def test_project_inspection_answers_before_logical_call_limit(

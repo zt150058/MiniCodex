@@ -63,7 +63,7 @@ coding-agent "修复失败测试" --workspace . --api-mode chat-completions --ba
 
 ## ModelClient 与适配器边界
 
-核心只依赖 `src/coding_agent/model.py` 中的 `ModelClient.complete(ModelRequest) -> ModelResponse`。`src/coding_agent/openai_client.py` 实现 `OpenAIResponsesClient`；`src/coding_agent/chat_completions_client.py` 独立实现 `ChatCompletionsModelClient`。两者都把 SDK 对象、异常和响应转换为 provider-neutral 内部类型。
+核心只依赖 `src/coding_agent/engine/model.py` 中的 `ModelClient.complete(ModelRequest) -> ModelResponse`。`src/coding_agent/providers/openai_client.py` 实现 `OpenAIResponsesClient`；`src/coding_agent/providers/chat_completions_client.py` 独立实现 `ChatCompletionsModelClient`。两者都把 SDK 对象、异常和响应转换为 provider-neutral 内部类型。
 
 AgentRunner、messages、ContextManager、工具、验证和报告层不知道具体 API mode。新增 Chat 能力没有修改公共 ModelClient 边界，也没有把 SDK 类型泄漏到核心层。
 

@@ -212,7 +212,7 @@ Chat 连续 Agent 循环合同位于 `tests/integration/test_chat_completions_ag
 .\.venv\Scripts\python.exe -m pytest tests\integration\test_chat_completions_agent.py -q -p no:cacheprovider
 ```
 
-Java headless Agent 合同位于 `tests/integration/test_java_agent.py`；真实本机 JDK 冒烟位于 `tests/tools/test_java_tool.py`。前者完全离线使用 fake executor，后者在临时工作区真实编译并运行一个 `.in`/`.out` 用例。
+Java headless Agent 合同位于 `tests/integration/test_java_agent.py`；真实本机 JDK 冒烟位于 `tests/operations/test_java_tool.py`。前者完全离线使用 fake executor，后者在临时工作区真实编译并运行一个 `.in`/`.out` 用例。
 
 完整离线测试：
 
@@ -225,7 +225,7 @@ Java headless Agent 合同位于 `tests/integration/test_java_agent.py`；真实
 GUI 的确定性视觉 fixture 不读取凭据或调用模型：
 
 ```powershell
-.\.venv\Scripts\python.exe tests\manual_web_fixture.py
+.\.venv\Scripts\python.exe tests\manual\manual_web_fixture.py
 ```
 
 它只打印一个 `127.0.0.1` URL，用于人工检查宽屏、窄屏、长文本、代码块、紧凑 Skill 选择器和各运行状态；按 Ctrl+C 停止。

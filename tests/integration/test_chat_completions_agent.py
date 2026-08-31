@@ -7,20 +7,20 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from coding_agent.agent import AgentRunner
-from coding_agent.chat_completions_client import ChatCompletionsModelClient
-from coding_agent.context import ContextLimits, ContextManager
-from coding_agent.messages import JSONObject, ToolResult
-from coding_agent.progress import ProgressLimits
-from coding_agent.state import AgentStatus
-from coding_agent.tools.base import (
+from coding_agent.engine.agent import AgentRunner
+from coding_agent.providers.chat_completions_client import ChatCompletionsModelClient
+from coding_agent.engine.context import ContextLimits, ContextManager
+from coding_agent.engine.messages import JSONObject, ToolResult
+from coding_agent.engine.progress import ProgressLimits
+from coding_agent.engine.state import AgentStatus
+from coding_agent.operations.tools.base import (
     ExecutionContext,
     ToolArgumentError,
     ToolExecution,
 )
-from coding_agent.tools.filesystem import ReadFileTool, WriteFileTool
-from coding_agent.tools.registry import ToolRegistry
-from coding_agent.verification import VerificationGate
+from coding_agent.operations.tools.filesystem import ReadFileTool, WriteFileTool
+from coding_agent.operations.tools.registry import ToolRegistry
+from coding_agent.engine.verification import VerificationGate
 
 
 FAKE_KEY = "task15-agent-obviously-fake-key"

@@ -9,12 +9,12 @@ import subprocess
 import sys
 import time
 
-from coding_agent.app import ApplicationFactories, run_application
-from coding_agent.config import RunConfig, load_run_config
-from coding_agent.logging import RunEventLogger
-from coding_agent.messages import AssistantMessage, ModelResponse, ToolCall
-from coding_agent.model import FakeModelClient, ModelClient
-from coding_agent.tools.shell import AuthorizedCommandExecutor
+from coding_agent.application.app import ApplicationFactories, run_application
+from coding_agent.application.config import RunConfig, load_run_config
+from coding_agent.engine.logging import RunEventLogger
+from coding_agent.engine.messages import AssistantMessage, ModelResponse, ToolCall
+from coding_agent.engine.model import FakeModelClient, ModelClient
+from coding_agent.operations.tools.shell import AuthorizedCommandExecutor
 
 
 FAKE_KEY = "task13-repair-fake-key"

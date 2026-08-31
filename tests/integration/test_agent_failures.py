@@ -6,25 +6,25 @@ from pathlib import Path
 import shutil
 import time
 
-from coding_agent.agent import AgentRunner
-from coding_agent.app import ApplicationFactories, run_application
-from coding_agent.config import RunConfig, load_run_config
-from coding_agent.context import ContextLimits, ContextManager
-from coding_agent.logging import (
+from coding_agent.engine.agent import AgentRunner
+from coding_agent.application.app import ApplicationFactories, run_application
+from coding_agent.application.config import RunConfig, load_run_config
+from coding_agent.engine.context import ContextLimits, ContextManager
+from coding_agent.engine.logging import (
     EventType,
     RunEvent,
     RunEventLogger,
     RunLogError,
     RunMetadata,
 )
-from coding_agent.messages import AssistantMessage, ModelResponse, ToolCall, ToolResult
-from coding_agent.model import FakeModelClient, ModelClient
-from coding_agent.progress import ProgressLimits
-from coding_agent.state import AgentStatus
-from coding_agent.tools.base import ExecutionContext
-from coding_agent.tools.filesystem import ReadFileTool
-from coding_agent.tools.registry import ToolRegistry
-from coding_agent.tools.shell import AuthorizedCommandExecutor
+from coding_agent.engine.messages import AssistantMessage, ModelResponse, ToolCall, ToolResult
+from coding_agent.engine.model import FakeModelClient, ModelClient
+from coding_agent.engine.progress import ProgressLimits
+from coding_agent.engine.state import AgentStatus
+from coding_agent.operations.tools.base import ExecutionContext
+from coding_agent.operations.tools.filesystem import ReadFileTool
+from coding_agent.operations.tools.registry import ToolRegistry
+from coding_agent.operations.tools.shell import AuthorizedCommandExecutor
 
 
 FAKE_KEY = "task13-failure-matrix-fake-key"

@@ -5,23 +5,23 @@ from pathlib import Path
 import shutil
 from typing import BinaryIO
 
-from coding_agent.agent import AgentRunner
-from coding_agent.context import ContextManager
-from coding_agent.messages import (
+from coding_agent.engine.agent import AgentRunner
+from coding_agent.engine.context import ContextManager
+from coding_agent.engine.messages import (
     ModelResponse,
     ToolCall,
     ToolResult,
     ToolResultMetadata,
 )
-from coding_agent.model import FakeModelClient
-from coding_agent.safety import AuthorizedCommand, JavaRuntime
-from coding_agent.state import AgentStatus, VerificationStatus
-from coding_agent.termination import TerminationPolicy
-from coding_agent.tools.base import ExecutionContext, ToolExecution
-from coding_agent.tools.filesystem import WriteFileTool
-from coding_agent.tools.java import RunJavaTestsTool
-from coding_agent.tools.registry import ToolRegistry
-from coding_agent.verification import VerificationGate
+from coding_agent.engine.model import FakeModelClient
+from coding_agent.operations.safety import AuthorizedCommand, JavaRuntime
+from coding_agent.engine.state import AgentStatus, VerificationStatus
+from coding_agent.engine.termination import TerminationPolicy
+from coding_agent.operations.tools.base import ExecutionContext, ToolExecution
+from coding_agent.operations.tools.filesystem import WriteFileTool
+from coding_agent.operations.tools.java import RunJavaTestsTool
+from coding_agent.operations.tools.registry import ToolRegistry
+from coding_agent.engine.verification import VerificationGate
 
 
 class ManualClock:
