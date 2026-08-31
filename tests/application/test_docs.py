@@ -41,7 +41,7 @@ class ReadmeMetrics:
 def _read_utf8(path: Path) -> str:
     raw = path.read_bytes()
     assert not raw.startswith(b"\xef\xbb\xbf")
-    return raw.decode("utf-8")
+    return raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _read_budget_contract_docs() -> str:
@@ -60,6 +60,15 @@ def _readme_metrics(path: Path) -> ReadmeMetrics:
         utf8_bytes=len(raw),
         lines=0 if not normalized else len(normalized.splitlines()),
     )
+
+
+def test_read_utf8_normalizes_windows_and_legacy_line_endings(
+    tmp_path: Path,
+) -> None:
+    document = tmp_path / "document.md"
+    document.write_bytes(b"first\r\nsecond\rthird\n")
+
+    assert _read_utf8(document) == "first\nsecond\nthird\n"
 
 
 def _section(text: str, heading: str) -> str:

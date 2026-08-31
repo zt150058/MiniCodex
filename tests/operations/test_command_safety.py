@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import sysconfig
 from typing import Callable
 
 import pytest
@@ -18,6 +20,18 @@ from coding_agent.operations.safety import (
     parse_windows_command_line,
 )
 from coding_agent.operations.tools.base import ToolArgumentError
+
+
+def _installed_console_script(name: str) -> Path:
+    candidates = (
+        shutil.which(f"{name}.exe"),
+        shutil.which(name),
+        str(Path(sysconfig.get_path("scripts")) / f"{name}.exe"),
+    )
+    for candidate in candidates:
+        if candidate is not None and Path(candidate).is_file():
+            return Path(candidate).resolve(strict=True)
+    raise AssertionError(f"installed console script is unavailable: {name}")
 
 
 def _assert_command_violation(
@@ -269,7 +283,7 @@ def test_python_rejects_outside_non_python_and_protected_scripts(
 
 @pytest.mark.parametrize("prefix", [["python", "-m", "pytest"], ["pytest"]])
 def test_pytest_demo_forms_are_allowed(tmp_path: Path, prefix: list[str]) -> None:
-    launcher = Path(sys.executable).with_name("pytest.exe")
+    launcher = _installed_console_script("pytest")
     locator = lambda name: str(launcher) if name.casefold() in {"pytest", "pytest.exe"} else None
 
     authorized = _authorize(
@@ -288,7 +302,7 @@ def test_pytest_demo_forms_are_allowed(tmp_path: Path, prefix: list[str]) -> Non
 
 
 def test_direct_pytest_name_is_case_insensitive(tmp_path: Path) -> None:
-    launcher = Path(sys.executable).with_name("pytest.exe")
+    launcher = _installed_console_script("pytest")
     locator = lambda name: str(launcher) if name.casefold() in {"pytest", "pytest.exe"} else None
     authorized = _authorize(
         tmp_path,
@@ -720,17 +734,24 @@ def test_unknown_shell_network_package_admin_and_prefix_programs_are_denied(
     )
 
 
-def test_workspace_path_entry_cannot_shadow_runtime_pytest(tmp_path: Path) -> None:
+def test_workspace_path_entry_cannot_shadow_trusted_pytest(tmp_path: Path) -> None:
     fake = tmp_path / "pytest.exe"
     fake.write_bytes(b"fake")
+    launcher = _installed_console_script("pytest")
+
+    def locate(name: str) -> str | None:
+        if name.casefold() == "pytest":
+            return str(fake)
+        if name.casefold() == "pytest.exe":
+            return str(launcher)
+        return None
+
     authorized = _authorize(
         tmp_path,
         ["pytest", "-q"],
-        locator=lambda name: str(fake),
+        locator=locate,
     )
-    assert authorized.argv[0] == str(
-        Path(sys.executable).with_name("pytest.exe").resolve(strict=True)
-    )
+    assert authorized.argv[0] == str(launcher)
     assert authorized.argv[0] != str(fake.resolve())
 
 

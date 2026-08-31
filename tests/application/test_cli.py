@@ -3,8 +3,10 @@ from __future__ import annotations
 import os
 from io import StringIO
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import sysconfig
 import tomllib
 from typing import TextIO
 
@@ -24,6 +26,18 @@ from coding_agent.operations.safety import (
 
 SECRET_SENTINEL = "do-not-print-this-test-value"
 CHAT_SECRET_SENTINEL = "chat-key-must-never-be-printed"
+
+
+def _installed_console_script(name: str) -> Path:
+    candidates = (
+        shutil.which(f"{name}.exe"),
+        shutil.which(name),
+        str(Path(sysconfig.get_path("scripts")) / f"{name}.exe"),
+    )
+    for candidate in candidates:
+        if candidate is not None and Path(candidate).is_file():
+            return Path(candidate).resolve(strict=True)
+    raise AssertionError(f"installed console script is unavailable: {name}")
 
 
 def valid_environ() -> dict[str, str]:
@@ -809,8 +823,7 @@ def test_gitignore_covers_runtime_and_local_credentials() -> None:
 def test_standard_console_command_rejects_missing_key_before_app(
     tmp_path: Path,
 ) -> None:
-    launcher = Path(sys.executable).with_name("coding-agent.exe")
-    assert launcher.is_file()
+    launcher = _installed_console_script("coding-agent")
 
     environ = os.environ.copy()
     environ.pop("OPENAI_API_KEY", None)
