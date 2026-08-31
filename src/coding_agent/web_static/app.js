@@ -14,10 +14,14 @@ const PHASE_LABELS = Object.freeze({
   tool: "执行工具",
   verification: "验证修改",
   finished: "运行结束",
+  discover: "调查中",
+  act: "执行中",
+  verify: "验证中",
+  finish: "收尾中",
 });
 
 const ACTIVITY_LABELS = Object.freeze({
-  model_progress: "Agent 正在处理",
+  model_progress: "MiniCodex 正在处理",
   tool_started: "工具开始",
   tool_finished: "工具完成",
   verification_started: "验证开始",
@@ -25,11 +29,17 @@ const ACTIVITY_LABELS = Object.freeze({
   controller_error: "控制器错误",
   run_failed: "运行失败",
   run_interrupted: "运行已中断",
+  changes_unverified: "修改待验证",
 });
 const RUN_MODES = new Set(["modify", "read_only"]);
 const RUN_MODE_LABELS = Object.freeze({
   modify: "可修改",
   read_only: "只读",
+});
+const BUDGET_PROFILES = new Set(["standard", "deep"]);
+const BUDGET_PROFILE_LABELS = Object.freeze({
+  standard: "标准",
+  deep: "深入",
 });
 
 
@@ -38,36 +48,284 @@ export function appendPlainText(document, parent, text) {
 }
 
 
-function appendFencedText(document, parent, text) {
-  let cursor = 0;
-  while (cursor < text.length) {
-    const opening = text.indexOf("```", cursor);
-    if (opening < 0) {
-      appendPlainText(document, parent, text.slice(cursor));
+const INLINE_MARKDOWN_PATTERNS = Object.freeze([
+  { kind: "code", expression: /`([^`\n]+)`/ },
+  { kind: "link", expression: /\[([^\]\n]+)\]\(([^)\s]+(?:\([^)]*\))?)\)/ },
+  { kind: "strong", expression: /\*\*([^*\n]+)\*\*/ },
+  { kind: "delete", expression: /~~([^~\n]+)~~/ },
+  { kind: "emphasis", expression: /\*([^*\n]+)\*/ },
+]);
+
+
+function isSafeMarkdownLink(href) {
+  return /^(?:https?:\/\/|mailto:)[^\s]+$/i.test(href);
+}
+
+
+function nextInlineMarkdownMatch(text) {
+  let selected = null;
+  for (const pattern of INLINE_MARKDOWN_PATTERNS) {
+    const match = pattern.expression.exec(text);
+    if (!match) continue;
+    if (!selected || match.index < selected.match.index) {
+      selected = { kind: pattern.kind, match };
+    }
+  }
+  return selected;
+}
+
+
+function appendInlineMarkdown(document, parent, text) {
+  let remaining = String(text);
+  while (remaining) {
+    const selected = nextInlineMarkdownMatch(remaining);
+    if (!selected) {
+      appendPlainText(document, parent, remaining);
       return;
     }
-    const codeStartLine = text.indexOf("\n", opening + 3);
-    if (codeStartLine < 0) {
-      appendPlainText(document, parent, text.slice(cursor));
-      return;
+    const { kind, match } = selected;
+    appendPlainText(document, parent, remaining.slice(0, match.index));
+    if (kind === "link" && !isSafeMarkdownLink(match[2])) {
+      appendPlainText(document, parent, match[0]);
+    } else {
+      const tagName = {
+        code: "code",
+        link: "a",
+        strong: "strong",
+        delete: "del",
+        emphasis: "em",
+      }[kind];
+      const element = document.createElement(tagName);
+      if (kind === "link") {
+        element.setAttribute("href", match[2]);
+        element.setAttribute("target", "_blank");
+        element.setAttribute("rel", "noopener noreferrer");
+        appendInlineMarkdown(document, element, match[1]);
+      } else if (kind === "code") {
+        appendPlainText(document, element, match[1]);
+      } else {
+        appendInlineMarkdown(document, element, match[1]);
+      }
+      parent.append(element);
     }
-    const closing = text.indexOf("```", codeStartLine + 1);
-    if (closing < 0) {
-      appendPlainText(document, parent, text.slice(cursor));
-      return;
+    remaining = remaining.slice(match.index + match[0].length);
+  }
+}
+
+
+function tableCells(line) {
+  let source = line.trim();
+  if (source.startsWith("|")) source = source.slice(1);
+  if (source.endsWith("|")) source = source.slice(0, -1);
+  const cells = [];
+  let cell = "";
+  let escaped = false;
+  for (const character of source) {
+    if (escaped) {
+      cell += character === "|" || character === "\\"
+        ? character
+        : `\\${character}`;
+      escaped = false;
+    } else if (character === "\\") {
+      escaped = true;
+    } else if (character === "|") {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += character;
     }
-    appendPlainText(document, parent, text.slice(cursor, opening));
-    const pre = document.createElement("pre");
-    const code = document.createElement("code");
-    appendPlainText(
-      document,
-      code,
-      text.slice(codeStartLine + 1, closing),
-    );
-    pre.append(code);
-    parent.append(pre);
-    cursor = closing + 3;
-    if (text[cursor] === "\n") cursor += 1;
+  }
+  if (escaped) cell += "\\";
+  cells.push(cell.trim());
+  return cells;
+}
+
+
+function tableAlignments(line) {
+  const cells = tableCells(line);
+  if (!cells.length || cells.some((cell) => !/^:?-{3,}:?$/.test(cell))) {
+    return null;
+  }
+  return cells.map((cell) => {
+    if (cell.startsWith(":") && cell.endsWith(":")) return "center";
+    if (cell.endsWith(":")) return "right";
+    return "left";
+  });
+}
+
+
+function isMarkdownTable(lines, index) {
+  if (index + 1 >= lines.length || !lines[index].includes("|")) return false;
+  const alignments = tableAlignments(lines[index + 1]);
+  return alignments !== null && tableCells(lines[index]).length === alignments.length;
+}
+
+
+function isMarkdownBlockStart(lines, index) {
+  const line = lines[index] ?? "";
+  return /^ {0,3}```/.test(line)
+    || /^ {0,3}#{1,6}[ \t]+/.test(line)
+    || /^ {0,3}>/.test(line)
+    || /^ {0,3}(?:[-+*][ \t]+|\d+[.)][ \t]+)/.test(line)
+    || /^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/.test(line)
+    || isMarkdownTable(lines, index);
+}
+
+
+function appendMarkdownBlock(document, parent, element) {
+  if (parent.childNodes.length && !parent.textContent.endsWith("\n")) {
+    appendPlainText(document, parent, "\n");
+  }
+  parent.append(element);
+}
+
+
+function appendMarkdownTable(document, parent, lines, index) {
+  const headers = tableCells(lines[index]);
+  const alignments = tableAlignments(lines[index + 1]);
+  const wrapper = document.createElement("div");
+  wrapper.className = "markdown-table-wrapper";
+  const table = document.createElement("table");
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  headers.forEach((content, cellIndex) => {
+    const cell = document.createElement("th");
+    cell.className = `markdown-align-${alignments[cellIndex]}`;
+    appendInlineMarkdown(document, cell, content);
+    headRow.append(cell);
+  });
+  head.append(headRow);
+  table.append(head);
+
+  const body = document.createElement("tbody");
+  let cursor = index + 2;
+  while (cursor < lines.length && lines[cursor].trim() && lines[cursor].includes("|")) {
+    const values = tableCells(lines[cursor]);
+    const row = document.createElement("tr");
+    headers.forEach((_header, cellIndex) => {
+      const cell = document.createElement("td");
+      cell.className = `markdown-align-${alignments[cellIndex]}`;
+      appendInlineMarkdown(document, cell, values[cellIndex] ?? "");
+      row.append(cell);
+    });
+    body.append(row);
+    cursor += 1;
+  }
+  table.append(body);
+  wrapper.append(table);
+  appendMarkdownBlock(document, parent, wrapper);
+  return cursor;
+}
+
+
+function appendMarkdownBlocks(document, parent, text) {
+  const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = /^ {0,3}```([A-Za-z0-9_+-]*)[ \t]*$/.exec(line);
+    if (fence) {
+      let closing = index + 1;
+      while (closing < lines.length && !/^ {0,3}```[ \t]*$/.test(lines[closing])) {
+        closing += 1;
+      }
+      if (closing >= lines.length) {
+        if (parent.childNodes.length && !parent.textContent.endsWith("\n")) {
+          appendPlainText(document, parent, "\n");
+        }
+        appendPlainText(document, parent, lines.slice(index).join("\n"));
+        return;
+      }
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (fence[1]) code.className = `language-${fence[1].toLowerCase()}`;
+      const codeLines = lines.slice(index + 1, closing);
+      appendPlainText(
+        document,
+        code,
+        codeLines.length ? `${codeLines.join("\n")}\n` : "",
+      );
+      pre.append(code);
+      appendMarkdownBlock(document, parent, pre);
+      index = closing + 1;
+      continue;
+    }
+
+    if (isMarkdownTable(lines, index)) {
+      index = appendMarkdownTable(document, parent, lines, index);
+      continue;
+    }
+
+    const heading = /^ {0,3}(#{1,6})[ \t]+(.+)$/.exec(line);
+    if (heading) {
+      const element = document.createElement(`h${heading[1].length}`);
+      const content = heading[2]
+        .trimEnd()
+        .replace(/[ \t]+#+[ \t]*$/, "");
+      appendInlineMarkdown(document, element, content);
+      appendMarkdownBlock(document, parent, element);
+      index += 1;
+      continue;
+    }
+
+    if (/^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/.test(line)) {
+      appendMarkdownBlock(document, parent, document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+
+    if (/^ {0,3}>/.test(line)) {
+      const quoteLines = [];
+      while (index < lines.length) {
+        const quote = /^ {0,3}>[ \t]?(.*)$/.exec(lines[index]);
+        if (!quote) break;
+        quoteLines.push(quote[1]);
+        index += 1;
+      }
+      const blockquote = document.createElement("blockquote");
+      appendMarkdownBlocks(document, blockquote, quoteLines.join("\n"));
+      appendMarkdownBlock(document, parent, blockquote);
+      continue;
+    }
+
+    const unordered = /^ {0,3}[-+*][ \t]+(.+)$/.exec(line);
+    const ordered = /^ {0,3}\d+[.)][ \t]+(.+)$/.exec(line);
+    if (unordered || ordered) {
+      const tagName = ordered ? "ol" : "ul";
+      const expression = ordered
+        ? /^ {0,3}\d+[.)][ \t]+(.+)$/
+        : /^ {0,3}[-+*][ \t]+(.+)$/;
+      const list = document.createElement(tagName);
+      while (index < lines.length) {
+        const item = expression.exec(lines[index]);
+        if (!item) break;
+        const listItem = document.createElement("li");
+        appendInlineMarkdown(document, listItem, item[1]);
+        list.append(listItem);
+        index += 1;
+      }
+      appendMarkdownBlock(document, parent, list);
+      continue;
+    }
+
+    const paragraphLines = [line.trim()];
+    index += 1;
+    while (
+      index < lines.length
+      && lines[index].trim()
+      && !isMarkdownBlockStart(lines, index)
+    ) {
+      paragraphLines.push(lines[index].trim());
+      index += 1;
+    }
+    const paragraph = document.createElement("p");
+    appendInlineMarkdown(document, paragraph, paragraphLines.join("\n"));
+    appendMarkdownBlock(document, parent, paragraph);
   }
 }
 
@@ -77,7 +335,7 @@ export function appendMessage(document, container, role, text, runMode = null) {
   message.className = `message message--${role === "user" ? "user" : "assistant"}`;
   const label = document.createElement("div");
   label.className = "message__label";
-  appendPlainText(document, label, role === "user" ? "你" : "Agent");
+  appendPlainText(document, label, role === "user" ? "你" : "MiniCodex");
   if (role === "user" && Object.hasOwn(RUN_MODE_LABELS, runMode)) {
     const badge = document.createElement("span");
     badge.className = "run-mode-badge";
@@ -86,7 +344,8 @@ export function appendMessage(document, container, role, text, runMode = null) {
   }
   const body = document.createElement("div");
   body.className = "message__body";
-  appendFencedText(document, body, String(text));
+  if (role === "user") appendPlainText(document, body, String(text));
+  else appendMarkdownBlocks(document, body, String(text));
   message.append(label, body);
   container.append(message);
   return message;
@@ -115,13 +374,23 @@ function safeActivityDetails(kind, data) {
   if (kind === "run_failed" || kind === "run_interrupted") {
     return [data.termination_reason];
   }
+  if (kind === "changes_unverified") {
+    return [
+      `已修改：${data.changed_paths.join("、")}`,
+      "验证：尚未执行或尚未通过",
+      `原因：${data.safe_error_code}`,
+      "建议：重新运行并提供强制验证命令，或让 Agent 使用允许的验证形式",
+    ];
+  }
   return [];
 }
 
 
 export function appendActivity(document, container, kind, data) {
   const card = document.createElement("div");
-  card.className = "activity-card";
+  card.className = kind === "changes_unverified"
+    ? "activity-card activity-card--changes-unverified"
+    : "activity-card";
   const label = ACTIVITY_LABELS[kind] ?? String(kind);
   const details = safeActivityDetails(kind, data ?? {})
     .filter((value) => value !== undefined && value !== null && value !== "")
@@ -136,10 +405,20 @@ export function appendActivity(document, container, kind, data) {
 }
 
 
-export function renderRunHeader(document, elements, run, phase) {
+export function renderRunHeader(
+  document,
+  elements,
+  run,
+  phase,
+  progress = null,
+  transientStatus = null,
+) {
   const status = run?.status;
   const answered = status === "succeeded" && run?.agent_status === "answered";
-  const label = answered ? "已回答" : STATUS_LABELS[status] ?? "状态未知";
+  const active = ["queued", "running", "cancelling"].includes(status);
+  const label = active && typeof transientStatus === "string"
+    ? transientStatus
+    : answered ? "已回答" : STATUS_LABELS[status] ?? "状态未知";
   elements.runStatus.replaceChildren(document.createTextNode(label));
   elements.runStatus.className = `status-pill status-pill--${
     status === "succeeded"
@@ -150,9 +429,19 @@ export function renderRunHeader(document, elements, run, phase) {
           ? "running"
           : "idle"
   }`;
-  elements.runPhase.replaceChildren(
-    document.createTextNode(PHASE_LABELS[phase] ?? "状态同步中"),
-  );
+  const phaseLabel = PHASE_LABELS[phase] ?? "状态同步中";
+  const progressLabel = progress && BUDGET_PROFILES.has(progress.budget_profile)
+    ? [
+        BUDGET_PROFILE_LABELS[progress.budget_profile],
+        `模型 ${progress.main_model_calls}/${progress.main_model_limit}`,
+        `摘要 ${progress.summary_model_calls}/${progress.summary_model_limit}`,
+        `请求 ${progress.provider_attempts}/${progress.provider_attempt_limit}`,
+        `工具 ${progress.tool_calls}/${progress.tool_limit}`,
+      ].join(" · ")
+    : null;
+  elements.runPhase.replaceChildren(document.createTextNode(
+    progressLabel ? `${phaseLabel} · ${progressLabel}` : phaseLabel,
+  ));
   elements.cancelButton.disabled = ![
     "queued",
     "running",
@@ -190,10 +479,13 @@ export function createInitialUiState() {
     skillDiagnostics: [],
     selectedSkillIds: [],
     selectedRunMode: "modify",
+    selectedBudgetProfile: "standard",
     activeRunId: null,
     lastSequence: 0,
     provisionalText: "",
     activities: [],
+    runProgress: null,
+    transientStatus: null,
     connection: "connecting",
     phase: "waiting",
     errorCode: null,
@@ -208,14 +500,23 @@ export function createApiClient({
 }) {
   const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
 
-  async function request(path, { method = "GET", body } = {}) {
+  async function request(
+    path,
+    { method = "GET", json, rawBody, contentType } = {},
+  ) {
+    if (json !== undefined && rawBody !== undefined) {
+      throw new WebClientError("invalid_request_body");
+    }
     const headers = new Headers({
       Authorization: `Bearer ${accessToken}`,
     });
     const init = { method, headers };
-    if (body !== undefined) {
+    if (json !== undefined) {
       headers.set("Content-Type", "application/json");
-      init.body = JSON.stringify(body);
+      init.body = JSON.stringify(json);
+    } else if (rawBody !== undefined) {
+      headers.set("Content-Type", contentType);
+      init.body = rawBody;
     }
     const response = await fetchImpl(
       new Request(`${normalizedBaseUrl}${path}`, init),
@@ -239,26 +540,55 @@ export function createApiClient({
     listSessions: () => request("/api/v1/sessions?limit=50"),
     loadSession: (sessionId) =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`),
+    deleteSession: (sessionId) =>
+      request(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
+        method: "DELETE",
+      }),
     listSkills: () => request("/api/v1/skills"),
-    createSession: (message, skillIds, runMode = "modify") =>
+    importSkillArchive: (archive) =>
+      request("/api/v1/skills/import", {
+        method: "POST",
+        rawBody: archive,
+        contentType: "application/zip",
+      }),
+    createSession: (
+      message,
+      skillIds,
+      runMode = "modify",
+      budgetProfile = "standard",
+    ) =>
       request("/api/v1/sessions", {
         method: "POST",
-        body: { message, skill_ids: skillIds, run_mode: runMode },
+        json: {
+          message,
+          skill_ids: skillIds,
+          run_mode: runMode,
+          budget_profile: budgetProfile,
+        },
       }),
-    submitFollowUp: (sessionId, message, runMode = "modify") =>
+    submitFollowUp: (
+      sessionId,
+      message,
+      runMode = "modify",
+      budgetProfile = "standard",
+    ) =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: "POST",
-        body: { message, run_mode: runMode },
+        json: {
+          message,
+          run_mode: runMode,
+          budget_profile: budgetProfile,
+        },
       }),
     saveSkillSelection: (sessionId, skillIds) =>
       request(`/api/v1/sessions/${encodeURIComponent(sessionId)}/skills`, {
         method: "PUT",
-        body: { skill_ids: skillIds },
+        json: { skill_ids: skillIds },
       }),
     cancelRun: (runId) =>
       request(`/api/v1/runs/${encodeURIComponent(runId)}/cancel`, {
         method: "POST",
-        body: {},
+        json: {},
       }),
     openRunStream: (runId, afterSequence = 0, { signal } = {}) => {
       const headers = new Headers({
@@ -369,6 +699,49 @@ function safeActivityData(kind, data) {
 export function reduceSessionUpdate(state, frame) {
   const payload = frame.data?.data ?? {};
   if (frame.id !== null) state.lastSequence = frame.id;
+  if (frame.event === "run_progress") {
+    const fields = [
+      "budget_profile",
+      "phase",
+      "main_model_calls",
+      "main_model_limit",
+      "summary_model_calls",
+      "summary_model_limit",
+      "provider_attempts",
+      "provider_attempt_limit",
+      "tool_calls",
+      "tool_limit",
+    ];
+    state.runProgress = Object.fromEntries(
+      fields.map((field) => [field, payload[field]]),
+    );
+    if (typeof payload.phase === "string") state.phase = payload.phase;
+    const runId = frame.data?.run_id ?? state.activeRunId;
+    const run = state.selectedSession?.runs?.find((item) => item.run_id === runId);
+    if (run && BUDGET_PROFILES.has(payload.budget_profile)) {
+      run.budget_profile = payload.budget_profile;
+    }
+    return state;
+  }
+  if (frame.event === "phase_changed") {
+    if (typeof payload.to_phase === "string") state.phase = payload.to_phase;
+    state.transientStatus = null;
+    return state;
+  }
+  if (frame.event === "decision_checkpoint") {
+    state.transientStatus = payload.reason === "final_call_reserve"
+      ? "正在使用最终决策预算"
+      : "根据已有信息作出决策";
+    return state;
+  }
+  if (frame.event === "context_compressed") {
+    state.transientStatus = "上下文已压缩，继续执行";
+    return state;
+  }
+  if (frame.event === "no_progress_detected") {
+    state.transientStatus = "未取得足够进展，正在结束";
+    return state;
+  }
   if (frame.event === "assistant_text_delta" && typeof payload.content === "string") {
     state.activities = [];
     state.provisionalText += payload.content;
@@ -429,6 +802,8 @@ export function reduceSessionUpdate(state, frame) {
       state.activeRunId = null;
       state.provisionalText = "";
       state.activities = [];
+      state.runProgress = null;
+      state.transientStatus = null;
     }
   }
   return state;
@@ -544,11 +919,17 @@ export function createUiController({
   setIntervalImpl = globalThis.setInterval,
   clearIntervalImpl = globalThis.clearInterval,
   streamConsumer = consumeRunStream,
+  confirmDelete = () => false,
 }) {
+  if (typeof confirmDelete !== "function") {
+    throw new TypeError("confirmDelete must be callable");
+  }
   const state = createInitialUiState();
   let pending = Promise.resolve();
   let elapsedTimer = null;
   let activeStream = null;
+  let skillImportPending = false;
+  let sessionDeletePending = false;
 
   function setConnectionNotice(message) {
     elements.connectionStatus.replaceChildren();
@@ -578,14 +959,27 @@ export function createUiController({
     const runsById = new Map((detail?.runs ?? []).map((run) => [run.run_id, run]));
     const lastAssistantSequence = new Map();
     const lastEventSequence = new Map();
+    const latestSafeErrorCode = new Map();
     for (const event of detail?.events ?? []) {
       if (typeof event.run_id !== "string") continue;
       lastEventSequence.set(event.run_id, event.sequence);
       if (event.kind === "assistant_text_committed") {
         lastAssistantSequence.set(event.run_id, event.sequence);
       }
+      if (
+        event.kind === "tool_activity" &&
+        typeof event.data?.safe_error_code === "string" &&
+        event.data.safe_error_code
+      ) {
+        latestSafeErrorCode.set(event.run_id, event.data.safe_error_code);
+      }
     }
-    return { runsById, lastAssistantSequence, lastEventSequence };
+    return {
+      runsById,
+      lastAssistantSequence,
+      lastEventSequence,
+      latestSafeErrorCode,
+    };
   }
 
   function renderControls() {
@@ -601,8 +995,25 @@ export function createUiController({
         String(button.dataset.runMode === state.selectedRunMode),
       );
     }
+    for (const button of [
+      elements.budgetProfileStandardButton,
+      elements.budgetProfileDeepButton,
+    ]) {
+      button.disabled = mutationLocked;
+      button.setAttribute(
+        "aria-pressed",
+        String(
+          button.dataset.budgetProfile === state.selectedBudgetProfile
+        ),
+      );
+    }
     for (const input of findInputs(elements.skillList)) {
       input.disabled = mutationLocked;
+    }
+    elements.skillImportButton.disabled = mutationLocked || skillImportPending;
+    elements.skillFileInput.disabled = mutationLocked || skillImportPending;
+    for (const button of findSessionDeleteButtons(elements.sessionList)) {
+      button.disabled = mutationLocked || sessionDeletePending;
     }
   }
 
@@ -616,6 +1027,22 @@ export function createUiController({
     return inputs;
   }
 
+  function findSessionDeleteButtons(root) {
+    const buttons = [];
+    function visit(node) {
+      if (
+        node?.nodeType === 1
+        && node.tagName === "BUTTON"
+        && node.dataset?.deleteSessionId
+      ) {
+        buttons.push(node);
+      }
+      for (const child of node?.childNodes ?? []) visit(child);
+    }
+    visit(root);
+    return buttons;
+  }
+
   function renderSessions() {
     elements.sessionList.replaceChildren();
     for (const session of state.sessions) {
@@ -625,13 +1052,25 @@ export function createUiController({
       button.setAttribute("type", "button");
       button.className = "session-button";
       button.dataset.sessionId = session.session_id;
+      button.setAttribute(
+        "aria-current",
+        String(state.selectedSessionId === session.session_id),
+      );
       const sessionTitle = session.title || "未命名会话";
       const title = document.createElement("span");
       title.className = "session-title";
       title.setAttribute("title", sessionTitle);
       appendPlainText(document, title, sessionTitle);
       button.append(title);
-      item.append(button);
+      const deleteButton = document.createElement("button");
+      deleteButton.setAttribute("type", "button");
+      deleteButton.className = "session-delete-button";
+      deleteButton.dataset.deleteSessionId = session.session_id;
+      deleteButton.setAttribute("aria-label", `删除会话：${sessionTitle}`);
+      deleteButton.setAttribute("title", `删除会话：${sessionTitle}`);
+      deleteButton.disabled = anySessionActive() || sessionDeletePending;
+      appendPlainText(document, deleteButton, "删除");
+      item.append(button, deleteButton);
       elements.sessionList.append(item);
     }
     elements.sessionCount.replaceChildren(
@@ -664,7 +1103,15 @@ export function createUiController({
     elements.skillSummary.replaceChildren(
       document.createTextNode(`已选择 ${state.selectedSkillIds.length} 个`),
     );
+    elements.skillEmptyState.hidden = state.skills.length !== 0;
     renderControls();
+  }
+
+  function setSkillImportStatus(message) {
+    elements.skillImportStatus.replaceChildren();
+    if (message) {
+      elements.skillImportStatus.append(document.createTextNode(message));
+    }
   }
 
   function renderConversation() {
@@ -678,6 +1125,28 @@ export function createUiController({
     const renderedTerminalRuns = new Set();
 
     function appendTerminalRun(run) {
+      if (run.termination_reason === "changes_unverified") {
+        const changedPaths = Array.isArray(run.final_report?.changed_paths)
+          ? run.final_report.changed_paths
+            .filter((path) => typeof path === "string" && path)
+            .slice(0, 40)
+          : [];
+        const verificationStatus = run.final_report?.verification?.status;
+        appendActivity(
+          document,
+          elements.conversationLog,
+          "changes_unverified",
+          {
+            changed_paths: changedPaths,
+            verification_status:
+              typeof verificationStatus === "string" ? verificationStatus : "stale",
+            safe_error_code:
+              projection.latestSafeErrorCode.get(run.run_id) ?? "verification_not_run",
+          },
+        );
+        renderedTerminalRuns.add(run.run_id);
+        return;
+      }
       appendActivity(
         document,
         elements.conversationLog,
@@ -765,7 +1234,14 @@ export function createUiController({
       document.createTextNode(summary?.title || "准备开始"),
     );
     const run = selectedRun();
-    renderRunHeader(document, elements, run, state.phase);
+    renderRunHeader(
+      document,
+      elements,
+      run,
+      state.phase,
+      state.runProgress,
+      state.transientStatus,
+    );
     renderConversation();
     renderElapsed();
     stopElapsedTimer();
@@ -838,10 +1314,18 @@ export function createUiController({
     const run = selectedRun();
     state.activeRunId =
       run && ACTIVE_SESSION_STATUSES.has(run.status) ? run.run_id : null;
+    if (
+      state.activeRunId &&
+      BUDGET_PROFILES.has(run?.budget_profile)
+    ) {
+      state.selectedBudgetProfile = run.budget_profile;
+    }
     if (state.activeRunId !== previousRunId) {
       state.lastSequence = 0;
       state.activities = [];
       state.provisionalText = "";
+      state.runProgress = null;
+      state.transientStatus = null;
     }
     synchronizeSelectedSummary();
     renderSkills();
@@ -858,9 +1342,88 @@ export function createUiController({
     return pending;
   }
 
+  function clearSelectedSession() {
+    stopActiveStream();
+    state.selectedSessionId = null;
+    state.selectedSession = null;
+    state.activeRunId = null;
+    state.selectedSkillIds = [];
+    state.lastSequence = 0;
+    state.provisionalText = "";
+    state.activities = [];
+    state.runProgress = null;
+    state.transientStatus = null;
+    state.phase = "waiting";
+  }
+
+  function focusSessionButton(sessionId) {
+    const button = Array.from(elements.sessionList.childNodes ?? [])
+      .flatMap((item) => Array.from(item.childNodes ?? []))
+      .find((item) => item?.dataset?.sessionId === sessionId);
+    button?.focus?.();
+  }
+
+  function requestSessionDeletion(sessionId) {
+    if (sessionDeletePending || anySessionActive()) return;
+    const targetIndex = state.sessions.findIndex(
+      (session) => session.session_id === sessionId,
+    );
+    if (targetIndex < 0) return;
+    const target = state.sessions[targetIndex];
+    const title = target.title || "未命名会话";
+    const prompt = `确定删除会话“${title}”？此操作无法撤销。`;
+    if (!confirmDelete(prompt)) return;
+    const wasSelected = state.selectedSessionId === sessionId;
+    sessionDeletePending = true;
+    renderControls();
+    track(async () => {
+      try {
+        const result = await api.deleteSession(sessionId);
+        state.sessions = state.sessions.filter(
+          (session) => session.session_id !== sessionId,
+        );
+        if (wasSelected) {
+          clearSelectedSession();
+          const replacement = state.sessions[targetIndex]
+            ?? state.sessions[targetIndex - 1]
+            ?? null;
+          if (replacement) {
+            await selectSession(replacement.session_id);
+          } else {
+            renderSkills();
+            renderSelectedSession();
+          }
+        }
+        renderSessions();
+        if (wasSelected && state.selectedSessionId) {
+          focusSessionButton(state.selectedSessionId);
+        } else if (wasSelected) {
+          elements.newSessionButton.focus?.();
+        }
+        if (result.cleanup_pending === true) {
+          setConnectionNotice(
+            "会话已删除；部分本地日志将在下次启动时继续清理。",
+          );
+        } else {
+          setConnectionNotice(null);
+        }
+      } finally {
+        sessionDeletePending = false;
+        renderControls();
+      }
+    });
+  }
+
   elements.sessionList.addEventListener("click", (event) => {
     let target = event.target;
     while (target && target !== elements.sessionList) {
+      const deleteSessionId = target.nodeType === 1
+        ? target.dataset?.deleteSessionId
+        : null;
+      if (deleteSessionId) {
+        requestSessionDeletion(deleteSessionId);
+        return;
+      }
       const sessionId = target.nodeType === 1 ? target.dataset?.sessionId : null;
       if (sessionId) {
         track(() => selectSession(sessionId));
@@ -896,6 +1459,83 @@ export function createUiController({
     }
   });
 
+  elements.skillImportButton.addEventListener("click", () => {
+    if (!anySessionActive() && !skillImportPending) {
+      elements.skillFileInput.click();
+    }
+  });
+
+  elements.skillFileInput.addEventListener("change", () => {
+    const files = Array.from(elements.skillFileInput.files ?? []);
+    if (anySessionActive() || skillImportPending) {
+      elements.skillFileInput.value = "";
+      renderControls();
+      return;
+    }
+    if (files.length !== 1) {
+      elements.skillFileInput.value = "";
+      setSkillImportStatus("请选择一个 Skill ZIP 文件");
+      return;
+    }
+    const archive = files[0];
+    const selectionBeforeImport = [...state.selectedSkillIds];
+    skillImportPending = true;
+    setSkillImportStatus("正在导入…");
+    renderControls();
+    track(async () => {
+      try {
+        const imported = await api.importSkillArchive(archive);
+        const catalog = await api.listSkills();
+        state.skills = [...(catalog.skills ?? [])];
+        state.skillDiagnostics = [...(catalog.diagnostics ?? [])];
+        const importedSkill = state.skills.find(
+          (skill) => skill.skill_id === imported.skill_id,
+        );
+        if (!importedSkill) {
+          throw new WebClientError("skill_install_failed");
+        }
+        const selected = new Set(state.selectedSkillIds);
+        selected.add(importedSkill.skill_id);
+        state.selectedSkillIds = state.skills
+          .map((skill) => skill.skill_id)
+          .filter((skillId) => selected.has(skillId));
+        if (
+          state.selectedSessionId
+          && state.selectedSession?.session?.status === "idle"
+        ) {
+          try {
+            const result = await api.saveSkillSelection(
+              state.selectedSessionId,
+              state.selectedSkillIds,
+            );
+            state.selectedSkillIds = [...(result.skill_ids ?? [])];
+          } catch (error) {
+            state.selectedSkillIds = state.skills
+              .map((skill) => skill.skill_id)
+              .filter((skillId) => selectionBeforeImport.includes(skillId));
+            const code = error instanceof WebClientError
+              ? error.code
+              : "skill_selection_failed";
+            setSkillImportStatus(
+              `已导入 ${importedSkill.name ?? importedSkill.skill_id}；自动选择失败：${code}`,
+            );
+            return;
+          }
+        }
+        setSkillImportStatus(`已导入 ${importedSkill.name ?? importedSkill.skill_id}`);
+      } catch (error) {
+        const code = error instanceof WebClientError
+          ? error.code
+          : "skill_import_failed";
+        setSkillImportStatus(`导入失败：${code}`);
+      } finally {
+        elements.skillFileInput.value = "";
+        skillImportPending = false;
+        renderSkills();
+      }
+    });
+  });
+
   elements.runModeControl.addEventListener("click", (event) => {
     if (anySessionActive()) {
       renderControls();
@@ -913,10 +1553,30 @@ export function createUiController({
     }
   });
 
+  elements.budgetProfileControl.addEventListener("click", (event) => {
+    if (anySessionActive()) {
+      renderControls();
+      return;
+    }
+    let target = event.target;
+    while (target && target !== elements.budgetProfileControl) {
+      const budgetProfile = target.nodeType === 1
+        ? target.dataset?.budgetProfile
+        : null;
+      if (BUDGET_PROFILES.has(budgetProfile)) {
+        state.selectedBudgetProfile = budgetProfile;
+        renderControls();
+        return;
+      }
+      target = target.parentNode;
+    }
+  });
+
   function submitComposer() {
     const message = elements.messageInput.value.trim();
     if (!message || anySessionActive()) return;
     const runMode = state.selectedRunMode;
+    const budgetProfile = state.selectedBudgetProfile;
     track(async () => {
       let handle;
       if (state.selectedSessionId) {
@@ -924,6 +1584,7 @@ export function createUiController({
           state.selectedSessionId,
           message,
           runMode,
+          budgetProfile,
         );
         await selectSession(handle.session_id);
       } else {
@@ -931,6 +1592,7 @@ export function createUiController({
           message,
           state.selectedSkillIds,
           runMode,
+          budgetProfile,
         );
         await selectSession(handle.session_id);
         if (!state.sessions.some((session) => session.session_id === handle.session_id)) {
@@ -976,11 +1638,7 @@ export function createUiController({
   });
 
   elements.newSessionButton.addEventListener("click", () => {
-    stopActiveStream();
-    state.selectedSessionId = null;
-    state.selectedSession = null;
-    state.activeRunId = null;
-    state.selectedSkillIds = [];
+    clearSelectedSession();
     renderSkills();
     renderSelectedSession();
   });
@@ -1039,6 +1697,10 @@ export function collectGuiElements(document) {
     skillToggle: "skill-toggle",
     skillPanel: "skill-panel",
     skillSummary: "skill-summary",
+    skillImportButton: "skill-import-button",
+    skillFileInput: "skill-file-input",
+    skillEmptyState: "skill-empty-state",
+    skillImportStatus: "skill-import-status",
     conversationTitle: "conversation-title",
     runStatus: "run-status",
     runPhase: "run-phase",
@@ -1053,6 +1715,9 @@ export function collectGuiElements(document) {
     runModeControl: "run-mode-control",
     runModeModifyButton: "run-mode-modify",
     runModeReadOnlyButton: "run-mode-read-only",
+    budgetProfileControl: "budget-profile-control",
+    budgetProfileStandardButton: "budget-profile-standard",
+    budgetProfileDeepButton: "budget-profile-deep",
     emptyState: "empty-state",
   };
   const elements = Object.fromEntries(
@@ -1080,6 +1745,7 @@ export async function startBrowserApplication({
     document,
     elements: collectGuiElements(document),
     api,
+    confirmDelete: (message) => window.confirm(message),
   });
   await controller.initialize();
 

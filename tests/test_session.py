@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.run_mode import RunMode
 from coding_agent.session import SessionError, make_session_title, utc_now, uuid4_hex
 from coding_agent.session import (
@@ -84,6 +85,7 @@ def test_domain_records_are_immutable_and_payload_repr_is_hidden() -> None:
         ordinal=1,
         status=SessionRunStatus.QUEUED,
         run_mode=RunMode.MODIFY,
+        budget_profile=BudgetProfile.STANDARD,
         user_event_sequence=1,
         started_at_utc=None,
         finished_at_utc=None,
@@ -209,9 +211,11 @@ def test_safe_run_summary_contains_only_accepted_terminal_facts() -> None:
 
 def _valid_persisted_report_input() -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": RUN_ID,
         "run_mode": "modify",
+        "budget_profile": "standard",
+        "phase": "finish",
         "status": "success",
         "exit_code": 0,
         "completion": {
@@ -245,7 +249,10 @@ def _valid_persisted_report_input() -> dict[str, object]:
             },
             "error_code": None,
         },
+        "main_model_calls": 1,
+        "summary_model_calls": 1,
         "logical_model_calls": 2,
+        "summary_provider_attempts": 1,
         "provider_attempts": 3,
         "tool_calls": 4,
         "verification_attempts": 1,
@@ -269,6 +276,8 @@ def test_persisted_run_report_excludes_conversation_and_command_evidence() -> No
         "schema_version",
         "run_id",
         "run_mode",
+        "budget_profile",
+        "phase",
         "status",
         "exit_code",
         "termination_reason",
@@ -276,7 +285,10 @@ def test_persisted_run_report_excludes_conversation_and_command_evidence() -> No
         "mutation_index",
         "validation_index",
         "verification",
+        "main_model_calls",
+        "summary_model_calls",
         "logical_model_calls",
+        "summary_provider_attempts",
         "provider_attempts",
         "tool_calls",
         "verification_attempts",
@@ -312,13 +324,18 @@ def test_persisted_run_report_excludes_conversation_and_command_evidence() -> No
         assert forbidden not in raw
 
 
-def _make_run_record(*, run_mode: object) -> SessionRunRecord:
+def _make_run_record(
+    *,
+    run_mode: object = RunMode.MODIFY,
+    budget_profile: object = BudgetProfile.STANDARD,
+) -> SessionRunRecord:
     return SessionRunRecord(
         run_id=RUN_ID,
         session_id=SESSION_ID,
         ordinal=1,
         status=SessionRunStatus.QUEUED,
         run_mode=run_mode,  # type: ignore[arg-type]
+        budget_profile=budget_profile,  # type: ignore[arg-type]
         user_event_sequence=1,
         started_at_utc=None,
         finished_at_utc=None,
@@ -327,6 +344,16 @@ def _make_run_record(*, run_mode: object) -> SessionRunRecord:
         audit_run_id=None,
         final_report=None,
     )
+
+
+@pytest.mark.parametrize("profile", tuple(BudgetProfile))
+def test_session_run_record_requires_and_preserves_budget_profile(
+    profile: BudgetProfile,
+) -> None:
+    record = _make_run_record(budget_profile=profile)
+    assert record.budget_profile is profile
+    with pytest.raises(TypeError, match="budget_profile"):
+        _make_run_record(budget_profile=profile.value)
 
 
 def _answered_report_input() -> dict[str, object]:
@@ -364,16 +391,80 @@ def test_session_run_record_requires_provider_neutral_run_mode() -> None:
 
 def test_persisted_answered_report_projects_run_mode() -> None:
     persisted = make_persisted_run_report(_answered_report_input())
-    assert persisted["schema_version"] == 2
+    assert persisted["schema_version"] == 3
     assert persisted["run_mode"] == "read_only"
     assert persisted["status"] == "answered"
     assert persisted["exit_code"] == 0
 
 
+def test_persisted_modify_capability_answer_projects_selected_mode() -> None:
+    report = _answered_report_input()
+    report["run_mode"] = "modify"
+
+    persisted = make_persisted_run_report(report)
+
+    assert persisted["run_mode"] == "modify"
+    assert persisted["status"] == "answered"
+    assert persisted["exit_code"] == 0
+
+
+def test_persisted_success_accepts_local_integrity_verification_source() -> None:
+    report = _valid_persisted_report_input()
+    report["verification"]["source"] = "local_integrity"  # type: ignore[index]
+
+    persisted = make_persisted_run_report(report)
+
+    assert persisted["verification"]["source"] == "local_integrity"  # type: ignore[index]
+
+
+def test_changes_unverified_session_run_result_remains_failed() -> None:
+    report = _valid_persisted_report_input()
+    report.update(
+        status="failed",
+        exit_code=1,
+        termination_reason="changes_unverified",
+        changed_paths=["task_manager.py"],
+        mutation_index=1,
+        validation_index=None,
+    )
+    report["verification"] = {
+        "status": "stale",
+        "source": None,
+        "command": None,
+        "exit_code": None,
+        "timed_out": False,
+        "truncated": False,
+        "duration_ms": None,
+        "validation_index": None,
+        "stdout": None,
+        "stderr": None,
+        "error_code": None,
+    }
+    persisted = make_persisted_run_report(report)
+    result = SessionRunResult(
+        run_id=RUN_ID,
+        status=SessionRunStatus.FAILED,
+        agent_status="failed",
+        termination_reason="changes_unverified",
+        audit_run_id="3" * 32,
+        safe_summary=make_safe_run_summary(
+            report,
+            status="failed",
+            termination_reason="changes_unverified",
+        ),
+        final_report=persisted,
+    )
+
+    assert result.status is SessionRunStatus.FAILED
+    assert result.agent_status == "failed"
+    assert result.termination_reason == "changes_unverified"
+    assert result.final_report is not None
+    assert result.final_report["termination_reason"] == "changes_unverified"
+
+
 @pytest.mark.parametrize(
     ("status", "mode", "exit_code"),
     [
-        ("answered", "modify", 0),
         ("answered", "read_only", 1),
         ("success", "read_only", 0),
     ],

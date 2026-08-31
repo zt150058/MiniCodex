@@ -154,6 +154,17 @@ def _read_only_config(workspace: Path) -> RunConfig:
     )
 
 
+def _optional_modify_config(workspace: Path) -> RunConfig:
+    return load_run_config(
+        task="create README",
+        workspace=workspace,
+        model="fake-model",
+        verify_command=None,
+        run_mode=RunMode.MODIFY,
+        environ={"OPENAI_API_KEY": FAKE_KEY},
+    )
+
+
 def _successful_factories() -> ApplicationFactories:
     executor = RecordingExecutor()
 
@@ -233,6 +244,66 @@ def test_modify_run_composes_exact_existing_six_tools(
         "run_java_tests",
     )
     assert gate_calls == 1
+
+
+def test_optional_modify_run_writes_readme_and_uses_local_integrity(
+    tmp_path: Path,
+) -> None:
+    client = FakeModelClient(
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        call_id="write-readme",
+                        name="write_file",
+                        arguments={
+                            "path": "README.md",
+                            "content": "# Demo\n\nLocal coding agent.\n",
+                        },
+                    ),
+                )
+            ),
+            ModelResponse(text="README created."),
+        )
+    )
+
+    result = execute_agent_run(
+        _optional_modify_config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="d" * 32,
+        ),
+    )
+
+    assert result.report.status is AgentStatus.SUCCESS
+    assert result.report.verification.source is not None
+    assert result.report.verification.source.value == "local_integrity"
+    assert result.report.mutation_index == result.report.validation_index == 1
+    assert (tmp_path / "README.md").read_text(encoding="utf-8").startswith(
+        "# Demo"
+    )
+
+
+def test_optional_modify_capability_can_answer_without_mutation(
+    tmp_path: Path,
+) -> None:
+    client = FakeModelClient((ModelResponse(text="Superpowers is a skill workflow."),))
+
+    result = execute_agent_run(
+        _optional_modify_config(tmp_path),
+        factories=_factories_with_model_client(
+            tmp_path,
+            client,
+            run_id="e" * 32,
+        ),
+    )
+
+    assert result.report.status is AgentStatus.ANSWERED
+    assert result.report.exit_code == 0
+    assert result.report.mutation_index == 0
+    assert result.report.verification.status.value == "not_run"
+    assert len(client.requests) == 1
 
 
 def test_read_only_run_composes_only_inspection_tools(

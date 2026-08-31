@@ -103,6 +103,56 @@ def test_sse_answered_terminal_preserves_exact_v2_status_pair() -> None:
     }
 
 
+def test_sse_replays_profile_phase_and_split_budget_in_sequence() -> None:
+    phase = make_update(
+        1,
+        SessionUpdateKind.PHASE_CHANGED,
+        {"from_phase": "act", "to_phase": "verify", "epoch": 2},
+    )
+    progress = make_update(
+        2,
+        SessionUpdateKind.RUN_PROGRESS,
+        {
+            "budget_profile": "deep",
+            "phase": "verify",
+            "main_model_calls": 7,
+            "main_model_limit": 40,
+            "summary_model_calls": 1,
+            "summary_model_limit": 6,
+            "provider_attempts": 9,
+            "provider_attempt_limit": 80,
+            "tool_calls": 12,
+            "tool_limit": 140,
+        },
+    )
+    finished = make_update(
+        3,
+        SessionUpdateKind.RUN_FINISHED,
+        {"status": "succeeded", "agent_status": "answered"},
+    )
+    controller = RecordingController(
+        update_batches=deque(
+            [SessionUpdateBatch((phase, progress, finished), 3, False)]
+        )
+    )
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "GET",
+            f"/api/v1/runs/{RUN_ID}/events",
+            headers={**auth_headers(), "Accept": "text/event-stream"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.text.index("id: 1") < response.text.index("id: 2")
+    assert response.text.index("id: 2") < response.text.index("id: 3")
+    assert progress.data["budget_profile"] == "deep"
+    assert progress.data["phase"] == "verify"
+    assert progress.data["main_model_calls"] == 7
+    assert progress.data["summary_model_calls"] == 1
+
+
 def test_sse_last_event_id_replays_only_newer_terminal_event() -> None:
     finished = make_update(
         2,

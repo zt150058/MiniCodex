@@ -31,6 +31,11 @@ from coding_agent.session_events import (
     SessionUpdateBatch,
     SessionUpdateKind,
 )
+from coding_agent.session_deletion import (
+    SessionDeletionError,
+    SessionDeletionResult,
+    SessionDeletionService,
+)
 from coding_agent.session_runtime import (
     SessionNarrativeRenderer,
     SessionRunExecutor,
@@ -46,9 +51,13 @@ from coding_agent.skills import (
     SkillCatalog,
     SkillCatalogError,
     SkillCatalogView,
+    SkillDescriptor,
 )
+from coding_agent.skill_packages import SkillPackageError, SkillPackageInstaller
 from coding_agent.logging import EventType, RunEvent
+from coding_agent.budget import BudgetProfile, limits_for_profile
 from coding_agent.run_mode import RunMode
+from coding_agent.safety import SafetyCode
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 
 
@@ -65,6 +74,9 @@ class WorkerThread(Protocol):
 
 
 ThreadFactory: TypeAlias = Callable[[Callable[[], None], str], WorkerThread]
+SessionDeletionServiceFactory: TypeAlias = Callable[
+    [Path, SessionStore], SessionDeletionService
+]
 
 
 class CancellationResult(StrEnum):
@@ -84,11 +96,19 @@ def default_thread_factory(
     return Thread(target=target, name=name, daemon=False)
 
 
+def default_session_deletion_service_factory(
+    workspace: Path,
+    store: SessionStore,
+) -> SessionDeletionService:
+    return SessionDeletionService(workspace, store)
+
+
 @dataclass(frozen=True, slots=True)
 class RunHandle:
     session_id: str
     run_id: str
     run_mode: RunMode
+    budget_profile: BudgetProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +128,11 @@ class _ActiveRun:
     cancellation_owner: _CancellationOwner | None = None
     cancellation_error_code: str | None = None
     finalizing: bool = False
+    phase: str = "discover"
+    main_model_calls: int = 0
+    summary_model_calls: int = 0
+    provider_attempts: int = 0
+    tool_calls: int = 0
 
 
 def _workspace_identity(workspace: Path) -> str:
@@ -130,6 +155,29 @@ def _timeout(value: float, *, allow_zero: bool = False) -> float:
     return float(value)
 
 
+def _session_safe_tool_error_code(value: object) -> str | None:
+    if value is None:
+        return None
+    if value in {"tool_error", "tool_rejected"}:
+        return str(value)
+    if not isinstance(value, str):
+        raise ValueError("invalid_safe_error_code")
+    if value.startswith("security_rejected:"):
+        suffix = value.removeprefix("security_rejected:")
+        try:
+            return SafetyCode(suffix).value
+        except ValueError:
+            raise ValueError("invalid_safe_error_code") from None
+    agent_codes = {
+        "agent_rejected:decision_required": "decision_required",
+        "agent_rejected:verification_required": "verification_required",
+    }
+    try:
+        return agent_codes[value]
+    except KeyError:
+        raise ValueError("invalid_safe_error_code") from None
+
+
 class SessionController:
     def __init__(
         self,
@@ -141,6 +189,8 @@ class SessionController:
         narrative_renderer: SessionNarrativeRenderer = SessionNarrativeRenderer(),
         thread_factory: ThreadFactory = default_thread_factory,
         skill_catalog: SkillCatalog | None = None,
+        skill_installer: SkillPackageInstaller | None = None,
+        session_deletion: SessionDeletionService | None = None,
     ) -> None:
         if not isinstance(event_hub, SessionEventHub):
             raise TypeError("event_hub must be SessionEventHub")
@@ -167,6 +217,27 @@ class SessionController:
         ).resolve(strict=False)
         if skill_catalog.workspace_root != expected_skill_root:
             raise SessionControllerError("invalid_session_state")
+        if skill_installer is None:
+            skill_installer = SkillPackageInstaller(expected_skill_root)
+        elif type(skill_installer) is not SkillPackageInstaller:
+            raise TypeError("skill_installer must be SkillPackageInstaller or None")
+        if skill_installer.workspace_skill_root != expected_skill_root:
+            raise SessionControllerError("invalid_session_state")
+        if session_deletion is None:
+            session_deletion = default_session_deletion_service_factory(
+                store.workspace,
+                store,
+            )
+        try:
+            deletion_matches = (
+                session_deletion.store is store
+                and _workspace_identity(session_deletion.workspace)
+                == _workspace_identity(store.workspace)
+            )
+        except (AttributeError, TypeError):
+            raise SessionControllerError("invalid_session_state") from None
+        if not deletion_matches:
+            raise SessionControllerError("invalid_session_state")
         self._store = store
         self._lease = lease
         self._executor = executor
@@ -174,6 +245,8 @@ class SessionController:
         self._narrative_renderer = narrative_renderer
         self._thread_factory = thread_factory
         self._skill_catalog = skill_catalog
+        self._skill_installer = skill_installer
+        self._session_deletion = session_deletion
         self._lock = RLock()
         self._active: _ActiveRun | None = None
         self._admission_done: Event | None = None
@@ -191,6 +264,10 @@ class SessionController:
         utc_clock: Callable[[], datetime] = utc_now,
         thread_factory: ThreadFactory = default_thread_factory,
         skill_catalog: SkillCatalog | None = None,
+        skill_installer: SkillPackageInstaller | None = None,
+        session_deletion_factory: SessionDeletionServiceFactory = (
+            default_session_deletion_service_factory
+        ),
     ) -> SessionController:
         try:
             requested_identity = _workspace_identity(workspace)
@@ -208,7 +285,21 @@ class SessionController:
             )
             store.initialize()
             store.recover_incomplete_runs()
-            return cls(
+            try:
+                session_deletion = session_deletion_factory(store.workspace, store)
+            except Exception:
+                raise SessionControllerError("invalid_session_state") from None
+            try:
+                deletion_matches = (
+                    session_deletion.store is store
+                    and _workspace_identity(session_deletion.workspace)
+                    == _workspace_identity(store.workspace)
+                )
+            except (AttributeError, TypeError):
+                raise SessionControllerError("invalid_session_state") from None
+            if not deletion_matches:
+                raise SessionControllerError("invalid_session_state")
+            controller = cls(
                 store=store,
                 lease=lease,
                 executor=executor,
@@ -218,7 +309,18 @@ class SessionController:
                 ),
                 thread_factory=thread_factory,
                 skill_catalog=skill_catalog,
+                skill_installer=skill_installer,
+                session_deletion=session_deletion,
             )
+            try:
+                session_deletion.recover_pending()
+            except SessionDeletionError as exc:
+                raise SessionControllerError(exc.code) from None
+            except Exception:
+                raise SessionControllerError(
+                    "session_deletion_recovery_failed"
+                ) from None
+            return controller
         except BaseException:
             lease.close()
             raise
@@ -254,6 +356,28 @@ class SessionController:
 
     def list_skills(self) -> SkillCatalogView:
         return self._skill_catalog.discover()
+
+    def import_skill_archive(self, archive: bytes) -> SkillDescriptor:
+        admission = self._reserve_admission()
+        try:
+            candidate = self._skill_installer.inspect(archive)
+            before = self._skill_catalog.discover()
+            if not before.usable:
+                raise SessionControllerError("skill_catalog_unavailable")
+            if any(item.skill_id == candidate.skill_id for item in before.skills):
+                raise SessionControllerError("skill_already_exists")
+            descriptor = self._skill_installer.install(archive)
+            after = self._skill_catalog.discover()
+            matches = tuple(
+                item for item in after.skills if item.skill_id == descriptor.skill_id
+            )
+            if not after.usable or matches != (descriptor,):
+                raise SessionControllerError("skill_install_failed")
+            return descriptor
+        except SkillPackageError as exc:
+            raise SessionControllerError(exc.code) from None
+        finally:
+            self._release_admission(admission)
 
     def get_session_skills(self, session_id: str) -> tuple[str, ...]:
         try:
@@ -291,9 +415,12 @@ class SessionController:
         *,
         skill_ids: tuple[str, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
         if type(run_mode) is not RunMode:
             raise TypeError("run_mode must be RunMode")
+        if type(budget_profile) is not BudgetProfile:
+            raise TypeError("budget_profile must be BudgetProfile")
         try:
             initial = self._narrative_renderer.render((), message)
         except (SessionError, TypeError, ValueError) as exc:
@@ -315,6 +442,7 @@ class SessionController:
                     message,
                     selected_skills=selected_skills,
                     run_mode=run_mode,
+                    budget_profile=budget_profile,
                 )
             except SessionStoreError as exc:
                 raise self._translate_store_error(exc) from None
@@ -325,6 +453,7 @@ class SessionController:
                 initial_user_message=initial,
                 skill_bundle=bundle,
                 run_mode=run_mode,
+                budget_profile=budget_profile,
             )
             handle = self._start_worker(request, admission)
             admission = None
@@ -339,9 +468,12 @@ class SessionController:
         message: str,
         *,
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
         if type(run_mode) is not RunMode:
             raise TypeError("run_mode must be RunMode")
+        if type(budget_profile) is not BudgetProfile:
+            raise TypeError("budget_profile must be BudgetProfile")
         admission = self._reserve_admission()
         try:
             try:
@@ -374,6 +506,7 @@ class SessionController:
                     message,
                     selected_skills=selected_skills,
                     run_mode=run_mode,
+                    budget_profile=budget_profile,
                 )
             except SessionStoreError as exc:
                 raise self._translate_store_error(exc) from None
@@ -384,6 +517,7 @@ class SessionController:
                 initial_user_message=initial,
                 skill_bundle=bundle,
                 run_mode=run_mode,
+                budget_profile=budget_profile,
             )
             handle = self._start_worker(request, admission)
             admission = None
@@ -450,7 +584,12 @@ class SessionController:
             if isinstance(exc, Exception):
                 raise SessionControllerError("thread_start_failed") from None
             raise
-        return RunHandle(request.session_id, request.run_id, request.run_mode)
+        return RunHandle(
+            request.session_id,
+            request.run_id,
+            request.run_mode,
+            request.budget_profile,
+        )
 
     def _controller_failure(self, run_id: str) -> SessionRunResult:
         return SessionRunResult(
@@ -584,10 +723,108 @@ class SessionController:
             self._degrade(active)
             return False
 
+    def _publish_progress(self, active: _ActiveRun) -> None:
+        profile = active.request.budget_profile
+        limits = limits_for_profile(profile)
+        self._publish(
+            active,
+            SessionUpdateKind.RUN_PROGRESS,
+            {
+                "budget_profile": profile.value,
+                "phase": active.phase,
+                "main_model_calls": active.main_model_calls,
+                "main_model_limit": limits.max_main_logical_calls,
+                "summary_model_calls": active.summary_model_calls,
+                "summary_model_limit": limits.max_summary_logical_calls,
+                "provider_attempts": active.provider_attempts,
+                "provider_attempt_limit": limits.max_provider_attempts,
+                "tool_calls": active.tool_calls,
+                "tool_limit": limits.max_tool_calls,
+            },
+        )
+
     def _run_event_handler(self, active: _ActiveRun, event: RunEvent) -> None:
         if not isinstance(event, RunEvent):
             raise TypeError("run event must be RunEvent")
         data = event.data
+        if event.event_type is EventType.RUN_STARTED:
+            if data["budget_profile"] != active.request.budget_profile.value:
+                self._degrade(active)
+                return
+            self._publish_progress(active)
+            return
+        if event.event_type is EventType.MODEL_CALL_STARTED:
+            if data["purpose"] == "main":
+                active.main_model_calls += 1
+            else:
+                active.summary_model_calls += 1
+            self._publish_progress(active)
+            return
+        if event.event_type is EventType.PROVIDER_ATTEMPT_STARTED:
+            active.provider_attempts = max(
+                active.provider_attempts,
+                int(data["provider_attempt_index"]),
+            )
+            self._publish_progress(active)
+            return
+        if event.event_type is EventType.PHASE_CHANGED:
+            active.phase = str(data["to_phase"])
+            self._publish(
+                active,
+                SessionUpdateKind.PHASE_CHANGED,
+                {
+                    "from_phase": data["from_phase"],
+                    "to_phase": data["to_phase"],
+                    "epoch": data["epoch"],
+                },
+            )
+            self._publish_progress(active)
+            return
+        if event.event_type is EventType.DECISION_CHECKPOINT:
+            self._publish(
+                active,
+                SessionUpdateKind.DECISION_CHECKPOINT,
+                {
+                    "reason": data["reason"],
+                    "phase": data["phase"],
+                    "main_calls_remaining": data["main_calls_remaining"],
+                },
+            )
+            return
+        if event.event_type is EventType.CONTEXT_COMPRESSION_COMPLETED:
+            self._publish(
+                active,
+                SessionUpdateKind.CONTEXT_COMPRESSED,
+                {
+                    "summary_source": data["summary_source"],
+                    "before_chars": data["before_chars"],
+                    "after_chars": data["after_chars"],
+                },
+            )
+            return
+        if event.event_type is EventType.NO_PROGRESS_DETECTED:
+            self._publish(
+                active,
+                SessionUpdateKind.NO_PROGRESS_DETECTED,
+                {
+                    "phase": data["phase"],
+                    "post_checkpoint_main_turns": data[
+                        "post_checkpoint_main_turns"
+                    ],
+                },
+            )
+            return
+        if event.event_type is EventType.RUN_COMPLETED:
+            if data["budget_profile"] != active.request.budget_profile.value:
+                self._degrade(active)
+                return
+            active.phase = str(data["phase"])
+            active.main_model_calls = int(data["main_model_calls"])
+            active.summary_model_calls = int(data["summary_model_calls"])
+            active.provider_attempts = int(data["provider_attempts"])
+            active.tool_calls = int(data["tool_calls"])
+            self._publish_progress(active)
+            return
         if event.event_type is EventType.TOOL_CALL_STARTED:
             self._publish(
                 active,
@@ -596,13 +833,16 @@ class SessionController:
             )
             return
         if event.event_type is EventType.TOOL_CALL_COMPLETED:
+            active.tool_calls = max(active.tool_calls, int(data["ordinal"]))
             safe = {
                 "tool_name": data["tool_name"],
                 "status": data["status"],
                 "duration_ms": data["duration_ms"],
                 "truncated": data["truncated"],
                 "exit_code": data["exit_code"],
-                "safe_error_code": data["safe_error_code"],
+                "safe_error_code": _session_safe_tool_error_code(
+                    data["safe_error_code"]
+                ),
                 "changed_paths": data["changed_paths"],
             }
             if self._append_event(
@@ -611,8 +851,10 @@ class SessionController:
                 safe,
             ):
                 self._publish(active, SessionUpdateKind.TOOL_FINISHED, safe)
+                self._publish_progress(active)
             return
         if event.event_type is EventType.VERIFICATION_STARTED:
+            active.tool_calls += 1
             self._publish(
                 active,
                 SessionUpdateKind.VERIFICATION_STARTED,
@@ -622,6 +864,7 @@ class SessionController:
                     "mutation_index": data["mutation_index"],
                 },
             )
+            self._publish_progress(active)
             return
         if event.event_type is EventType.VERIFICATION_COMPLETED:
             persisted = {
@@ -770,6 +1013,26 @@ class SessionController:
             return self._store.list_sessions(limit=limit)
         except SessionStoreError as exc:
             raise self._translate_store_error(exc) from None
+
+    def delete_session(self, session_id: str) -> SessionDeletionResult:
+        admission = self._reserve_admission()
+        try:
+            try:
+                session = self._store.get_session(session_id)
+            except SessionStoreError as exc:
+                raise self._translate_store_error(exc) from None
+            if session.status is not SessionStatus.IDLE:
+                raise SessionControllerError("invalid_session_state")
+            try:
+                result = self._session_deletion.delete(session_id)
+            except SessionDeletionError as exc:
+                raise SessionControllerError(exc.code) from None
+            self._event_hub.forget_runs(result.run_ids)
+            if self._event_run_id in result.run_ids:
+                self._event_run_id = None
+            return result
+        finally:
+            self._release_admission(admission)
 
     def read_updates(
         self,

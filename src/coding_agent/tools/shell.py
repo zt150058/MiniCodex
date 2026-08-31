@@ -311,7 +311,13 @@ class RunCommandTool:
     name = "run_command"
     schema: JSONObject = {
         "name": "run_command",
-        "description": "Run an authorized command in the workspace.",
+        "description": (
+            "Run a single process in the workspace. Use no shell operators. "
+            "Supported verification forms: python "
+            "<workspace-relative-file.py>, python -m pytest ..., or python -m "
+            "unittest ... with purpose=\"verification\". Use run_java_tests "
+            "for Java verification."
+        ),
         "strict": True,
         "parameters": {
             "type": "object",

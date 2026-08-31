@@ -22,7 +22,7 @@ from coding_agent.model import (
 )
 
 
-EVENT_SCHEMA_VERSION = 2
+EVENT_SCHEMA_VERSION = 3
 _RUN_ID = re.compile(r"[0-9a-f]{32}")
 
 
@@ -48,6 +48,11 @@ class EventType(StrEnum):
     VERIFICATION_EVIDENCE_RECORDED = "verification_evidence_recorded"
     VERIFICATION_BLOCKED = "verification_blocked"
     COMPLETION_CANDIDATE = "completion_candidate"
+    PHASE_CHANGED = "phase_changed"
+    PROGRESS_OBSERVED = "progress_observed"
+    DECISION_CHECKPOINT = "decision_checkpoint"
+    NO_PROGRESS_DETECTED = "no_progress_detected"
+    SUMMARY_FALLBACK_LATCHED = "summary_fallback_latched"
     RUN_COMPLETED = "run_completed"
 
 
@@ -142,7 +147,19 @@ def _is_reparse(path: Path) -> bool:
 
 _EVENT_KEYS: dict[EventType, frozenset[str]] = {
     EventType.RUN_STARTED: frozenset(
-        {"task_chars", "mutation_index", "run_mode"}
+        {
+            "task_chars",
+            "mutation_index",
+            "run_mode",
+            "budget_profile",
+            "max_main_model_calls",
+            "max_summary_model_calls",
+            "max_provider_attempts",
+            "max_summary_provider_attempts",
+            "max_tool_calls",
+            "max_runtime_seconds",
+            "verification_tool_reserve",
+        }
     ),
     EventType.TOOL_CALL_STARTED: frozenset(
         {"ordinal", "tool_name", "call_id_hash", "mutation_index"}
@@ -204,8 +221,29 @@ _EVENT_KEYS: dict[EventType, frozenset[str]] = {
     EventType.COMPLETION_CANDIDATE: frozenset(
         {"text_chars", "mutation_index", "validation_index", "verification_status"}
     ),
+    EventType.PHASE_CHANGED: frozenset(
+        {"from_phase", "to_phase", "epoch"}
+    ),
+    EventType.PROGRESS_OBSERVED: frozenset(
+        {"strength", "source", "epoch"}
+    ),
+    EventType.DECISION_CHECKPOINT: frozenset(
+        {"reason", "phase", "main_calls_remaining"}
+    ),
+    EventType.NO_PROGRESS_DETECTED: frozenset(
+        {"phase", "post_checkpoint_main_turns"}
+    ),
+    EventType.SUMMARY_FALLBACK_LATCHED: frozenset(
+        {"reason", "summary_model_calls"}
+    ),
     EventType.RUN_COMPLETED: frozenset(
-        {"status", "termination_reason", "logical_model_calls", "provider_attempts", "tool_calls", "verification_attempts", "mutation_index", "validation_index", "elapsed_ms"}
+        {
+            "status", "termination_reason", "budget_profile", "phase",
+            "main_model_calls", "summary_model_calls", "logical_model_calls",
+            "summary_provider_attempts", "provider_attempts", "tool_calls",
+            "verification_attempts", "mutation_index", "validation_index",
+            "elapsed_ms",
+        }
     ),
 }
 
@@ -224,14 +262,30 @@ _NONNEGATIVE_INT_FIELDS = {
     "output_chars", "duration_ms", "mutation_index_before", "mutation_index_after",
     "attempt_index", "stdout_chars", "stderr_chars", "logical_model_calls", "tool_calls",
     "verification_attempts", "elapsed_ms", "ordinal",
+    "epoch", "main_calls_remaining", "post_checkpoint_main_turns",
+    "summary_model_calls",
+    "max_main_model_calls", "max_summary_model_calls", "max_provider_attempts",
+    "max_summary_provider_attempts", "max_tool_calls", "verification_tool_reserve",
+    "main_model_calls", "summary_provider_attempts",
 }
 _ENUM_FIELDS = {
     "purpose": {"main", "summary"},
     "status": {"ok", "error", "rejected", "not_run", "stale", "running", "completion_candidate", "passed", "failed", "timed_out", "success", "answered", "interrupted"},
-    "source": {"model", "user_verify"},
+    "source": {
+        "model",
+        "user_verify",
+        "local_integrity",
+        "tool",
+        "completion",
+    },
     "summary_source": {"none", "model", "fallback"},
     "verification_status": {"not_run", "stale", "running", "passed", "failed", "timed_out", "error"},
     "run_mode": {"modify", "read_only"},
+    "phase": {"discover", "act", "verify", "finish"},
+    "from_phase": {"discover", "act", "verify", "finish"},
+    "to_phase": {"discover", "act", "verify", "finish"},
+    "strength": {"none", "weak", "strong"},
+    "budget_profile": {"standard", "deep"},
 }
 _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9._-]+"),
@@ -242,6 +296,7 @@ _MODEL_ERROR_CODES = {
     "transient_model_error",
     "fatal_model_error",
     "invalid_model_response",
+    "model_output_limit",
     "model_budget_exceeded",
     "model_client_error",
 }
@@ -265,11 +320,14 @@ _VERIFICATION_ERROR_CODES = {
 _TERMINATION_REASONS = {
     "audit_log_failure",
     "logical_model_call_limit",
+    "main_model_call_limit",
     "provider_attempt_limit",
     "tool_call_limit",
     "time_limit",
     "repeated_tool_call",
     "consecutive_model_errors",
+    "invalid_model_response",
+    "model_output_limit",
     "consecutive_tool_errors",
     "consecutive_safety_rejections",
     "context_budget_exhausted",
@@ -277,6 +335,8 @@ _TERMINATION_REASONS = {
     "empty_model_response",
     "internal_invariant",
     "user_interrupted",
+    "no_progress",
+    "changes_unverified",
 }
 _SAFETY_CODES = {
     "invalid_path",
@@ -333,6 +393,15 @@ def _validate_data(
                 raise RunLogError("invalid_event_data")
             if key != "exit_code" and value is not None and value < 0:
                 raise RunLogError("invalid_event_data")
+        elif key == "max_runtime_seconds":
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise RunLogError("invalid_event_data")
+            value = float(value)
         elif key in _NONNEGATIVE_INT_FIELDS:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise RunLogError("invalid_event_data")
@@ -397,6 +466,28 @@ def _validate_data(
         "completion_candidate", "success", "answered", "failed", "interrupted"
     }:
         raise RunLogError("invalid_event_data")
+    if event_type is EventType.PHASE_CHANGED and (
+        normalized.get("from_phase") == normalized.get("to_phase")
+    ):
+        raise RunLogError("invalid_event_data")
+    if event_type is EventType.PROGRESS_OBSERVED and normalized.get(
+        "source"
+    ) not in {"tool", "completion"}:
+        raise RunLogError("invalid_event_data")
+    if event_type is EventType.DECISION_CHECKPOINT and normalized.get(
+        "reason"
+    ) not in {
+        "exploration_limit",
+        "final_call_reserve",
+        "final_read_allowance_exhausted",
+        "verification_failure",
+        "duplicate_only_turn",
+    }:
+        raise RunLogError("invalid_event_data")
+    if event_type is EventType.SUMMARY_FALLBACK_LATCHED and normalized.get(
+        "reason"
+    ) not in {"model_error", "invalid_summary", "summary_budget"}:
+        raise RunLogError("invalid_event_data")
     if event_type in {
         EventType.MODEL_CALL_FAILED,
     } and normalized.get("error_code") not in _MODEL_ERROR_CODES:
@@ -416,18 +507,28 @@ def _validate_data(
             isinstance(safe_error, str)
             and safe_error.startswith("security_rejected:")
             and safe_error.removeprefix("security_rejected:") in _SAFETY_CODES
-        )
+        ) or safe_error in {
+            "agent_rejected:decision_required",
+            "agent_rejected:verification_required",
+        }
         if not valid_tool_error:
             raise RunLogError("invalid_event_data")
     if event_type in {
         EventType.MODEL_CALL_BLOCKED,
         EventType.PROVIDER_ATTEMPT_BLOCKED,
     }:
-        allowed_reason = {
-            EventType.MODEL_CALL_BLOCKED: "logical_model_call_limit",
-            EventType.PROVIDER_ATTEMPT_BLOCKED: "provider_attempt_limit",
+        allowed_reasons = {
+            EventType.MODEL_CALL_BLOCKED: {
+                "logical_model_call_limit",
+                "main_model_call_limit",
+                "summary_model_call_limit",
+            },
+            EventType.PROVIDER_ATTEMPT_BLOCKED: {
+                "provider_attempt_limit",
+                "summary_provider_attempt_limit",
+            },
         }[event_type]
-        if normalized.get("reason") != allowed_reason:
+        if normalized.get("reason") not in allowed_reasons:
             raise RunLogError("invalid_event_data")
     if event_type in {
         EventType.CONTEXT_COMPRESSION_FAILED,

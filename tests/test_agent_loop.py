@@ -16,6 +16,7 @@ from openai import RateLimitError
 
 import coding_agent.agent as agent_module
 from coding_agent.agent import AgentInterrupted, AgentRunner
+from coding_agent.budget import BudgetProfile
 from coding_agent.context import ContextLimits, ContextManager
 from coding_agent.logging import RunEventLogger
 from coding_agent.messages import (
@@ -31,11 +32,14 @@ from coding_agent.messages import (
 from coding_agent.model import (
     FakeModelClient,
     FatalModelError,
+    InvalidModelResponseError,
     ModelClient,
     ModelError,
+    ModelOutputLimitError,
     TransientModelError,
 )
 from coding_agent.openai_client import OpenAIResponsesClient
+from coding_agent.progress import AgentPhase, ProgressLimits
 from coding_agent.run_mode import RunMode
 from coding_agent.safety import (
     AuthorizedCommand,
@@ -43,7 +47,12 @@ from coding_agent.safety import (
     SafetyCode,
     SafetyViolation,
 )
-from coding_agent.state import AgentStatus, TerminationReason, VerificationStatus
+from coding_agent.state import (
+    AgentState,
+    AgentStatus,
+    TerminationReason,
+    VerificationStatus,
+)
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 from coding_agent.termination import TerminationLimits, TerminationPolicy
 from coding_agent.tools.base import (
@@ -57,7 +66,8 @@ from coding_agent.tools.filesystem import (
     WriteFileTool,
 )
 from coding_agent.tools.registry import ToolRegistry
-from coding_agent.verification import VerificationGate
+from coding_agent.tools.shell import RunCommandTool
+from coding_agent.verification import VerificationGate, VerificationResult
 
 
 def _runner(
@@ -75,6 +85,8 @@ def _runner(
     confirmed_text_handler: Callable[[str], None] | None = None,
     cancellation_requested: Callable[[], bool] | None = None,
     run_mode: RunMode = RunMode.MODIFY,
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD,
+    progress_limits: ProgressLimits | None = None,
 ) -> tuple[AgentRunner, FakeModelClient]:
     client = FakeModelClient(responses)
     runner = AgentRunner(
@@ -95,8 +107,63 @@ def _runner(
         confirmed_text_handler=confirmed_text_handler,
         cancellation_requested=cancellation_requested,
         run_mode=run_mode,
+        budget_profile=budget_profile,
+        progress_limits=progress_limits,
     )
     return runner, client
+
+
+def test_agent_state_starts_with_fresh_progress_ledger(tmp_path: Path) -> None:
+    first = AgentState.start("one", tmp_path, 0.0)
+    second = AgentState.start("two", tmp_path, 0.0)
+
+    assert first.progress.phase is AgentPhase.DISCOVER
+    assert first.progress is not second.progress
+
+
+def test_has_unverified_changes_is_derived_from_freshness(tmp_path: Path) -> None:
+    state = AgentState.start("change", tmp_path, 0.0)
+    assert state.has_unverified_changes is False
+
+    state.mutation_index = 1
+    state.modified_paths = ("task_manager.py",)
+    state.verification_status = VerificationStatus.STALE
+    assert state.has_unverified_changes is True
+
+    state.verification_status = VerificationStatus.PASSED
+    assert state.has_unverified_changes is True
+
+    command = AuthorizedCommand(
+        argv=(sys.executable, "task_manager.py"),
+        normalized_command="python task_manager.py",
+        purpose="verification",
+        source=CommandSource.MODEL,
+    )
+    state.last_verification = VerificationResult(
+        status=VerificationStatus.PASSED,
+        validation_index=1,
+        command=command.normalized_command,
+        source=command.source,
+        exit_code=0,
+        stdout="ok",
+        stderr="",
+        timed_out=False,
+        truncated=False,
+        duration_ms=1,
+        error=None,
+    )
+    assert state.has_unverified_changes is False
+
+
+def test_forced_verification_pending_remains_independent_of_derived_state(
+    tmp_path: Path,
+) -> None:
+    state = AgentState.start("change", tmp_path, 0.0)
+    state.mutation_index = 1
+    state.verification_status = VerificationStatus.STALE
+
+    assert state.has_unverified_changes is True
+    assert state.required_verification_pending is False
 
 
 def test_agent_state_start_preserves_run_mode(tmp_path: Path) -> None:
@@ -129,6 +196,35 @@ def test_read_only_text_response_becomes_answered(tmp_path: Path) -> None:
     assert state.verification_status is VerificationStatus.NOT_RUN
     assert state.verification_attempt_count == 0
     assert state.last_verification is None
+    assert state.progress.phase is AgentPhase.FINISH
+
+
+def test_modify_capability_can_answer_without_mutation_or_verification(
+    tmp_path: Path,
+) -> None:
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="Superpowers is a workflow skill collection."),),
+        run_mode=RunMode.MODIFY,
+        verification_gate=_verification_gate(
+            tmp_path,
+            FakeVerificationExecutor(),
+            required=False,
+        ),
+    )
+
+    state = runner.run("Do you know Superpowers skills?")
+
+    assert state.run_mode is RunMode.MODIFY
+    assert state.status is AgentStatus.ANSWERED
+    assert state.completion_text == "Superpowers is a workflow skill collection."
+    assert state.mutation_index == 0
+    assert state.modified_paths == ()
+    assert state.verification_status is VerificationStatus.NOT_RUN
+    assert state.verification_attempt_count == 0
+    assert state.last_verification is None
+    assert state.progress.phase is AgentPhase.FINISH
+    assert len(client.requests) == 1
 
 
 def test_explicit_modify_text_without_gate_remains_completion_candidate(
@@ -349,11 +445,17 @@ def test_cancel_during_admitted_context_summary_blocks_next_main_model(
         execution_context=ExecutionContext(tmp_path),
         context_manager=ContextManager(
             model_client=client,
-            limits=ContextLimits(max_history_items=4, recent_turns=1),
+            limits=ContextLimits(
+                max_history_items=6,
+                recent_turns=1,
+                compression_trigger_items=5,
+                compression_target_items=4,
+            ),
         ),
         termination_policy=TerminationPolicy(
-            TerminationLimits(max_logical_model_calls=3)
+            TerminationLimits(max_main_logical_calls=3)
         ),
+        progress_limits=ProgressLimits(100, 100, 100, 100, 1),
         cancellation_requested=cancel.is_set,
     )
     state = runner.run("repair")
@@ -725,6 +827,566 @@ class RecordingTool:
         return outcome
 
 
+def _named_recording_tool(
+    name: str,
+    schema: JSONObject,
+    *outcomes: ToolExecution | BaseException,
+) -> RecordingTool:
+    tool = RecordingTool(*outcomes)
+    tool.name = name
+    tool.schema = deepcopy(schema)
+    return tool
+
+
+def test_decision_required_rejects_reads_but_executes_mutation_in_same_batch(
+    tmp_path: Path,
+) -> None:
+    for name in ("first.py", "final.py", "extra.py"):
+        (tmp_path / name).write_text(f"# {name}\n", encoding="utf-8")
+    read = _named_recording_tool(
+        "read_file",
+        ReadFileTool.schema,
+        ToolExecution(output="1: # first.py"),
+        ToolExecution(output="1: # final.py"),
+    )
+    responses = (
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    "first-read",
+                    "read_file",
+                    {"path": "first.py", "start_line": 1, "end_line": None},
+                ),
+            )
+        ),
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    "final-read",
+                    "read_file",
+                    {"path": "final.py", "start_line": 1, "end_line": None},
+                ),
+            )
+        ),
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    "blocked-read",
+                    "read_file",
+                    {"path": "extra.py", "start_line": 1, "end_line": 2},
+                ),
+                ToolCall(
+                    "allowed-write",
+                    "write_file",
+                    {"path": "README.md", "content": "# Project\n"},
+                ),
+            )
+        ),
+        ModelResponse(),
+    )
+    runner, client = _runner(
+        tmp_path,
+        responses,
+        tools=(read, WriteFileTool()),
+        verification_gate=VerificationGate(
+            required_command=None,
+            execution_context=ExecutionContext(tmp_path),
+        ),
+        progress_limits=ProgressLimits(1, 12, 2, 3, 4, 1),
+    )
+
+    state = runner.run("create README")
+
+    paired = [
+        item
+        for item in state.messages
+        if isinstance(item, ToolResult) and item.call_id == "blocked-read"
+    ]
+    assert len(paired) == 1
+    assert paired[0].status == "rejected"
+    assert paired[0].error is not None
+    assert paired[0].error.startswith("agent_rejected:decision_required")
+    assert [call["path"] for call in read.executions] == ["first.py", "final.py"]
+    assert state.mutation_index == 1
+    assert (tmp_path / "README.md").read_text(encoding="utf-8") == "# Project\n"
+    assert client.requests[-1].instructions is not None
+
+
+def test_repeated_read_after_decision_required_gets_one_model_reaction(
+    tmp_path: Path,
+) -> None:
+    read = _named_recording_tool(
+        "read_file",
+        ReadFileTool.schema,
+        ToolExecution(output="1: first"),
+        ToolExecution(output="1: final"),
+    )
+    responses = (
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    "first",
+                    "read_file",
+                    {"path": "first.py", "start_line": 1, "end_line": None},
+                ),
+            )
+        ),
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    "final",
+                    "read_file",
+                    {"path": "final.py", "start_line": 1, "end_line": None},
+                ),
+            )
+        ),
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    "blocked",
+                    "read_file",
+                    {"path": "extra.py", "start_line": 1, "end_line": None},
+                ),
+            )
+        ),
+        ModelResponse(text="response after rejection"),
+    )
+    runner, client = _runner(
+        tmp_path,
+        responses,
+        tools=(read,),
+        progress_limits=ProgressLimits(1, 12, 2, 2, 4, 1),
+    )
+
+    state = runner.run("inspect indefinitely")
+
+    assert state.status is AgentStatus.COMPLETION_CANDIDATE
+    assert state.termination_reason is None
+    assert [call["path"] for call in read.executions] == ["first.py", "final.py"]
+    blocked = [
+        item
+        for item in state.messages
+        if isinstance(item, ToolResult) and item.call_id == "blocked"
+    ]
+    assert len(blocked) == 1
+    assert blocked[0].error is not None
+    assert blocked[0].error.startswith("agent_rejected:decision_required")
+    assert len(client.requests) == 4
+
+
+def test_duplicate_read_rejection_gets_one_model_reaction_that_can_write(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.txt").write_text("source\n", encoding="utf-8")
+    arguments = {"path": "source.txt", "start_line": 1, "end_line": None}
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(ToolCall("first", "read_file", arguments),)),
+            ModelResponse(tool_calls=(ToolCall("repeat", "read_file", arguments),)),
+            ModelResponse(tool_calls=(ToolCall("ignored", "read_file", arguments),)),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write",
+                        "write_file",
+                        {"path": "README.md", "content": "# Project\n"},
+                    ),
+                )
+            ),
+            ModelResponse(text="README created."),
+        ),
+        tools=(ReadFileTool(), WriteFileTool()),
+    )
+    state = runner.run("create README")
+    rejected = [
+        item
+        for item in state.messages
+        if isinstance(item, ToolResult)
+        and item.error is not None
+        and item.error.startswith("agent_rejected:decision_required")
+    ]
+    assert len(rejected) == 1
+    assert (tmp_path / "README.md").is_file()
+    assert len(client.requests) == 5
+
+
+def test_second_failed_decision_stops_without_extra_model_request(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.txt").write_text("source\n", encoding="utf-8")
+    arguments = {"path": "source.txt", "start_line": 1, "end_line": None}
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(ToolCall("first", "read_file", arguments),)),
+            ModelResponse(tool_calls=(ToolCall("repeat", "read_file", arguments),)),
+            ModelResponse(tool_calls=(ToolCall("ignored-1", "read_file", arguments),)),
+            ModelResponse(tool_calls=(ToolCall("ignored-2", "read_file", arguments),)),
+            ModelResponse(text="must not be requested"),
+        ),
+        tools=(ReadFileTool(),),
+    )
+    state = runner.run("inspect forever")
+    assert state.termination_reason is TerminationReason.NO_PROGRESS
+    assert len(client.requests) == 4
+
+
+def test_unverified_mutation_rejects_exploration_on_next_model_turn(
+    tmp_path: Path,
+) -> None:
+    write = ToolCall(
+        "write",
+        "write_file",
+        {"path": "task.py", "content": "print('ok')\n"},
+    )
+    read = ToolCall(
+        "read-after-write",
+        "read_file",
+        {"path": "task.py", "start_line": 1, "end_line": None},
+    )
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(write,)),
+            ModelResponse(tool_calls=(read,)),
+            ModelResponse(text="cannot verify safely"),
+        ),
+        tools=(WriteFileTool(), ReadFileTool()),
+        verification_gate=gate,
+    )
+
+    state = runner.run("write a Python file")
+
+    result = next(
+        item
+        for item in state.messages
+        if isinstance(item, ToolResult) and item.call_id == "read-after-write"
+    )
+    control = client.requests[1].instructions
+    assert control is not None
+    assert "unverified changes: active" in control
+    assert (
+        "required action: verify, repair failed verification, or report blocker"
+        in control
+    )
+    assert result.error is not None
+    assert result.error.startswith("agent_rejected:verification_required")
+    assert state.status is AgentStatus.SUCCESS
+    assert state.termination_reason is None
+    assert state.mutation_index == 1
+    assert state.verification_attempt_count == 1
+    assert state.last_verification is not None
+    assert state.last_verification.source is CommandSource.LOCAL_INTEGRITY
+
+
+def test_changed_file_completion_runs_local_integrity_and_succeeds(
+    tmp_path: Path,
+) -> None:
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write",
+                        "write_file",
+                        {"path": "a.py", "content": "x = 1\n"},
+                    ),
+                )
+            ),
+            ModelResponse(text="file written but I cannot verify it"),
+        ),
+        tools=(WriteFileTool(),),
+        verification_gate=gate,
+    )
+
+    state = runner.run("write a.py")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.termination_reason is None
+    assert state.progress.phase is AgentPhase.FINISH
+    assert state.verification_status is VerificationStatus.PASSED
+    assert state.validation_index == state.mutation_index == 1
+    assert state.verification_attempt_count == 1
+    assert state.tool_call_count == 2
+    assert state.last_verification is not None
+    assert state.last_verification.source is CommandSource.LOCAL_INTEGRITY
+    assert state.progress.epoch == 2
+    assert state.completion_text == "file written but I cannot verify it"
+
+
+def test_failed_verification_opens_one_standard_repair_read_batch(
+    tmp_path: Path,
+) -> None:
+    command = _named_recording_tool(
+        "run_command",
+        RunCommandTool.schema,
+        _verification_execution(1, stderr="test failed"),
+    )
+    read = _named_recording_tool(
+        "read_file",
+        ReadFileTool.schema,
+        ToolExecution(output="1: print('broken')"),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write",
+                        "write_file",
+                        {"path": "task.py", "content": "print('broken')\n"},
+                    ),
+                )
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "verify",
+                        "run_command",
+                        {
+                            "command": "python -m pytest -q",
+                            "purpose": "verification",
+                        },
+                    ),
+                )
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "repair-read",
+                        "read_file",
+                        {"path": "task.py", "start_line": 1, "end_line": None},
+                    ),
+                )
+            ),
+            ModelResponse(text="verification remains blocked"),
+        ),
+        tools=(WriteFileTool(), command, read),
+        verification_gate=VerificationGate(
+            required_command=None,
+            execution_context=ExecutionContext(tmp_path),
+        ),
+        budget_profile=BudgetProfile.STANDARD,
+    )
+
+    state = runner.run("write, test, and repair")
+
+    assert len(command.executions) == 1
+    assert len(read.executions) == 1
+    assert state.last_verification is not None
+    assert state.last_verification.status is VerificationStatus.FAILED
+    assert state.progress.phase is AgentPhase.ACT
+    assert state.termination_reason is TerminationReason.CHANGES_UNVERIFIED
+    assert "progress checkpoint: active" in (
+        client.requests[2].instructions or ""
+    )
+    assert "further read tools will be rejected" in (
+        client.requests[3].instructions or ""
+    )
+
+
+def test_failed_verification_repair_snapshot_allows_whole_mutation_batch(
+    tmp_path: Path,
+) -> None:
+    command = _named_recording_tool(
+        "run_command",
+        RunCommandTool.schema,
+        _verification_execution(1, stderr="test failed"),
+    )
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "initial-write",
+                        "write_file",
+                        {"path": "task.py", "content": "print('broken')\n"},
+                    ),
+                )
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "verify",
+                        "run_command",
+                        {
+                            "command": "python -m pytest -q",
+                            "purpose": "verification",
+                        },
+                    ),
+                )
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "repair-one",
+                        "write_file",
+                        {"path": "one.py", "content": "one = 1\n"},
+                    ),
+                    ToolCall(
+                        "repair-two",
+                        "write_file",
+                        {"path": "two.py", "content": "two = 2\n"},
+                    ),
+                )
+            ),
+            ModelResponse(text="repair requires fresh verification"),
+        ),
+        tools=(WriteFileTool(), command),
+        verification_gate=VerificationGate(
+            required_command=None,
+            execution_context=ExecutionContext(tmp_path),
+        ),
+    )
+
+    state = runner.run("repair two files")
+
+    assert (tmp_path / "one.py").read_text(encoding="utf-8") == "one = 1\n"
+    assert (tmp_path / "two.py").read_text(encoding="utf-8") == "two = 2\n"
+    assert state.mutation_index == 3
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.CHANGES_UNVERIFIED
+    assert state.verification_status is VerificationStatus.STALE
+    assert state.validation_index == 1
+    assert state.last_verification is not None
+    assert state.last_verification.source is CommandSource.MODEL
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["shell_syntax_denied", "executable_denied"],
+)
+def test_command_security_rejection_returns_bounded_correction_contract(
+    tmp_path: Path,
+    code: str,
+) -> None:
+    command = _named_recording_tool(
+        "run_command",
+        RunCommandTool.schema,
+        SafetyViolation(SafetyCode(code), "rejected"),
+    )
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "write",
+                        "write_file",
+                        {"path": "task.py", "content": "print('ok')\n"},
+                    ),
+                )
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "bad-command",
+                        "run_command",
+                        {"command": "unsafe", "purpose": "verification"},
+                    ),
+                )
+            ),
+            ModelResponse(text="blocked"),
+        ),
+        tools=(WriteFileTool(), command),
+        verification_gate=VerificationGate(
+            required_command=None,
+            execution_context=ExecutionContext(tmp_path),
+        ),
+    )
+
+    state = runner.run("write and verify")
+    next_request = client.requests[-1]
+    rendered = "\n".join(
+        item.error or ""
+        for item in next_request.messages
+        if isinstance(item, ToolResult)
+    )
+    assert "one process" in rendered
+    assert "python <workspace-relative-file.py>" in rendered
+    assert "python -m pytest" in rendered
+    assert 'purpose="verification"' in rendered
+    assert str(tmp_path) not in rendered
+    assert sys.executable not in rendered
+    assert state.status is AgentStatus.SUCCESS
+    assert state.termination_reason is None
+    assert state.last_verification is not None
+    assert state.last_verification.source is CommandSource.LOCAL_INTEGRITY
+
+
+def test_three_security_rejections_after_mutation_end_changes_unverified(
+    tmp_path: Path,
+) -> None:
+    def denied() -> SafetyViolation:
+        return SafetyViolation(SafetyCode.EXECUTABLE_DENIED, "denied")
+
+    command = _named_recording_tool(
+        "run_command",
+        RunCommandTool.schema,
+        denied(),
+        denied(),
+        denied(),
+    )
+    responses: list[ModelResponse] = [
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    "write",
+                    "write_file",
+                    {"path": "task.py", "content": "print('ok')\n"},
+                ),
+            )
+        )
+    ]
+    responses.extend(
+        ModelResponse(
+            tool_calls=(
+                ToolCall(
+                    f"verify-{index}",
+                    "run_command",
+                    {
+                        "command": f"python{index + 2} task.py",
+                        "purpose": "verification",
+                    },
+                ),
+            )
+        )
+        for index in range(3)
+    )
+    runner, client = _runner(
+        tmp_path,
+        tuple(responses),
+        tools=(WriteFileTool(), command),
+        verification_gate=VerificationGate(
+            required_command=None,
+            execution_context=ExecutionContext(tmp_path),
+        ),
+    )
+
+    state = runner.run("write and verify")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.CHANGES_UNVERIFIED
+    assert state.consecutive_safety_rejections == 3
+    assert state.mutation_index == 1
+    assert state.validation_index is None
+    assert state.verification_attempt_count == 0
+    assert len(command.executions) == 3
+    assert len(client.requests) == 4
+
+
 class InterruptingModelClient:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -831,9 +1493,15 @@ def test_read_only_mutation_fact_fails_internal_invariant(
 def _compression_limits() -> ContextLimits:
     return ContextLimits(
         max_serialized_chars=60_000,
-        max_history_items=18,
+        max_history_items=24,
         recent_turns=8,
+        compression_trigger_items=19,
+        compression_target_items=12,
     )
+
+
+def _isolated_progress_limits() -> ProgressLimits:
+    return ProgressLimits(100, 100, 100, 100, 1)
 
 
 def _nine_tool_turns() -> tuple[ModelResponse, ...]:
@@ -1011,14 +1679,15 @@ def test_logical_model_limit_blocks_third_request(tmp_path: Path) -> None:
         tmp_path,
         tuple(ModelResponse(tool_calls=(call,)) for call in calls),
         tools=(EchoTool(),),
-        limits=TerminationLimits(max_logical_model_calls=2),
+        limits=TerminationLimits(max_main_logical_calls=2),
+        progress_limits=ProgressLimits(100, 100, 100, 100, 1),
     )
 
     state = runner.run("never completes")
 
     assert state.status is AgentStatus.FAILED
-    assert state.termination_reason is TerminationReason.LOGICAL_MODEL_CALL_LIMIT
-    assert state.failure_reason == TerminationReason.LOGICAL_MODEL_CALL_LIMIT.value
+    assert state.termination_reason is TerminationReason.MAIN_MODEL_CALL_LIMIT
+    assert state.failure_reason == TerminationReason.MAIN_MODEL_CALL_LIMIT.value
     assert state.completion_text is None
     assert state.model_call_count == 2
     assert state.tool_call_count == 2
@@ -1042,7 +1711,10 @@ def test_provider_attempt_limit_blocks_third_retry(tmp_path: Path) -> None:
         tool_registry=ToolRegistry(),
         execution_context=ExecutionContext(workspace=tmp_path),
         termination_policy=TerminationPolicy(
-            TerminationLimits(max_provider_attempts=2)
+            TerminationLimits(
+                max_provider_attempts=2,
+                max_summary_provider_attempts=2,
+            )
         ),
         clock=lambda: 0.0,
     )
@@ -1099,11 +1771,15 @@ def test_agent_emits_ordered_tool_mutation_candidate_and_terminal_events(
         "tool_call_started",
         "tool_call_completed",
         "mutation_recorded",
+        "progress_observed",
+        "phase_changed",
         "model_call_started",
         "provider_attempt_started",
         "provider_attempt_completed",
         "model_call_completed",
         "completion_candidate",
+        "progress_observed",
+        "phase_changed",
         "run_completed",
     ]
     assert state.status is AgentStatus.COMPLETION_CANDIDATE
@@ -1126,7 +1802,10 @@ def test_tool_limit_pairs_unexecuted_call_without_dispatch(tmp_path: Path) -> No
         tmp_path,
         (ModelResponse(tool_calls=(first, second)),),
         tools=(tool,),
-        limits=TerminationLimits(max_tool_calls=1),
+        limits=TerminationLimits(
+            max_tool_calls=1,
+            verification_tool_reserve=0,
+        ),
     )
 
     state = runner.run("respect tool limit")
@@ -1145,7 +1824,7 @@ def test_tool_limit_pairs_unexecuted_call_without_dispatch(tmp_path: Path) -> No
 
 
 def test_exact_time_limit_prevents_first_model_request(tmp_path: Path) -> None:
-    clock = FakeClock(0.0, 600.0)
+    clock = FakeClock(0.0, 1200.0)
     runner, client = _runner(
         tmp_path,
         (ModelResponse(text="must not run"),),
@@ -1178,6 +1857,76 @@ def test_three_consecutive_model_errors_stop_before_fourth_request(
     assert state.consecutive_model_errors == 3
     assert len(client.requests) == 3
     assert state.tool_call_count == 0
+
+
+def test_output_limit_gets_one_temporary_small_tool_recovery_instruction(
+    tmp_path: Path,
+) -> None:
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelOutputLimitError("private partial must not leak"),
+            ModelResponse(text="recovered"),
+        ),
+    )
+
+    state = runner.run("create several files")
+
+    assert state.status is AgentStatus.COMPLETION_CANDIDATE
+    assert state.consecutive_output_limit_errors == 0
+    assert len(client.requests) == 2
+    assert client.requests[0].instructions is None
+    recovery = client.requests[1].instructions
+    assert recovery is not None
+    assert "one file per response" in recovery
+    assert "private partial" not in recovery
+    assert not any(
+        isinstance(message, (UserMessage, AssistantMessage))
+        and "one file per response" in message.content
+        for message in state.messages
+        if not isinstance(message, AssistantMessage) or message.content is not None
+    )
+
+
+def test_second_consecutive_output_limit_stops_before_third_request(
+    tmp_path: Path,
+) -> None:
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelOutputLimitError("first private partial"),
+            ModelOutputLimitError("second private partial"),
+            ModelResponse(text="must not run"),
+        ),
+    )
+
+    state = runner.run("create a large project")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.MODEL_OUTPUT_LIMIT
+    assert state.consecutive_output_limit_errors == 2
+    assert len(client.requests) == 2
+    assert state.tool_call_count == 0
+    assert "private partial" not in repr(state)
+
+
+def test_invalid_completed_model_response_stops_without_blind_retry(
+    tmp_path: Path,
+) -> None:
+    runner, client = _runner(
+        tmp_path,
+        (
+            InvalidModelResponseError("private provider body"),
+            ModelResponse(text="must not run"),
+        ),
+    )
+
+    state = runner.run("create a project")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.INVALID_MODEL_RESPONSE
+    assert len(client.requests) == 1
+    assert "private provider body" not in repr(state)
 
 
 def test_model_success_resets_consecutive_model_errors(tmp_path: Path) -> None:
@@ -1388,26 +2137,180 @@ def test_system_exit_is_not_caught(tmp_path: Path) -> None:
     assert len(client.requests) == 1
 
 
-def test_summary_and_main_call_share_one_run_budget(tmp_path: Path) -> None:
-    tool = RecordingTool(*_nine_tool_outcomes())
+def test_summary_and_main_counts_are_split_but_total_is_preserved(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingTool(
+        ToolExecution(output="result-0"),
+        ToolExecution(output="result-1"),
+    )
     runner, client = _runner(
         tmp_path,
-        _nine_tool_turns()
-        + (_summary_response(), ModelResponse(text="done")),
+        (
+            ModelResponse(tool_calls=(_record_call(0),)),
+            ModelResponse(tool_calls=(_record_call(1),)),
+            _summary_response(),
+            ModelResponse(text="done"),
+        ),
         tools=(tool,),
-        context_limits=_compression_limits(),
+        context_limits=ContextLimits(
+            max_history_items=6,
+            recent_turns=1,
+            compression_trigger_items=5,
+            compression_target_items=3,
+        ),
     )
 
     state = runner.run("compress then finish")
 
     assert state.status is AgentStatus.COMPLETION_CANDIDATE
-    assert state.logical_model_call_count == 11
-    assert state.model_call_count == 11
-    assert len(client.requests) == 11
-    assert client.requests[9].tool_schemas == ()
-    assert client.requests[10].messages[1].content.startswith(
+    assert state.logical_model_call_count == 4
+    assert state.main_model_call_count == 3
+    assert state.summary_model_call_count == 1
+    assert state.model_call_count == 4
+    assert state.summary_provider_attempt_count == 1
+    assert len(client.requests) == 4
+    assert client.requests[2].tool_schemas == ()
+    assert client.requests[3].messages[1].content.startswith(
         "coding-agent context summary\n"  # type: ignore[union-attr]
     )
+
+
+def test_checkpoint_control_is_temporary_and_not_added_to_history(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingTool(ToolExecution(output="first"))
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(_record_call(1),)),
+            ModelResponse(text="decision"),
+        ),
+        tools=(tool,),
+        instructions="base instructions",
+        progress_limits=ProgressLimits(1, 12, 2, 2, 1),
+    )
+
+    state = runner.run("inspect then decide")
+
+    assert "progress checkpoint: active" in (client.requests[1].instructions or "")
+    assert "base instructions" in (client.requests[1].instructions or "")
+    assert all(
+        "Execution control:" not in str(message.to_dict().get("content", ""))
+        for message in state.messages
+    )
+
+
+def test_checkpoint_then_mutation_enters_act_and_clears_no_progress(
+    tmp_path: Path,
+) -> None:
+    mutation = ToolCall(
+        "write-after-checkpoint",
+        "write_file",
+        {"path": "created.txt", "content": "created"},
+    )
+    inspection = RecordingTool(ToolExecution(output="inspection"))
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(_record_call(1),)),
+            ModelResponse(tool_calls=(mutation,)),
+            ModelResponse(text="finished"),
+        ),
+        tools=(inspection, WriteFileTool()),
+        progress_limits=ProgressLimits(1, 12, 2, 2, 1),
+    )
+
+    state = runner.run("inspect then create")
+
+    assert state.status is AgentStatus.COMPLETION_CANDIDATE
+    assert state.progress.phase is AgentPhase.FINISH
+    assert state.progress.checkpoint_active is False
+    assert state.termination_reason is not TerminationReason.NO_PROGRESS
+    assert state.mutation_index == 1
+
+
+def test_checkpoint_then_continued_exploration_stops_without_extra_model_call(
+    tmp_path: Path,
+) -> None:
+    tool = RecordingTool(
+        ToolExecution(output="one"),
+        ToolExecution(output="two"),
+        ToolExecution(output="three"),
+    )
+    runner, client = _runner(
+        tmp_path,
+        tuple(
+            ModelResponse(tool_calls=(_record_call(index),))
+            for index in range(1, 4)
+        ),
+        tools=(tool,),
+        progress_limits=ProgressLimits(1, 12, 2, 2, 1),
+    )
+
+    state = runner.run("inspect forever")
+
+    assert state.status is AgentStatus.FAILED
+    assert state.termination_reason is TerminationReason.NO_PROGRESS
+    assert state.main_model_call_count == 3
+    assert len(client.requests) == 3
+
+
+def test_forced_verification_can_use_reserved_final_tool_slot(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    tool = RecordingTool(ToolExecution(output="work"))
+    runner, _ = _runner(
+        tmp_path,
+        (
+            ModelResponse(tool_calls=(_record_call(1),)),
+            ModelResponse(text="candidate"),
+        ),
+        tools=(tool,),
+        limits=TerminationLimits(max_tool_calls=2),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("use reserved verification slot")
+
+    assert state.status is AgentStatus.SUCCESS
+    assert state.tool_call_count == 2
+    assert state.verification_status is VerificationStatus.PASSED
+    assert len(executor.calls) == 1
+
+
+def test_reserved_final_slot_pairs_all_blocked_calls_without_execution(
+    tmp_path: Path,
+) -> None:
+    executor = FakeVerificationExecutor(_verification_execution(0))
+    tool = RecordingTool(
+        ToolExecution(output="one"),
+        ToolExecution(output="two"),
+    )
+    calls = tuple(_record_call(index) for index in range(1, 5))
+    runner, _ = _runner(
+        tmp_path,
+        (ModelResponse(tool_calls=calls),),
+        tools=(tool,),
+        limits=TerminationLimits(max_tool_calls=3),
+        verification_gate=_verification_gate(tmp_path, executor),
+    )
+
+    state = runner.run("preserve the verification slot")
+
+    assert state.termination_reason is TerminationReason.TOOL_CALL_LIMIT
+    assert len(tool.executions) == 2
+    rejected = tuple(
+        message
+        for message in state.messages
+        if isinstance(message, ToolResult) and message.status == "rejected"
+    )
+    assert tuple(result.call_id for result in rejected) == ("call-3", "call-4")
+    assert all(
+        result.error == "agent_terminated:tool_call_limit" for result in rejected
+    )
+    assert executor.calls == []
 
 
 def test_main_instructions_survive_compression_but_summary_is_isolated(
@@ -1421,6 +2324,7 @@ def test_main_instructions_survive_compression_but_summary_is_isolated(
         + (_summary_response(), ModelResponse(text="candidate")),
         tools=(tool,),
         context_limits=_compression_limits(),
+        progress_limits=_isolated_progress_limits(),
         instructions=sentinel,
     )
 
@@ -1431,11 +2335,10 @@ def test_main_instructions_survive_compression_but_summary_is_isolated(
         "Summarize the provider-neutral"
     )
     assert client.requests[9].instructions is None
-    assert all(
-        request.instructions == sentinel
-        for index, request in enumerate(client.requests)
-        if index != 9
-    )
+    assert all(request.instructions == sentinel for request in client.requests[:9])
+    assert client.requests[10].instructions is not None
+    assert client.requests[10].instructions.startswith(sentinel)
+    assert "Exploration coverage:" in client.requests[10].instructions
 
 
 def test_context_summary_remains_synchronous_when_main_calls_stream(
@@ -1455,11 +2358,12 @@ def test_context_summary_remains_synchronous_when_main_calls_stream(
         model_client=client,
         tool_registry=ToolRegistry((tool,)),
         execution_context=ExecutionContext(tmp_path),
-        context_manager=ContextManager(
-            model_client=client,
-            limits=_compression_limits(),
-        ),
-        stream_handler=events.append,
+            context_manager=ContextManager(
+                model_client=client,
+                limits=_compression_limits(),
+            ),
+            progress_limits=_isolated_progress_limits(),
+            stream_handler=events.append,
     )
 
     state = runner.run("compress then finish")
@@ -1489,6 +2393,7 @@ def test_compression_events_wrap_summary_and_clear_continuation(
         ),
         tools=(tool,),
         context_limits=_compression_limits(),
+        progress_limits=_isolated_progress_limits(),
         event_sink=logger,
     )
 
@@ -1523,7 +2428,7 @@ def test_compression_events_wrap_summary_and_clear_continuation(
     )
     assert started < summary_model_started < completed < next_main
     assert events[completed]["data"]["continuation_cleared"] is True
-    assert events[completed]["data"]["summary_source"] == "model"
+    assert events[completed]["data"]["summary_source"] == "fallback"
     assert logger.metadata.context_compression_count == 1
     assert state.continuation_items == ()
     assert "summary-private" not in raw
@@ -1539,6 +2444,7 @@ def test_summary_exhausts_provider_budget_before_main_call(
         + (TransientModelError("summary unavailable"), ModelResponse(text="must not run")),
         tools=(tool,),
         context_limits=_compression_limits(),
+        progress_limits=_isolated_progress_limits(),
         limits=TerminationLimits(max_provider_attempts=10),
     )
 
@@ -1560,6 +2466,7 @@ def test_summary_fallback_with_remaining_budget_continues_main(
         + (TransientModelError("summary unavailable"), ModelResponse(text="done")),
         tools=(tool,),
         context_limits=_compression_limits(),
+        progress_limits=_isolated_progress_limits(),
     )
 
     state = runner.run("fallback then finish")
@@ -1579,6 +2486,7 @@ def test_fatal_summary_error_becomes_stable_agent_termination(
         _nine_tool_turns() + (FatalModelError("fatal summary"),),
         tools=(tool,),
         context_limits=_compression_limits(),
+        progress_limits=_isolated_progress_limits(),
     )
 
     state = runner.run("fatal summary")
@@ -1634,6 +2542,7 @@ def test_compression_clears_continuation_before_next_main_request(
         ),
         tools=(tool,),
         context_limits=_compression_limits(),
+        progress_limits=_isolated_progress_limits(),
     )
 
     state = runner.run("clear stale continuation")
@@ -1645,13 +2554,58 @@ def test_compression_clears_continuation_before_next_main_request(
     assert summary_only not in state.continuation_items
 
 
+def test_compression_injects_coverage_without_persisting_it(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "large.txt").write_text("x" * 50_000, encoding="utf-8")
+    runner, client = _runner(
+        tmp_path,
+        (
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "large-read",
+                        "read_file",
+                        {
+                            "path": "large.txt",
+                            "start_line": 1,
+                            "end_line": None,
+                        },
+                    ),
+                )
+            ),
+            _summary_response(),
+            ModelResponse(text="finished"),
+        ),
+        tools=(ReadFileTool(),),
+        context_limits=ContextLimits(),
+    )
+    state = runner.run("inspect then finish")
+    main_request = client.requests[-1]
+    assert "Exploration coverage:" in (main_request.instructions or "")
+    assert all(
+        "Exploration coverage:" not in getattr(message, "content", "")
+        for message in state.messages
+    )
+    assert state.continuation_items == ()
+
+
+def test_short_uncompressed_run_does_not_inject_coverage(tmp_path: Path) -> None:
+    runner, client = _runner(
+        tmp_path,
+        (ModelResponse(text="finished"),),
+    )
+    runner.run("finish directly")
+    assert "Exploration coverage:" not in (client.requests[0].instructions or "")
+
+
 def test_text_on_final_permitted_model_call_is_completion_candidate(
     tmp_path: Path,
 ) -> None:
     runner, client = _runner(
         tmp_path,
         (ModelResponse(text="done"),),
-        limits=TerminationLimits(max_logical_model_calls=1),
+        limits=TerminationLimits(max_main_logical_calls=1),
     )
     state = runner.run("finish at boundary")
     assert state.status is AgentStatus.COMPLETION_CANDIDATE
@@ -1668,10 +2622,10 @@ def test_tools_on_final_model_call_run_before_next_model_is_refused(
         tmp_path,
         (ModelResponse(tool_calls=(_record_call(1),)),),
         tools=(tool,),
-        limits=TerminationLimits(max_logical_model_calls=1),
+        limits=TerminationLimits(max_main_logical_calls=1),
     )
     state = runner.run("tool at boundary")
-    assert state.termination_reason is TerminationReason.LOGICAL_MODEL_CALL_LIMIT
+    assert state.termination_reason is TerminationReason.MAIN_MODEL_CALL_LIMIT
     assert state.logical_model_call_count == 1
     assert state.tool_call_count == 1
     assert len(client.requests) == 1
@@ -1954,28 +2908,30 @@ def test_model_verification_evidence_allows_success_without_second_execution(
     assert executor.calls == []
 
 
-def test_model_prose_without_evidence_never_becomes_success(tmp_path: Path) -> None:
+def test_modify_capability_prose_without_mutation_becomes_answered(
+    tmp_path: Path,
+) -> None:
     executor = FakeVerificationExecutor()
     runner, client = _runner(
         tmp_path,
         (ModelResponse(text="I am done"), ModelResponse(text="still done")),
-        limits=TerminationLimits(max_logical_model_calls=2),
+        limits=TerminationLimits(max_main_logical_calls=2),
         verification_gate=_verification_gate(tmp_path, executor, required=False),
     )
 
     state = runner.run("require real evidence")
 
-    assert state.status is AgentStatus.FAILED
-    assert state.termination_reason is TerminationReason.LOGICAL_MODEL_CALL_LIMIT
+    assert state.status is AgentStatus.ANSWERED
+    assert state.termination_reason is None
     assert state.verification_attempt_count == 0
-    assert len(client.requests) == 2
+    assert len(client.requests) == 1
     assert executor.calls == []
     assert sum(
         isinstance(message, AssistantMessage)
         and message.content is not None
         and message.content.startswith("coding-agent verification feedback\n")
         for message in state.messages
-    ) == 2
+    ) == 0
 
 
 def test_tool_budget_at_limit_blocks_required_verification_without_counting_it(
@@ -1987,7 +2943,10 @@ def test_tool_budget_at_limit_blocks_required_verification_without_counting_it(
         tmp_path,
         (ModelResponse(tool_calls=(call,)), ModelResponse(text="candidate")),
         tools=(EchoTool(),),
-        limits=TerminationLimits(max_tool_calls=1),
+        limits=TerminationLimits(
+            max_tool_calls=1,
+            verification_tool_reserve=0,
+        ),
         verification_gate=_verification_gate(tmp_path, executor),
     )
 
@@ -2032,8 +2991,9 @@ def test_last_permitted_model_call_can_still_run_required_verification(
         tmp_path,
         (ModelResponse(text="candidate"),),
         limits=TerminationLimits(
-            max_logical_model_calls=1,
+            max_main_logical_calls=1,
             max_provider_attempts=1,
+            max_summary_provider_attempts=1,
         ),
         verification_gate=_verification_gate(tmp_path, executor),
     )
@@ -2071,15 +3031,18 @@ def test_required_verification_events_precede_success_terminal(
     ).read_text(encoding="utf-8")
     events = [json.loads(line) for line in raw.splitlines()]
     event_types = [event["event_type"] for event in events]
-    assert event_types[-4:] == [
+    assert event_types[-7:] == [
         "completion_candidate",
+        "phase_changed",
         "verification_started",
         "verification_completed",
+        "progress_observed",
+        "phase_changed",
         "run_completed",
     ]
     assert state.status is AgentStatus.SUCCESS
-    assert events[-2]["data"]["status"] == "passed"
-    assert events[-2]["data"]["validation_index"] == state.mutation_index
+    assert events[-4]["data"]["status"] == "passed"
+    assert events[-4]["data"]["validation_index"] == state.mutation_index
     assert events[-1]["data"]["status"] == "success"
     assert "private verification output" not in raw
 
@@ -2132,14 +3095,14 @@ def test_failed_verification_then_exhausted_model_budget_stops_before_request(
     runner, client = _runner(
         tmp_path,
         (ModelResponse(text="candidate"), ModelResponse(text="must not run")),
-        limits=TerminationLimits(max_logical_model_calls=1),
+        limits=TerminationLimits(max_main_logical_calls=1),
         verification_gate=_verification_gate(tmp_path, executor),
     )
 
     state = runner.run("bounded repair")
 
     assert state.status is AgentStatus.FAILED
-    assert state.termination_reason is TerminationReason.LOGICAL_MODEL_CALL_LIMIT
+    assert state.termination_reason is TerminationReason.MAIN_MODEL_CALL_LIMIT
     assert state.logical_model_call_count == 1
     assert state.model_call_count == 1
     assert state.tool_call_count == 1

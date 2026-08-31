@@ -13,7 +13,7 @@ coding-agent "修复当前项目中的失败测试" --workspace <path> --verify 
 `--verify` 是可选参数：
 
 - 用户提供时，该命令是最终强制验证门槛。只有它在最后一次文件修改之后执行且退出码为 `0`，Agent 才能报告成功。
-- 用户未提供时，Agent 可以根据项目文件选择验证命令。该命令仍须通过安全策略，被标记为 `purpose="verification"`，在最后一次文件修改之后执行，并以退出码 `0` 结束。
+- 用户未提供时，Agent 优先接受模型通过安全策略选择的可信验证命令；若当前修改链没有模型或用户验证证据，则可退回确定性的本地文件完整性验证。已有真实验证因后续修改而过期时不得降级。完整性验证只证明变更文件仍位于工作区、大小合规、可按 UTF-8 读取，并对 Python、JSON、TOML 做语法解析，不声称测试、编译或程序运行成功。
 - 最终报告始终展示真实执行的验证命令、来源、退出码、标准输出、标准错误、超时状态和截断状态。
 
 首版的主要特色是修改后的自动验证和失败后迭代修复；辅助特色是结构化上下文压缩。最终演示使用带失败测试的小型 Python 项目，并固定传入 `--verify "pytest -q"`。
@@ -43,6 +43,7 @@ coding-agent "修复当前项目中的失败测试" --workspace <path> --verify 
 - API 模式：`--api-mode` 只接受 `responses` 和 `chat-completions`，默认 `responses`。
 - Endpoint 配置：`responses` 禁止 `--base-url` 并继续使用官方默认地址；`chat-completions` 必须显式提供合法的 HTTPS `--base-url`，项目不硬编码或自动探测供应商。
 - 模型配置：通过 `--model` 或 `OPENAI_MODEL` 指定；两者都不存在时以配置错误退出。
+- 运行预算：每个 run 显式选择 `standard` 或 `deep`，默认 `standard`；档位在 run 创建后不可变。
 - 凭据：Responses 只读取 `OPENAI_API_KEY`，Chat Completions 只读取 `CHAT_COMPLETIONS_API_KEY`；两者不互相回退，也不提供 API Key CLI 参数。
 - 运行依赖：使用已批准的 `openai`、`fastapi` 和 `uvicorn`，其余功能优先使用标准库。
 - 测试依赖：使用已批准的 `pytest` 和 `httpx`。
@@ -59,6 +60,8 @@ AgentRunner <------> ModelClient
     |                    +------> OpenAIResponsesClient ------> OpenAI Responses API
     |                    +------> ChatCompletionsModelClient -> compatible Chat Completions API
     |
+    +------> ProgressLedger
+    +------> Layered ModelCallBudget
     +------> ContextManager
     +------> TerminationPolicy
     +------> VerificationGate
@@ -91,6 +94,8 @@ AgentState -> JSONL EventLogger -> FinalReport
 | `messages.py` | 定义供应商无关的消息、工具调用和结果类型 | 标准库 |
 | `state.py` | 定义 `AgentState` 和验证、终止枚举 | `messages.py` |
 | `model.py` | 定义 `ModelClient` 协议、请求响应类型和 `FakeModelClient` | `messages.py` |
+| `budget.py` | 定义运行预算档位和不可变的分层预算参数 | 标准库 |
+| `progress.py` | 定义执行阶段、进度账本、决策检查点和无进展判定 | `messages.py`, `budget.py` |
 | `openai_client.py` | 在内部类型和 OpenAI Responses API 之间转换 | `model.py`, `openai` |
 | `chat_completions_client.py` | 在内部类型和 OpenAI-compatible Chat Completions API 之间转换 | `model.py`, `openai` |
 | `agent.py` | 执行显式 Agent 主循环 | 上述核心接口 |
@@ -120,20 +125,26 @@ TerminationPolicy.check(AgentState, monotonic_time) -> TerminationDecision
 
 Agent 使用同步、显式的 `while` 循环。每轮按以下顺序执行：
 
-1. 检查模型调用、工具调用、总时间、重复调用、连续错误和安全拒绝预算。
-2. 让 `ContextManager` 构建本轮活动上下文；达到阈值时先执行压缩。
-3. 通过 `ModelClient` 调用模型。
-4. 将模型输出解析为内部 `ModelResponse`。
-5. 如果存在工具调用，按响应中的顺序逐个执行：
+1. 检查用户取消、内部不变量、已有终止条件和 `ProgressLedger` 的决策。
+2. 让 `ContextManager` 构建本轮活动上下文；达到高水位时先压缩到低水位。
+3. 同步摘要产生的分层预算计数，并重新检查时间、主调用和 provider 硬限制。
+4. 在不可变基础指令后追加只含阶段、剩余预算和检查点的确定性运行控制段。
+5. 通过 `ModelClient` 调用主模型并将输出解析为内部 `ModelResponse`。
+6. 如果存在工具调用，按响应中的顺序逐个执行：
    - 验证工具存在且 `call_id` 未重复；
    - 校验 JSON 参数和工具 schema；
    - 执行路径或命令安全授权；
    - 执行本地工具并捕获统一结果；
    - 将 `ToolResult` 加入历史、日志和状态。
-6. 文件工具成功修改内容时增加 `mutation_index`，记录文件，并把现有验证标记为 `STALE`。
-7. 如果模型返回完成文本且没有工具调用，按显式运行模式处理：`modify` 将其视为完成候选并进入 `VerificationGate`；`read_only` 在零修改且未运行验证的不变量成立时进入 `ANSWERED`。
-8. `modify` 验证通过时进入 `SUCCESS`；验证失败或缺少证据时，把真实证据加入上下文并继续运行。`ANSWERED` 不等同于验证成功。
-9. 任何预算耗尽或不可恢复错误都进入带原因的 `FAILED`，不得死循环。
+7. 工具完成后更新弱/强进展、执行阶段、错误计数、修改账本和验证证据。
+8. 文件工具成功修改内容时增加 `mutation_index`，记录文件，并把现有验证标记为 `STALE`。
+9. 如果模型返回完成文本且没有工具调用，零修改、零验证的运行可在 `modify` 或 `read_only` 下进入 `ANSWERED`；这里的 `modify` 是能力边界，不代表本次运行必须修改。存在修改时，该文本只是完成候选并进入 `VerificationGate`。
+10. 修改后的新鲜验证通过时进入 `SUCCESS`；实际执行过但失败或因后续修改而过期的模型/用户验证不会被完整性兜底覆盖。当前修改链没有这类证据且未提供强制 `--verify` 时，可运行确定性的本地完整性验证。`ANSWERED` 与完整性验证都不等同于测试或编译成功。
+11. 任何预算耗尽、检查点后的持续无进展或不可恢复错误都进入带原因的 `FAILED`，不得死循环。
+
+普通决策检查点生效后，`standard` 只允许最后 1 个尝试读取的响应批次，`deep` 允许 2 个；也就是 **Standard 1 / Deep 2**。整轮只有重复读取时直接关闭读取而不获得该额度。额度耗尽后的只读调用返回配对的 `agent_rejected:decision_required`，不执行工具；同一模型响应中的合法修改调用仍按顺序执行，因此门控不会拆散多文件修改批次。第一次决策无进展后，在硬预算允许时保证一次纠正响应，第二次仍无行动才终止。
+
+`AgentState.has_unverified_changes` 是由修改序号与最新验证证据派生的只读事实。存在未验证修改时，只允许精确的可信验证调用；安全策略拒绝命令后，Agent 收到不包含原命令的有界纠正说明。模型直接声明完成且没有当前验证证据时，Agent 可执行本地完整性验证；完整性失败或已经存在当前失败验证时继续保持未验证状态，文件保留且不得进入 `SUCCESS`。
 
 工具调用首版顺序执行，不实现并行。`AgentState` 保存简短的 `current_goal` 和 `open_issues`，但不引入独立 Planner。
 
@@ -299,12 +310,9 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 
 ## 11. 上下文管理策略
 
-活动上下文满足任一条件时触发压缩：
+上下文继续使用确定性的 JSON 序列化字符数和消息项数量，不增加 tokenizer 依赖。字符硬上限为 60,000，48,000 时触发压缩，目标不高于 33,000；消息项硬上限为 24，20 项时触发压缩，目标不高于 12 项。字符数或消息项任一达到高水位都触发，压缩结果必须同时满足两项目标，避免刚压到硬上限下方后立即再次压缩。
 
-- 序列化字符数超过 60,000。
-- 历史项数量超过 24。
-
-压缩以完整 turn 为边界，绝不拆开 assistant tool call 与对应 tool results。最近 8 个完整 turn 是优先保留后缀，最新 1 个完整 turn 是硬下限。首次候选最多调用一次摘要模型；若仍超限，则逐个扩大被移除的最旧完整 turn，后续候选只使用确定性本地摘要，不再次调用模型。成功压缩会原子清空活动 continuation；若摘要加最新完整 turn 仍无法满足硬预算，则以 `context_budget_exhausted` 安全终止。
+压缩以完整 turn 为边界，绝不拆开 assistant tool call 与对应 tool results。初始用户目标始终保留，最近完整交互优先保留；为达到低水位可以继续扩大被移除的最旧前缀，必要时可把最后一个已完成 turn 纳入摘要。若仅初始目标和受限摘要仍超过硬预算，则以 `context_budget_exhausted` 安全终止。
 
 结构化摘要包含：
 
@@ -318,9 +326,13 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 - `verification_state`
 - `avoid_repeating`
 
-以下事实由本地状态强制合并进摘要，不信任模型自行保留：原始任务、工作区边界、修改文件、最近修改序号、验证命令及来源、退出码、验证序号和终止计数。
+以下事实由本地状态强制合并进摘要，不信任模型自行保留：原始任务、工作区相对边界、修改文件、最近修改序号、验证命令及来源、退出码、验证序号和终止计数。摘要不得包含宿主机绝对工作区路径。
 
-语义摘要通过一次无工具的 `ModelClient` 调用生成，并计入 12 次模型调用总预算。输出必须是可解析、字段完整且受大小限制的 JSON。模型调用失败或摘要不合法时，使用本地确定性摘要：保留结构化状态、工具元数据和截断后的近期错误，随后继续任务。
+语义摘要通过一次无工具、无 continuation、无运行指令的 `ModelClient` 调用生成，只消耗摘要专用逻辑预算。输出必须是字段完整且受大小限制的 JSON；解析器只接受裸 JSON，或外围仅包含空白和单一 `json` 代码围栏的 JSON，围栏外正文、多对象、缺少字段和类型错误仍属于非法摘要。每个新 run 初始允许模型摘要；普通 `ModelError`、非法摘要或摘要专用额度耗尽时，当前压缩立即使用确定性本地摘要，并把本 run 锁定为本地摘要。后续压缩不再请求模型；下一次新 run 重新获得一次模型摘要机会。致命模型错误、全局 provider 预算耗尽、内部不变量和 `BaseException` 不降级。
+
+确定性 fallback 在摘要字符上限内按首次出现顺序保留尽可能多的去重、安全、工作区相对检查目标，不再只保留固定数量的最新路径。它不复制成功工具的正文，也不包含宿主机绝对路径、凭据、continuation 或 provider payload；较新的完整工具 turn 继续提供实际内容，路径清单只负责维持导航连续性。
+
+没有压缩时 continuation 原样透传；压缩成功时在完整新消息序列通过校验后同时替换活动历史并清空 continuation。摘要响应产生的 continuation 永远丢弃，continuation、encrypted reasoning 和 provider payload 不进入摘要、日志、报告、Session 或 GUI。
 
 字符数是 token 数的保守近似。首版不引入额外 tokenizer 依赖。
 
@@ -338,7 +350,7 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 | 命令超时 | 终止子进程树，返回 `timed_out=true` |
 | 安全拒绝 | 不执行，记录稳定错误码和简洁原因 |
 | 验证失败 | 作为任务证据回流，不视为程序崩溃 |
-| 摘要失败 | 使用确定性降级摘要 |
+| 摘要普通错误或非法结构 | 本次压缩使用确定性降级摘要，并为当前 run 熔断后续模型摘要 |
 | 日志写入失败 | 向 stderr 报告并停止运行，避免产生不可审计执行 |
 | 用户中断 | 尽力刷新日志，以退出码 130 结束 |
 
@@ -393,29 +405,32 @@ Responses 的 opaque continuation items 仅驻留内存，用于正确续接 Res
 
 ### 无 `--verify`
 
-- Agent 必须产生最新的可信验证证据：通过 `run_command` 执行 `purpose="verification"` 的命令，或通过 `run_java_tests` 执行完整 Java 黑盒套件并使用 `purpose="verification"`。
+- Agent 优先产生最新的可信验证证据：通过 `run_command` 执行 `purpose="verification"` 的命令，或通过 `run_java_tests` 执行完整 Java 黑盒套件并使用 `purpose="verification"`。若没有执行过这些验证，可使用本地文件完整性验证作为最低收敛门槛。
 - 命令或 Java 工具调用必须通过安全策略和可信验证检查。
 - `echo`、目录查看、`git status` 等纯检查命令不能作为验证证据。
 - Java `purpose="test"`、不完整用例、编译失败、程序失败、输出不匹配、截断、超时或清理失败均不能形成通过证据。
 - 最新可信验证必须在最后修改之后执行且退出码为 `0`。
+- 本地完整性验证使用最后一次修改的精确 `changed_paths`，限制每个文件最多 524,288 原始字节，只读 UTF-8 文本；`.py`、`.json`、`.toml` 还必须通过确定性语法解析。其他文本类型只进行完整性检查，因此 C/C++ 等项目的 `SUCCESS` 不表示已经编译。
 
 模型文本中的“完成”“通过”或类似声明都不是验证证据。
 
 ## 15. 循环终止条件
 
-默认硬限制如下：
+每个 run 选择不可变预算档位。`standard` 默认允许 24 次主逻辑调用、4 次摘要逻辑调用、48 次全局 provider 请求、其中最多 8 次摘要 provider 请求、80 次工具调用和 20 分钟；`deep` 允许 40 次主逻辑调用、6 次摘要逻辑调用、80 次全局 provider 请求、其中最多 12 次摘要 provider 请求、140 次工具调用和 30 分钟。配置了必须执行的 `--verify` 且最新修改尚未获得新鲜验证时，最后 1 次工具额度只供 `VerificationGate` 使用。
 
-- 最多 12 次模型调用，包括上下文摘要调用和瞬时错误的每次重试尝试。
-- 最多 40 次工具调用。
-- 最长总运行时间 10 分钟，使用单调时钟计算。
-- 相同工具名和规范化 JSON 参数在无状态进展时最多连续出现 3 次。
-- 连续模型、解析或工具错误最多 3 次。
-- 连续安全拒绝最多 3 次。
+主调用和摘要调用分别计数，但共享全局 provider 硬上限。摘要子额度耗尽时改用本地摘要，不终止主任务。所有上限使用“允许最后一次合法操作，阻止第一个不允许的操作”语义，计数器不得超过上限。
+
+精确重复调用、连续模型错误、连续工具错误和连续安全拒绝的阈值仍为 3。除此之外，`ProgressLedger` 区分首次成功检查等弱进展与修改、验证、阶段转换和完成候选等强进展。`standard` 在自上次强进展后达到 4 次主调用、12 次只读工具调用或连续 2 次完全无新信息时发出决策检查点；`deep` 对应为 6、24 和 3。检查点后分别再允许 2 或 3 次有效主响应；仍只有探索时以 `no_progress` 终止。
+
+主调用剩余 4 次且尚未完成时提前发出最终决策检查点。这 4 次仍可使用，检查点不额外消耗调用。
+
+普通探索检查点后的最后只读批次按尝试读取的模型响应计数，而不是按成功、新颖性或响应中的文件数量计数：`standard` 为 1，`deep` 为 2。整轮只有重复读取时直接触发 `decision_required`；普通额度耗尽后的首个额外读取同样被配对拒绝。拒绝本身不执行、不改写命令，也不推进修改或验证状态。
 
 终止状态和 CLI 退出码：
 
 - `SUCCESS`，退出码 `0`：完成候选通过 `VerificationGate`。
 - `FAILED`，退出码 `1`：预算耗尽、重复停滞、连续失败、安全违规或验证无法通过。
+- `FAILED`，退出码 `1`，原因 `changes_unverified`：修改已保留，但没有最后一次修改之后的新鲜通过证据；不得伪装成成功，也不自动回滚文件。
 - 参数或配置错误，退出码 `2`。
 - 用户中断，退出码 `130`。
 
@@ -485,6 +500,10 @@ Chat Completions 集成测试使用真实 `AgentRunner`、真实适配器和 fak
 18. **临时增量与持久确认分离**：流式 delta 只进入有数量和字节上限的内存事件缓冲；discard 永不持久化，只有 Agent 完整确认的非空文本才能写入 SQLite。
 19. **重启恢复等于中断收敛**：启动时将遗留的 queued、running 或 cancelling run 标记为 `interrupted/process_restarted` 并把会话恢复为 idle，不重放工具、不恢复 provider continuation，也不声称续跑。
 20. **声明式 Skill 目录与执行能力分离**：Task21 允许从用户级和工作区级可信本地目录发现受限 `SKILL.md`，按会话持久化有序 Skill ID，并在每次 run 开始前冻结仅存在于内存的指令快照；Skill 正文不进入 SQLite、日志、事件或报告，Skill 不能注册工具、扩大权限或绕过确定性安全与验证策略。
+21. **权限、资源、阶段和终态分离**：`RunMode` 决定允许的能力，`BudgetProfile` 决定资源硬限制，`AgentPhase` 描述当前工作阶段，`AgentStatus` 表示最终状态；四者不能相互替代或扩大权限。
+22. **分层预算而非单纯提高总轮次**：主调用与摘要调用独立计数、共享 provider 硬上限，并给摘要设置更小的 provider 子预算；这避免维护性摘要挤占核心推理，同时仍有全局成本边界。
+23. **确定性进度账本而非模型自报进展**：首次检查属于弱进展，修改、验证和阶段转换属于强进展；决策检查点先帮助模型收敛，持续探索才以准确的 `no_progress` 终止。
+24. **门控恢复而非自动命令改写**：最后只读额度让复杂调查保留有限收尾空间；额度或命令规则触发拒绝时，只返回安全、精确的纠正约束，绝不替模型重写或执行命令。无法形成新鲜证据时，用 `changes_unverified` 准确表达“文件已改但未验证”。
 
 ## 18. 本地 Web 里程碑
 
@@ -498,9 +517,31 @@ REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果�
 
 `modify` 保留现有六个工具和新鲜验证门槛。`read_only` 只注册 `list_directory`、`read_file` 与专用 `inspect_git`；后者只能执行既有安全策略批准的本地 Git `status`、`diff`、`log`、`show` 和 `ls-files`。只读模式不注册文件修改、通用命令、Java 或验证工具。
 
-只读 run 的非空、无工具最终文本在零修改、零验证的不变量成立时进入 `ANSWERED`，退出码为 `0`；`SUCCESS` 仍只表示修改能力运行获得了最后一次修改后的新鲜通过证据。模式随 run 写入 SQLite、REST/SSE、审计和最终报告；历史数据库迁移时保守标记为 `modify`。
+任一模式的非空、无工具最终文本在零修改、零验证的不变量成立时进入 `ANSWERED`，退出码为 `0`；这体现 `modify` 是能力而非意图。`SUCCESS` 仍只表示修改能力运行获得了最后一次修改后的新鲜通过证据。模式随 run 写入 SQLite、REST/SSE、审计和最终报告；历史数据库迁移时保守标记为 `modify`。
 
-## 20. 首版不实现的功能
+## 20. 自适应收敛与分层预算
+
+每个 run 从 `DISCOVER` 阶段开始。成功修改进入 `ACT`，开始验证进入 `VERIFY`，合法答案或新鲜验证通过进入 `FINISH`。阶段不替代状态：`FINISH` 本身不是成功，修改后的运行仍只能通过 `VerificationGate` 进入 `SUCCESS`。被拒绝或失败的修改不能推动阶段，`read_only` 不能借阶段状态获得修改能力。
+
+`ProgressLedger` 只保存确定性、安全的元数据和哈希指纹。新的成功检查是弱进展；成功修改、新验证证据、阶段转换和完成候选是强进展；重复或近似重复结果、合成拒绝、压缩本身和模型文字中的自我声明不算进展。达到档位阈值时，下一次主请求只在 `ModelRequest.instructions` 后追加固定控制段，要求模型在回答、实施、只检查明确剩余项和报告阻塞之间作出选择；该控制段不伪装成用户消息，也不持久化进会话历史。
+
+运行级 `ExplorationLedger` 与消息历史分离，保存读取工具名、规范化安全目标、请求和结果指纹、状态及对应 `mutation_index`，但不保存文件正文。它按模型响应聚合新读取与重复读取，因此上下文压缩不会使 Agent 忘记已检查目标。账本只驻留当前 run；observation 列表在 repr 中隐藏，不进入 JSONL、FinalReport、Session、SSE 或 GUI。发生过压缩或进入检查点后，主请求可获得字符数受限的 `Exploration coverage`，只包含安全相对目标、计数和省略数量。
+
+普通探索阈值触发的检查点按档位提供 **Standard 1 / Deep 2** 个最终只读响应批次；批次按模型响应中是否尝试读取计数，不依赖结果是否新颖，也不按同一响应中的文件数量重复计数。若一个主响应尝试读取但没有得到任何新结果、修改或验证，则直接关闭后续读取并进入 `decision_required`，不再赠送最终读取批次。额度用完后的读取产生配对但未执行的拒绝结果；若同一批次还含合法修改，修改仍执行。
+
+进入 `decision_required` 后，第一次没有强进展的决策响应必须把完整配对反馈交给模型，并保证在其他硬预算允许时再执行一次纠正响应；第二次仍未修改、验证、完成或报告阻塞时才以 `no_progress` 终止，不得再多调用一次模型。该握手优先于通用检查点回合阈值，但不能越过内部不变量、安全拒绝、时间或 provider 硬预算。修改后，`has_unverified_changes` 只根据本地账本和验证新鲜度计算，不受模型文字影响；合法验证会清除该状态，反复拒绝或无证据完成则稳定终止为 `changes_unverified`。
+
+稳定终止优先级为：内部不变量、安全拒绝、时间、全局 provider 预算、无进展、主调用预算、工具预算、连续模型错误、连续工具错误、精确重复调用。用户中断、审计失败、致命模型错误、上下文预算耗尽和空响应继续作为即时原因处理。摘要成功不能重置主模型连续错误；摘要普通失败只触发当前 run 的摘要熔断。
+
+`standard`/`deep` 选择从 CLI 或 Web 进入 `RunConfig`，随每个 run 写入 Session、SQLite、REST/SSE、审计和最终报告；历史 run 缺少该字段时迁移为 `standard`。follow-up 可为新 run 选择不同档位，正在运行的 run 不可改变。GUI 只展示档位、阶段、安全计数、剩余额度、压缩来源和检查点，不展示隐藏指令、完整工具参数、绝对路径、摘要正文或 continuation。
+
+## 21. 本地 Skill 导入与会话删除
+
+Task27–Task28 按 `docs/superpowers/specs/2026-08-31-local-skill-import-session-deletion-design.md` 实施。Task27 在不增加依赖和不扩大 Agent 权限的前提下，通过认证的 `application/zip` REST 边界导入一个仅含 `<skill-id>/SKILL.md` 的工作区声明式 Skill；专用安装器使用受限 archive grammar、共享 Skill 解析器、独占暂存写入和同目录原子重命名，拒绝额外内容、危险路径、reparse、压缩炸弹和覆盖。
+
+Task28 允许 GUI 逐条确认删除空闲会话及其精确 `audit_run_id` JSONL。专用删除服务以不可变数据库 manifest、精确日志路径、可逆暂存清单、显式 SQLite 子表删除顺序和启动恢复协调文件系统与数据库；不使用 glob、数据库路径文本或用户给定文件目标。活动 run 期间禁止导入或删除。两项能力只属于本地控制面，不暴露为模型工具，也不允许任意工作区删除。
+
+## 22. 首版不实现的功能
 
 - 多智能体、子 Agent 和独立 Planner。
 - 向量数据库、长期记忆和语义检索。
@@ -512,14 +553,15 @@ REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果�
 - 自动 endpoint 探测、按 URL 猜测 API 模式或凭据回退。
 - WebSocket、异步客户端、多个 choices、旧式 `function_call` 或非函数工具。
 - TUI、桌面 GUI、账户系统和多会话并发执行。
-- 可执行 Skill、远程 Skill、Skill 安装/编辑/市场和 Skill 自定义工具；Task21 只实现可信本地声明式目录、会话级有序选择和逐 run 不可变指令快照。
+- 可执行 Skill、远程 Skill、用户级 Skill 安装、Skill 更新/覆盖/编辑/卸载、市场和 Skill 自定义工具；Task27 只增加当前工作区单个纯声明式 zip 的显式本地导入。
 - MCP 客户端或服务端集成。
+- 根据仓库大小自动推算预算、无限预算、独立 Planner/Executor 或模型自动推断 `RunMode`。
 - 任意 Shell、网络访问、包安装或服务端托管工具。
-- 文件删除、移动、权限修改和二进制文件编辑。
+- Agent 工具中的文件删除、移动、权限修改和二进制文件编辑；Task28 的控制面只删除用户明确确认的单个空闲会话及其精确审计日志。
 - Git 写操作、自动提交、自动推送或远程仓库操作。
 - 对恶意工作区代码的操作系统级隔离保证。
 
-## 21. 当前方案的局限性
+## 23. 当前方案的局限性
 
 - 有限命令白名单只覆盖 Python 演示场景，不是通用 Coding Agent 的完整命令生态。
 - `replace_text` 不适合大规模重构或重复片段复杂编辑。
@@ -531,3 +573,5 @@ REST/SSE 与 GUI 行为由离线 Python/Node 测试覆盖，最终视觉效果�
 - OpenAI-compatible 只是协议目标而非兼容性保证；第三方 endpoint 必须实现标准 Chat Completions 工具调用、call ID 和 tool result 配对语义。
 - Chat Completions 使用 `max_tokens` 以覆盖目标兼容服务；只接受 `max_completion_tokens` 的 endpoint 不在 Task15 范围内。
 - 真实模型行为具有非确定性，自动测试主要依赖 FakeModelClient；真实 API 测试只能作为单独记录的人工证据。
+- `standard` 与 `deep` 是可解释的固定档位，并不保证适合所有仓库；确定性进度启发式仍可能要求用户为异常复杂的只读调查选择 `deep`。
+- 最终只读额度和命令纠正都是有限启发式；复杂仓库仍可能以 `decision_required` 或 `changes_unverified` 停止。此时修改文件会保留，不提供事务回滚。

@@ -43,6 +43,11 @@ def _read_utf8(path: Path) -> str:
     return raw.decode("utf-8")
 
 
+def _read_budget_contract_docs() -> str:
+    paths = (ROOT / "AGENTS.md", *PUBLIC_DOCS)
+    return "\n".join(_read_utf8(path) for path in paths)
+
+
 def _readme_metrics(path: Path) -> ReadmeMetrics:
     raw = path.read_bytes()
     text = raw.decode("utf-8")
@@ -269,6 +274,48 @@ def test_readme_submission_stays_within_limit_and_names_read_only_mode() -> None
         assert value in text
 
 
+def test_docs_explain_deterministic_decision_and_verification_recovery() -> None:
+    combined = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            ROOT / "DESIGN.md",
+            ROOT / "TASKS.md",
+            ROOT / "README.md",
+            ROOT / "docs" / "USAGE.md",
+        )
+    )
+
+    for phrase in (
+        "Standard 1 / Deep 2",
+        "decision_required",
+        "changes_unverified",
+        "拒绝但不自动改写",
+        "修改待验证",
+    ):
+        assert phrase in combined
+
+
+def test_docs_describe_run_scoped_exploration_convergence() -> None:
+    readme = _read_utf8(ROOT / "README.md")
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+    for text in (readme, usage):
+        assert "ExplorationLedger" in text or "探索账本" in text
+        assert "decision_required" in text
+        assert "Standard 1 / Deep 2" in text
+        assert "运行级" in text
+    assert "长期记忆" in usage
+    assert "不保存文件正文" in usage
+
+
+def test_docs_do_not_claim_unverified_changes_are_success() -> None:
+    usage = (ROOT / "docs" / "USAGE.md").read_text(encoding="utf-8")
+
+    assert "changes_unverified" in usage
+    assert "退出码 1" in usage
+    assert "文件不会自动回滚" in usage
+    assert "SUCCESS" in usage
+
+
 def test_model_instructions_and_streaming_are_documented_accurately() -> None:
     design = _read_utf8(ROOT / "DESIGN.md")
     api_guide = _read_utf8(ROOT / "docs" / "OPENAI_API.md")
@@ -326,6 +373,47 @@ def test_local_web_gui_is_documented_with_its_real_security_boundary() -> None:
 
     assert "安全诊断" not in usage
     assert "Skill 诊断" not in usage
+
+
+def test_public_docs_lock_local_skill_zip_import_contract() -> None:
+    combined = "\n".join(
+        (
+            _read_utf8(ROOT / "README.md"),
+            _read_utf8(ROOT / "README.txt"),
+            _read_utf8(ROOT / "docs" / "USAGE.md"),
+        )
+    )
+    for required in (
+        ".zip",
+        "当前工作区",
+        "SKILL.md",
+        "不覆盖",
+        "不可执行",
+        "128 KiB",
+        "65,536 字节",
+        "运行期间",
+    ):
+        assert required in combined
+
+
+def test_public_docs_lock_confirmed_session_deletion_contract() -> None:
+    readme = _read_utf8(ROOT / "README.md")
+    submission = _read_utf8(ROOT / "README.txt")
+    usage = _read_utf8(ROOT / "docs" / "USAGE.md")
+    combined = "\n".join((readme, submission, usage))
+
+    for required in (
+        "逐条删除",
+        "标题二次确认",
+        "不支持批量删除",
+        "活动 run",
+        ".coding-agent/logs/<audit_run_id>.jsonl",
+        "cleanup_pending",
+        "启动恢复",
+        "不是 Agent 工具",
+        "不会删除任意工作区文件",
+    ):
+        assert required in combined
 
 
 def test_api_guide_matches_both_adapters_and_declares_unsupported_features() -> None:
@@ -433,3 +521,40 @@ def test_public_docs_contain_no_secret_or_personal_absolute_path() -> None:
     )
     for pattern in forbidden_patterns:
         assert re.search(pattern, combined, flags=re.IGNORECASE) is None
+
+
+def test_docs_explain_profiles_phases_and_exact_default_limits() -> None:
+    combined = _read_budget_contract_docs()
+    for required in (
+        "standard",
+        "deep",
+        "BudgetProfile",
+        "RunMode",
+        "DISCOVER",
+        "ACT",
+        "VERIFY",
+        "FINISH",
+        "24",
+        "4",
+        "48",
+        "80",
+        "20 分钟",
+        "40",
+        "6",
+        "140",
+        "30 分钟",
+        "no_progress",
+    ):
+        assert required in combined
+
+
+def test_docs_do_not_claim_unlimited_budget_planner_or_provider_memory() -> None:
+    combined = _read_budget_contract_docs().lower()
+    for forbidden in (
+        "无限预算",
+        "自动 planner",
+        "服务端会话替代本地历史",
+        "恢复 encrypted reasoning",
+        "绕过验证",
+    ):
+        assert forbidden not in combined

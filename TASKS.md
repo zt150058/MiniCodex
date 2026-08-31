@@ -1014,7 +1014,170 @@
 
 **当前状态**
 
-`进行中`
+`已完成`
+
+## 26. 自适应 Agent 收敛与分层预算
+
+**任务目标**
+
+在不引入 Planner、Agent 框架或新依赖的前提下，增加 `standard`/`deep` 分层预算、轻量阶段、确定性进度账本、决策检查点、上下文高低水位和运行级摘要熔断；再以运行级探索账本、重复回合产出优先握手、Standard 1 / Deep 2 个普通最终只读批次、精确命令纠正和 `changes_unverified` 终态，让复杂任务在保留安全边界的同时收敛到修改、验证或准确失败。
+
+**涉及模块**
+
+- 新增 `src/coding_agent/budget.py` 和 `src/coding_agent/progress.py`
+- `model.py`、`context.py`、`termination.py`、`state.py` 和 `agent.py`
+- 配置、CLI、composition root、日志、报告和项目开发指导
+- 模型指令、`run_command` schema、修改新鲜度派生状态和未验证终止投影
+- Session、SQLite 迁移、Controller、REST、SSE 和本地 GUI
+- 对应单元、组件、集成、Node GUI、Windows 专项和文档合同测试
+- `DESIGN.md`、`AGENTS.md`、`README.md`、`README.txt` 和 `docs/USAGE.md`
+
+**验收标准**
+
+- `BudgetProfile` 只接受 `standard` 与 `deep`，默认 `standard`，逐 run 不可变并完整贯通 CLI、Web、Session、SQLite、审计和最终报告；历史 run 缺少 profile 时确定性迁移为 `standard`。
+- `standard` 精确限制为 24 次主逻辑调用、4 次摘要逻辑调用、48 次全局 provider 请求、8 次摘要 provider 请求、80 次工具调用和 20 分钟；`deep` 精确限制为 40、6、80、12、140 和 30 分钟。
+- 主调用、摘要调用和真实 provider attempt 分别计数；摘要调用不消耗主逻辑额度，摘要 provider 子额度不能突破全局上限，所有限制阻止第一个不允许的操作且计数器永不越界。
+- 配置了强制验证且存在待验证修改时，最后 1 次工具额度只允许现有 `VerificationGate` 使用；其他运行不错误预留。
+- 上下文在 48,000 字符或 20 项达到高水位时触发压缩，并压到不高于 33,000 字符且不高于 12 项；60,000 字符和 24 项继续作为硬上限。
+- 压缩只移除完整工具 turn，保留初始目标，不产生孤立 `ToolResult`；成功替换历史时清空活动 continuation，摘要请求和摘要结果均不保留 continuation。
+- 摘要解析接受裸 JSON 或外围仅含空白的单一 `json` 代码围栏，仍严格校验完整字段和类型；fallback 在摘要字符上限内按首次出现顺序保留尽可能多的去重安全相对目标，不复制成功工具正文。
+- 每个 run 的第一次普通摘要错误、非法结构或摘要子预算耗尽立即使用本地确定性 fallback，并锁定后续压缩为本地摘要；新 run 重新允许模型摘要。致命错误、全局 provider 预算、内部不变量和 `BaseException` 不降级。
+- 摘要和事件不包含宿主机绝对工作区路径、摘要正文、continuation、provider payload、凭据或异常正文。
+- `ProgressLedger` 确定地区分弱进展、强进展和无进展；`standard` 使用 4 次主调用、12 次只读工具、2 次完全无新信息和检查点后 2 次主响应阈值，`deep` 使用 6、24、3 和 3。
+- 运行级 `ExplorationLedger` 保存安全相对目标、请求/结果指纹、状态和 mutation epoch，不保存正文且不持久化；压缩不清空它，模型只在压缩后或检查点期间看到字符受限的安全 coverage。
+- Agent 阶段只根据真实本地行为转换；阶段不能扩大 `RunMode` 权限，`FINISH` 不能绕过 `VerificationGate`，摘要成功不能重置主模型连续错误。
+- 决策检查点通过临时运行 instructions 注入，不伪装成用户消息、不产生额外 Assistant 气泡、不持久化隐藏控制内容；检查点后的持续探索以 `no_progress` 稳定终止。
+- 普通检查点后的最终只读响应批次精确为 Standard 1 / Deep 2，并按尝试读取的模型响应计数；整轮只有重复读取时直接进入 `decision_required`，不再获得最终读取批次。
+- `decision_required` 后第一次无强进展必须把配对反馈交给模型并保证一次纠正响应；第二次仍无行动时以 `no_progress` 终止且不额外调用模型，同批次合法修改仍可执行。
+- 模型可见指令与 `RunCommandTool` schema 明确列出可信 Python/pytest/unittest 和专用 Java 验证形式；命令安全拒绝提供脱敏纠正，但拒绝且不自动改写或执行命令。
+- 用户提供 `--verify` 或已有验证失败时，最后一次修改缺少新鲜通过证据仍只能以 `changes_unverified`、`FAILED` 和退出码 `1` 结束；没有强制命令和失败证据时，可对精确修改路径执行一次本地完整性验证，只有生成当前 mutation 的新鲜通过证据后才能进入 `SUCCESS`。
+- `RunMode.MODIFY` 是能力边界而不是意图分类；零修改、零验证且包含非空最终文本的运行可进入 `ANSWERED`，但不得声称修改或验证成功。
+- Chat `length` 与 Responses `incomplete/max_output_tokens` 映射为 provider-neutral 输出上限错误；第一次只注入临时的小步/单文件纠正，第二次在第三个请求前稳定终止，其他已完成但损坏的响应不进行三次盲重试。
+- 多工具批次中途终止继续生成配对的未执行拒绝结果；流式、取消、Task8 安全、Task11 验证、两个 provider、Skill 和 follow-up 既有行为保持兼容。
+- GUI 可选择标准/深度档位，并安全显示阶段、分项预算、压缩来源和决策检查点；不恢复大量工具卡片或泄漏敏感数据。
+- 默认测试完全离线，不读取真实密钥、不访问网络、不新增依赖或 Agent 框架。
+
+**需要编写的测试**
+
+- profile 枚举、不可变参数、配置、CLI 和精确边界测试。
+- 主/摘要 logical call、全局/摘要 provider attempt、工具与验证保留额度的等号和越界测试。
+- 高低水位、完整 turn、可移除最后完成 turn、fallback 熔断、相同输入确定性、相对路径隐私和 continuation 生命周期测试。
+- 裸 JSON、单一 JSON 围栏、围栏外正文、多对象、缺失字段、fallback 路径容量和正文排除测试。
+- 弱进展、强进展、不同读取的持续探索、精确重复、检查点恢复、检查点后终止和 fake clock 测试。
+- 探索账本 mutation epoch、压缩保持、有界 coverage、整轮重复判定、响应级读取计数和两阶段决策握手测试。
+- Agent 阶段、动态 instructions、只读完成、修改验证、错误重置、多工具批次和取消测试。
+- JSONL schema、FinalReport、Session schema 迁移、生命周期持久化、REST/SSE 和 GUI 投影测试。
+- FakeModelClient 驱动的只读项目介绍、创建 README、摘要非法后继续、复杂调查进入修改和最终验证场景。
+- 真实形态 README fixture：每轮 4–5 个读取、触发压缩、重复读取、配对拒绝、单次纠正写入和新鲜验证，并断言重复执行批次受到确定上限约束。
+- Standard/Deep 最终只读等号边界、额外读取配对拒绝、多文件批次继续修改和 `decision_required` 日志测试。
+- 真实本地 Python 脚本的命令拒绝—合法修正—新鲜验证，以及三次拒绝后 `changes_unverified` 保留文件的离线集成测试。
+- `changes_unverified` 的 FinalReport、JSONL、Session/SSE 安全投影和 GUI 重载终态卡片测试。
+- Task1—Task25、两个 provider、Windows reparse point、timeout 和进程树完整回归测试。
+- 依赖、凭据、绝对路径、continuation、占位符、skip/xfail、Agent 框架和 `git diff --check` 审计。
+
+**建议的 Git 提交说明**
+
+`feat: add adaptive agent convergence and layered budgets`
+
+**当前状态**
+
+`已完成`
+
+## 27. 当前工作区声明式 Skill zip 导入
+
+**任务目标**
+
+在不增加生产依赖、不扩大 Agent 权限且不改变 Task21 选择与注入语义的前提下，为本地 GUI 增加单个纯声明式 Skill zip 的安全导入。导入只写入当前工作区 `.coding-agent/skills/`，只接受一个 `<skill-id>/SKILL.md`，并使用共享解析、受限 archive grammar、暂存写入和原子发布。
+
+**涉及模块**
+
+- 新增 `src/coding_agent/skill_packages.py`
+- `src/coding_agent/skills.py`
+- `src/coding_agent/session_controller.py`
+- `src/coding_agent/web.py`
+- `src/coding_agent/web_static/index.html`
+- `src/coding_agent/web_static/app.js`
+- `src/coding_agent/web_static/styles.css`
+- 对应 Skill、Controller、REST、GUI 和文档测试
+
+**验收标准**
+
+- GUI 只上传一个 `.zip`，Web 使用有 131,072 字节上限的原始 `application/zip` 请求体，不使用 multipart 或新增依赖。
+- archive 只允许一个合法 Skill 目录和一个 `SKILL.md`；拒绝额外文件、嵌套目录、重复成员、危险路径、reparse/symlink 属性、加密、异常压缩、损坏内容和解压后超限。
+- 实现不调用 archive-wide extraction；只对唯一验证成员进行 65,537 字节有界读取并写入新的本地 `SKILL.md`。
+- 手动目录发现和 zip 导入复用同一个 bytes 解析器，Task21 的格式、哈希、诊断、隐私和选择行为保持不变。
+- 安装使用 Skill 根目录内随机暂存、独占文件创建和同目录原子重命名；同名 Skill 及并发竞争拒绝覆盖。
+- 只安装到当前工作区；不支持用户级安装、更新、覆盖、编辑、卸载、远程下载、市场、资源文件、脚本或可执行 Skill。
+- 活动 run、Controller busy/closed/degraded 或不可用 catalog 时拒绝导入。
+- GUI 提供导入按钮、空目录说明、有界状态和稳定错误；成功后刷新并为草稿或空闲会话自动选择新 Skill。
+- REST、GUI、错误、日志和 repr 不暴露 archive bytes、Skill 正文、绝对路径、暂存名或 OS 异常。
+- 默认测试完全离线，不读取真实密钥、不访问网络、不新增 Agent 框架或依赖。
+
+**需要编写的测试**
+
+- 合法 stored/deflated zip、目录成员可选、raw/uncompressed 等号边界和共享解析等价测试。
+- traversal、绝对路径、盘符、ADS、反斜杠、点/空段、控制字符、重复规范名、extra/nested/multiple member 测试。
+- encrypted、unsupported compression、symlink/non-regular 属性、CRC、截断、损坏、超限和压缩炸弹形态测试。
+- catalog 创建、unsafe root、同名、rename race、独占写、暂存清理、发布后发现失败和 Controller admission 测试。
+- application/zip、Content-Encoding、Bearer、Host、Origin、body cap、状态映射、GUI 上传/刷新/自动选择/禁用和打包资源测试。
+- Task21、Session、Web、GUI、安全和完整离线回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: import declarative workspace skills from zip`
+
+**当前状态**
+
+`已完成`
+
+## 28. 逐条删除会话及精确审计日志
+
+**任务目标**
+
+为本地 GUI 增加带标题二次确认的逐条会话删除，并安全删除该会话的 SQLite 关系数据、内存事件投影和由持久化 `audit_run_id` 精确派生的 JSONL；使用可逆日志暂存和启动恢复协调 SQLite 与文件系统，绝不扩展为 Agent 删除工具或任意文件删除。
+
+**涉及模块**
+
+- 新增 `src/coding_agent/session_deletion.py`
+- `src/coding_agent/session_store.py`
+- `src/coding_agent/session_events.py`
+- `src/coding_agent/session_controller.py`
+- `src/coding_agent/web.py`
+- `src/coding_agent/web_static/index.html`
+- `src/coding_agent/web_static/app.js`
+- `src/coding_agent/web_static/styles.css`
+- 对应 Store、删除恢复、Controller、REST、GUI 和文档测试
+
+**验收标准**
+
+- 只允许用户逐条删除空闲会话；不提供批量删除，活动 run 或 Controller busy/closed/degraded 时拒绝。
+- Store 产生只含 session ID、稳定顺序 run ID 和非空 audit run ID 的不可变 manifest；删除事务必须重新读取并精确匹配 manifest。
+- SQLite 在 `BEGIN IMMEDIATE` 中按 `session_events`、`run_skill_snapshots`、`session_runs`、`session_skill_selections`、`sessions` 顺序显式删除并校验行数；任一失败完整回滚。
+- 日志目标只能由通过现有 ID grammar 校验的 `audit_run_id` 构造为 `.coding-agent/logs/<id>.jsonl`；禁止使用数据库路径文本、用户路径、glob 或宽范围枚举。
+- 删除前对工作区、内部目录、日志、暂存和目标执行规范化、边界与 reparse 检查；缺失日志视为已经不存在，异常类型和不安全路径在数据库删除前拒绝。
+- 日志先移动到带有界安全 manifest 的精确暂存目录；数据库失败时无覆盖恢复，提交成功后清理暂存。最终清理失败返回 `cleanup_pending` 并由启动恢复继续。
+- 启动恢复根据会话是否仍存在决定恢复或清理；空且无 manifest 的合法操作目录可清除，畸形 manifest、目标冲突或不安全路径 fail closed。
+- 删除后清除匹配的 SessionEventHub 完成态投影，使已删除 run 不再通过 SSE 读取；无关内存状态保持。
+- GUI 删除控制独立于会话选择，确认文案包含安全纯文本标题；取消不发请求，成功后按下一项、上一项、空白页规则稳定选择。
+- `cleanup_pending` 明确提示日志将在启动时重试；错误和响应不泄漏绝对路径、日志内容、暂存名或 OS 异常。
+- 不删除无关 JSONL、数据库/WAL、Skill、工作区文件或内部目录，不声称跨 SQLite/NTFS 的真实原子事务。
+
+**需要编写的测试**
+
+- manifest 稳定性、stale 拒绝、完整关系删除、其他会话不变、行数校验、SQLite 回滚、busy/active/missing 测试。
+- 精确日志派生、缺失日志、无关日志保留、reparse/non-regular 拒绝和无 glob/数据库路径信任测试。
+- 暂存、数据库失败恢复、提交后清理、cleanup pending、恢复不覆盖，以及各崩溃窗口的启动恢复测试。
+- 畸形 manifest、unsafe staging、目标冲突、空 orphan 目录和 Controller degraded 测试。
+- EventHub forget、SSE 已删除 run、REST DELETE、认证、状态映射、GUI 确认/取消/选中/未选中/最后会话/失败/待清理测试。
+- Task19—Task27、日志、Session、Web、GUI、Windows reparse point 和完整离线回归测试。
+
+**建议的 Git 提交说明**
+
+`feat: delete local sessions and exact audit logs`
+
+**当前状态**
+
+`已完成`
 
 ## 任务完成规则
 

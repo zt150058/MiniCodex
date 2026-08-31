@@ -208,21 +208,13 @@ def _is_reparse(metadata: os.stat_result) -> bool:
     return stat.S_ISLNK(metadata.st_mode) or bool(attributes & 0x400)
 
 
-def _read_definition(
-    path: Path,
+def _parse_skill_document(
+    raw: bytes,
     source: SkillSource,
     entry_name: str,
 ) -> _SkillDefinition:
-    try:
-        metadata = os.lstat(path)
-        if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
-            raise _EntryError("unsafe_skill_path")
-        with path.open("rb") as handle:
-            raw = handle.read(MAX_SKILL_FILE_BYTES + 1)
-    except FileNotFoundError:
-        raise _EntryError("missing_skill_file") from None
-    except OSError:
-        raise _EntryError("missing_skill_file") from None
+    if not isinstance(raw, bytes):
+        raise TypeError("raw must be bytes")
     if len(raw) > MAX_SKILL_FILE_BYTES:
         raise _EntryError("skill_file_too_large")
     try:
@@ -272,6 +264,26 @@ def _read_definition(
     except (TypeError, ValueError):
         raise _EntryError("invalid_skill_metadata") from None
     return _SkillDefinition(descriptor=descriptor, instructions=body)
+
+
+def _read_definition(
+    path: Path,
+    source: SkillSource,
+    entry_name: str,
+) -> _SkillDefinition:
+    try:
+        metadata = os.lstat(path)
+        if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise _EntryError("unsafe_skill_path")
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_SKILL_FILE_BYTES + 1)
+    except FileNotFoundError:
+        raise _EntryError("missing_skill_file") from None
+    except OSError:
+        raise _EntryError("missing_skill_file") from None
+    if len(raw) > MAX_SKILL_FILE_BYTES:
+        raise _EntryError("skill_file_too_large")
+    return _parse_skill_document(raw, source, entry_name)
 
 
 class SkillCatalog:

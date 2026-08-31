@@ -31,6 +31,9 @@ REQUIRED_IDS = {
     "message-input",
     "send-message-button",
     "run-mode-control",
+    "budget-profile-control",
+    "budget-profile-standard",
+    "budget-profile-deep",
     "connection-status",
     "coding-agent-bootstrap",
     "workspace-name",
@@ -50,6 +53,30 @@ def test_gui_contains_compact_accessible_run_mode_control() -> None:
     assert "http://" not in html
     assert "https://" not in html
     assert "innerHTML" not in gui_source("app.js")
+
+
+def test_gui_contains_compact_accessible_budget_profile_control() -> None:
+    html = gui_source("index.html")
+    css = gui_source("styles.css")
+
+    assert 'id="budget-profile-control"' in html
+    assert 'data-budget-profile="standard"' in html
+    assert 'data-budget-profile="deep"' in html
+    assert 'aria-label="运行预算"' in html
+    assert "标准" in html
+    assert "深入" in html
+    assert "无限" not in html
+    assert "budget-profile-control" in css
+
+
+def test_gui_unverified_terminal_card_uses_safe_text_contract() -> None:
+    script = gui_source("app.js")
+    styles = gui_source("styles.css")
+
+    assert "activity-card--changes-unverified" in script
+    assert "activity-card--changes-unverified" in styles
+    assert "appendPlainText" in script
+    assert "innerHTML" not in script
 
 
 class GuiMarkupParser(HTMLParser):
@@ -260,6 +287,7 @@ def test_gui_layout_has_unique_semantic_landmarks_and_controls() -> None:
 
 def test_empty_state_uses_minicodex_and_normal_connection_notice_is_hidden() -> None:
     source = gui_source("index.html")
+    script = gui_source("app.js")
     parser = GuiMarkupParser()
     parser.feed(source)
     attributes = {
@@ -272,7 +300,13 @@ def test_empty_state_uses_minicodex_and_normal_connection_notice_is_hidden() -> 
         "MiniCodex 可以在授权范围内读取和修改工作区文件、运行受控命令，并展示真实验证结果。"
         in source
     )
+    assert "<title>Local MiniCodex</title>" in source
+    assert "把一个清晰的代码任务交给 MiniCodex" in source
+    assert 'aria-label="MiniCodex 运行状态"' in source
+    assert 'aria-label="允许 MiniCodex 修改工作区"' in source
     assert "Agent 可以在授权范围内" not in source
+    assert "MiniCodex 正在处理" in script
+    assert 'role === "user" ? "你" : "MiniCodex"' in script
     assert "data-visible" in attributes["connection-status"]
     assert attributes["connection-status"]["data-visible"] == "false"
     assert attributes["connection-status"]["aria-hidden"] == "true"
@@ -376,6 +410,19 @@ def test_session_titles_are_larger_and_have_no_secondary_status_style() -> None:
     session_title_rule = css.split(".session-title {", 1)[1].split("}", 1)[0]
     assert "font-size: 14px" in session_title_rule
     assert ".session-meta {" not in css
+
+
+def test_session_deletion_controls_are_safe_accessible_and_responsive() -> None:
+    script = gui_source("app.js")
+    css = gui_source("styles.css")
+
+    assert "deleteSession" in script
+    assert "confirmDelete" in script
+    assert "deleteSessionId" in script
+    assert "session-delete-button" in script
+    assert "session-delete-button" in css
+    assert "@media (max-width: 800px)" in css
+    assert "innerHTML" not in script
 
 
 def test_hidden_connection_notice_keeps_its_grid_slot() -> None:

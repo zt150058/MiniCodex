@@ -50,6 +50,7 @@ $env:OPENAI_MODEL = '<model-id>'
 | `--workspace` | 是 | 目标工作区目录；启动时规范化并执行安全检查。 |
 | `--verify` | 否 | 用户指定的强制最终验证命令；启动前使用同一命令策略授权。 |
 | `--read-only` | 否 | 选择 `read_only` 只读问答；默认不提供时使用 `modify`。 |
+| `--budget-profile` | 否 | 运行预算：`standard`（默认）或 `deep`；创建 run 后不可改变。 |
 | `--model` | 否 | 模型 ID；覆盖 `OPENAI_MODEL`。 |
 | `--api-mode` | 否 | 只接受 `responses` 或 `chat-completions`；默认 `responses`。 |
 | `--base-url` | 仅 Chat | compatible Chat Completions 的绝对 HTTPS API 前缀。 |
@@ -62,12 +63,14 @@ $env:OPENAI_MODEL = '<model-id>'
 ```powershell
 coding-agent "修复失败测试" --workspace . --api-mode responses --model '<openai-model-id>' --verify "pytest -q"
 
+coding-agent "分析较大的项目" --workspace . --budget-profile deep --api-mode responses --model '<openai-model-id>' --verify "pytest -q"
+
 coding-agent "修复失败测试" --workspace . --api-mode chat-completions --base-url '<https-provider-base-url-with-api-prefix>' --model '<compatible-model-id>' --verify "pytest -q"
 
 coding-agent "读取项目并介绍其用途" --workspace . --read-only --api-mode responses --model '<openai-model-id>'
 ```
 
-`responses` 可省略 `--api-mode`。未提供 `--verify` 时，模型必须通过 `run_command` 产生可信验证证据，或通过 `run_java_tests` 产生新鲜且内部一致的 Java verification 证据。目录查看、echo 和 `git status` 不能成为成功证据。
+`responses` 可省略 `--api-mode`。未提供 `--verify` 时，模型可通过 `run_command` 产生可信验证证据，或通过 `run_java_tests` 产生新鲜且内部一致的 Java verification 证据；若没有执行这些验证，完成候选会触发内建文件完整性检查。目录查看、echo 和 `git status` 不能成为成功证据。
 
 简单 Java 标准输入输出项目可省略 Python 验证命令：
 
@@ -93,9 +96,13 @@ coding-agent-web --workspace . --api-mode chat-completions --base-url '<https-pr
 
 服务只绑定 IPv4 `127.0.0.1`，默认使用系统分配的随机端口，监听成功后才打开浏览器。传 `--no-open-browser` 可只输出本地 URL。页面、REST 和 fetch-SSE 使用同一进程级 Bearer token，并执行严格 Host 与 Origin 检查；token 不进入 URL、持久存储或日志。它不是远程服务，不应通过端口转发、代理或网络共享暴露。
 
-左侧可新建和切换持久会话；空闲会话可提交 follow-up，并为下一次运行选择有序的声明式 Skill。发送前的紧凑选择器提供“允许修改”和“只读问答”，选择值只对当前提交生效并在运行期间锁定；同一会话的每条消息可以重新选择模式。页面刷新后选择器恢复默认的允许修改，不使用浏览器持久存储猜测权限。历史消息旁的模式标记来自持久化 run 记录。
+左侧可新建和切换持久会话；空闲会话可提交 follow-up，并为下一次运行选择有序的声明式 Skill。发送前的紧凑选择器提供“允许修改”和“只读问答”，以及 `standard`（标准）和 `deep`（深入）预算。两个选择值只对当前提交生效并在运行期间锁定；同一会话的每条消息可以重新选择模式和预算。页面刷新后选择器恢复默认的允许修改和标准预算，不使用浏览器持久存储猜测权限。历史消息旁的模式与 profile 标记来自持久化 run 记录。
 
 Skill 选择器只显示可用 Skill 的名称、描述和来源；发现诊断不在 GUI 中展示，指令正文也不会显示，GUI 不执行 Skill，Skill 也不能扩展所选模式的工具权限。全局一次只运行一个 Agent；运行或取消期间，历史仍可浏览，但发送和 Skill 修改会禁用。取消按钮只请求既有协作式取消，关闭浏览器不会取消正在运行的 Agent，重新打开页面会从持久快照和 SSE 游标恢复。页面通过服务器终态显示成功、已回答或失败，不根据浏览器断开伪造结果。
+
+空闲时可点击“导入 Skill ZIP”，选择一个本机 `.zip`。它只安装到当前工作区的 `.coding-agent/skills/`，包内必须恰好包含一个 `<skill-id>/SKILL.md`；归档不得超过 128 KiB，`SKILL.md` 不得超过 65,536 字节。导入不会覆盖任何同 ID 的用户或工作区 Skill，不接受可执行内容、符号链接或额外文件；运行期间导入按钮禁用。成功导入后，新 Skill 会加入草稿选择；若当前选中空闲会话，也会通过既有会话选择接口保存。该功能不联网、不执行 Skill，也不会扩大 Agent 权限。
+
+会话列表中的删除按钮只支持逐条删除空闲会话，并以该会话的安全纯文本标题二次确认；不支持批量删除，活动 run、取消过程或 Controller 忙碌时均拒绝。删除成功后会移除该会话的 SQLite 关系数据、内存事件投影，以及由持久化 audit ID 精确派生的 `.coding-agent/logs/<audit_run_id>.jsonl`，不会扫描或删除无关日志。响应中的 `cleanup_pending` 表示数据库删除已完成，但暂存日志将在下次启动恢复时继续清理。会话删除是认证后的本地 GUI/REST 控制面操作，不是 Agent 工具，也不会删除任意工作区文件、Skill、数据库或 WAL。
 
 本地 GUI 不提供账户，不支持 MCP，不支持并行运行，也不允许远程使用。浏览器启动失败只产生固定警告，服务仍继续运行。
 
@@ -111,12 +118,18 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 
 ## Agent 运行流程
 
+`RunMode` 与 `BudgetProfile` 是正交且不可变的 run 属性：前者限定工具权限，后者限定资源；二者都不会由模型提示词推断。`standard` 最多允许 24 次 main model call、4 次 summary call、48 次 provider attempt（其中 summary 最多 8 次）、80 次工具调用和 20 分钟；`deep` 对应 40、6、80（summary 最多 12）、140 和 30 分钟。它们是“阻止下一次不允许操作”的硬上限，不是承诺用完的配额。
+
+进度状态按 `AgentPhase` 的 `DISCOVER`、`ACT`、`VERIFY`、`FINISH` 演进，与终态 `AgentStatus`（例如 `ANSWERED`、`SUCCESS`、`FAILED`）分开。读取和检查属于弱进展，修改与新鲜验证属于强进展。运行级 `ExplorationLedger`（探索账本）仅保留安全的工作区相对目标标签、请求/结果哈希、状态和修改 epoch；它不保存文件正文、provider continuation 或凭据，也不是跨会话的长期记忆。达到探索阈值时先注入一次确定性的决策 checkpoint；checkpoint 后仍持续探索才以 `no_progress` 终止。上下文压缩优先请求一次结构化摘要，清除旧 provider continuation，并在后续请求中临时提供有界探索覆盖；摘要模型错误、非法摘要或摘要专用预算耗尽会为当前 run 锁定本地 fallback，后续压缩不再调用摘要模型。
+
+普通 checkpoint 后的最终只读额度是 **Standard 1 / Deep 2** 个尝试读取的模型响应批次；一个响应中的多个读取只算一批，失败或被拒绝的读取也不能产生无限额度。整批读取均为已见过的相同结果时会立即进入 `decision_required`，不再获得普通最终读取额度。之后的读取会得到配对拒绝而不执行，同一响应中的合法修改仍可继续；第一次决策响应仍无强进展时，仅在更高优先级硬预算允许下再提供一次纠正响应，第二次仍无进展则以 `no_progress` 停止。被安全策略拒绝的验证命令只收到固定、脱敏的合法形式提示：本地 Python 脚本、`python -m pytest ...`、`python -m unittest ...`，Java 使用 `run_java_tests`。策略会拒绝但不自动改写或代替模型执行命令。
+
 1. CLI 在联网前校验任务、工作区、运行模式、API mode、base URL、模式专用凭据、模型和可选验证命令。
 2. composition root 根据显式运行模式构造精确工具注册表；修改模式还构造共享命令执行器和验证门，两种模式共享所选模型适配器、上下文管理器、终止策略和事件日志器。
 3. 启动时只读取一次根 `AGENTS.md`，与内置基础规则组合成不可变运行指令；Agent 根据该指令和本地历史请求模型。超过字符或历史项阈值时生成结构化摘要，失败则使用确定性 fallback，摘要不会继承运行指令。
 4. 工具调用按响应顺序进行本地校验、授权、执行和观察，结果通过 `call_id` 配对写回历史。
 5. 文件修改增加 mutation index，并使旧验证状态失效。
-6. `modify` 的完成候选只有在本地验证门接受新鲜证据后才能成为 `SUCCESS`；`read_only` 的非空最终回答在零修改、零验证的不变量成立时成为 `ANSWERED`。
+6. 存在修改时，`modify` 的完成候选只有在本地验证门接受新鲜证据后才能成为 `SUCCESS`；零修改、零验证的非空最终回答在 `modify` 或 `read_only` 下都成为 `ANSWERED`。
 7. 预算耗尽、重复无进展、安全拒绝或不可恢复错误产生稳定失败原因。
 
 两个模型适配器内部都支持 provider-neutral 文本流事件，以及首个 delta 前的结构化同步回退。**CLI 仍使用同步最终报告**，不会逐 token 显示内容；Web GUI 通过经过认证的 fetch-SSE 投影安全事件。部分输出仅驻留内存；中断后不会写入消息历史、JSONL 或 FinalReport。
@@ -154,9 +167,11 @@ coding-agent "修复当前项目中的失败测试" --workspace . --api-mode res
 
 `SUCCESS` 不由模型文字决定。修改模式的新鲜验证必须在最后一次文件修改后运行、退出码为 0，并满足 `validation_index == mutation_index`。
 
-只读模式的非空最终文本在没有修改和验证事实时成为 `ANSWERED`，GUI 显示“已回答”，退出码同样为 `0`；它只表示问答正常结束，不表示测试通过或代码已验证。预算、安全拒绝、审计失败、模型错误和用户中断仍可终止只读运行。
+如果文件已经修改，但纠正机会耗尽、验证没有运行或未通过，终止原因是 `changes_unverified`，FinalReport 状态为 `failed`、退出码 1。GUI 以“修改待验证”显示修改路径、验证状态和安全错误码。文件不会自动回滚；用户应检查保留的修改，提供 `--verify`，或要求 Agent 使用上述允许的验证形式。该状态绝不等同于 `SUCCESS`。
 
-用户提供 `--verify` 时，即使已有新鲜 Java 证据，也必须执行用户命令并以其结果为最终门槛；未提供时才允许可信 `run_command` 或完整通过的 Java verification 证据。
+任一模式的非空最终文本在没有修改和验证事实时成为 `ANSWERED`，GUI 显示“已回答”，退出码同样为 `0`；它只表示问答正常结束，不表示测试通过或代码已验证。预算、安全拒绝、审计失败、模型错误和用户中断仍可终止运行。
+
+用户提供 `--verify` 时，即使已有新鲜 Java 证据，也必须执行用户命令并以其结果为最终门槛；未提供时才允许可信 `run_command`、完整通过的 Java verification 证据或内建完整性验证。已有模型/用户验证因后续修改而过期时不得降级为完整性检查。内建验证检查每个 changed path 仍处于工作区、文件不超过 524,288 原始字节且为 UTF-8；`.py`、`.json`、`.toml` 还必须通过语法解析，其他文本（包括 C/C++）只检查完整性，不表示已编译或运行。
 
 | 退出码 | FinalReport 状态 | 含义 |
 | --- | --- | --- |
@@ -216,13 +231,19 @@ GUI 的确定性视觉 fixture 不读取凭据或调用模型：
 - `--read-only cannot be combined with --verify`：二者权限语义冲突；移除验证命令，或改用默认修改模式。
 - `trusted Java runtime is unavailable`：确认 Windows PATH 中存在工作区外的 `javac.exe` 与 `java.exe`。
 - 退出 `1`：读取 FinalReport 的 termination reason、验证证据和 `.coding-agent/logs/<run_id>.jsonl` 中的脱敏事件。
+- `no_progress`：Agent 在决策 checkpoint 后仍未回答、修改、验证或报告阻塞；缩小任务范围，明确目标文件，或在确需更多探索时选择 `deep`。
+- `decision_required`：最终只读额度已耗尽，或本轮读取全部是运行级探索账本中的重复结果。让 Agent 直接回答、实施已明确修改、使用合法验证形式，或报告具体阻塞；继续读取会被配对拒绝，第一次无进展决策之后最多还有一次纠正响应。
+- `changes_unverified`：文件已修改但没有最后一次修改之后的新鲜通过证据，退出码 1。文件不会自动回滚；检查修改后重新运行并提供强制验证命令，或让 Agent 使用允许的 Python/Java 验证形式。
+- `main_model_call_limit`：main call 硬上限已用完；检查此前 checkpoint 与工具结果，拆分任务或选择 `deep`，不要把它误解为 summary 次数。
+- `provider_attempt_limit`：包括模型适配器内部重试在内的物理请求硬上限已用完；检查 endpoint 稳定性。摘要调用与 main 调用共享该总数，但另有 summary 子上限。
+- 摘要 fallback：日志中的 `summary_fallback_latched` 表示本 run 已改用确定性本地摘要；这是安全降级，不会记录摘要正文，也不会在同一 run 反复尝试模型摘要。
 - 测试超时：命令执行器会终止 Windows 子进程树并保留受限的 stdout/stderr；检查 `timed_out` 和 `cleanup_error`。
 
 ## 停止运行与清理
 
 一次性 CLI 中按 `Ctrl+C` 请求停止，正常中断应返回 `130` 和 `interrupted` 报告；强制关闭终端可能阻止最终报告写出。Web 服务中按 Ctrl+C 会停止接收新请求，等待已接纳的运行协作式结束并关闭资源；关闭浏览器不会取消运行。
 
-进程停止后，用户可以自行删除工作区内 `.coding-agent` 目录来清理本地日志。Agent 没有删除工具，也不会自动清理、提交或上传这些文件。
+进程停止后，用户可以自行删除工作区内 `.coding-agent` 目录来清理全部本地状态。GUI 的逐条会话删除只清理精确关联的关系数据和审计 JSONL；Agent 没有删除工具，也不会自动清理、提交或上传其他文件。
 
 ## 安全边界和已知限制
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 import json
+from pathlib import PurePosixPath, PureWindowsPath
 
 from coding_agent.messages import (
     AssistantMessage,
@@ -15,13 +16,18 @@ from coding_agent.messages import (
 from coding_agent.model import (
     FatalModelError,
     ModelBudgetExceeded,
+    ModelBudgetReason,
     ModelCallBudget,
     ModelCallPurpose,
     ModelClient,
     ModelError,
     invoke_model,
 )
-from coding_agent.state import AgentState, TerminationReason
+from coding_agent.state import (
+    AgentState,
+    SummaryFallbackReason,
+    TerminationReason,
+)
 
 
 class SummarySource(StrEnum):
@@ -43,6 +49,10 @@ class ContextLimits:
     recent_turns: int = 8
     max_summary_chars: int = 12_000
     summary_max_output_tokens: int = 4096
+    compression_trigger_chars: int = 48_000
+    compression_target_chars: int = 33_000
+    compression_trigger_items: int = 20
+    compression_target_items: int = 12
 
     def __post_init__(self) -> None:
         for name in (
@@ -51,11 +61,74 @@ class ContextLimits:
             "recent_turns",
             "max_summary_chars",
             "summary_max_output_tokens",
+            "compression_trigger_chars",
+            "compression_target_chars",
+            "compression_trigger_items",
+            "compression_target_items",
         ):
             object.__setattr__(
                 self,
                 name,
                 _positive_integer(getattr(self, name), name),
+            )
+        self._normalize_legacy_watermarks()
+        if not (
+            0
+            < self.compression_target_chars
+            < self.compression_trigger_chars
+            < self.max_serialized_chars
+        ):
+            raise ValueError(
+                "character watermarks must satisfy 0 < target < trigger < hard"
+            )
+        if not (
+            0
+            < self.compression_target_items
+            < self.compression_trigger_items
+            < self.max_history_items
+        ):
+            raise ValueError(
+                "item watermarks must satisfy 0 < target < trigger < hard"
+            )
+
+    def _normalize_legacy_watermarks(self) -> None:
+        if (
+            self.max_serialized_chars != 60_000
+            and self.compression_trigger_chars == 48_000
+            and self.compression_trigger_chars >= self.max_serialized_chars
+        ):
+            object.__setattr__(
+                self,
+                "compression_trigger_chars",
+                self.max_serialized_chars - 1,
+            )
+        if (
+            self.compression_target_chars == 33_000
+            and self.compression_target_chars >= self.compression_trigger_chars
+        ):
+            object.__setattr__(
+                self,
+                "compression_target_chars",
+                self.compression_trigger_chars - 1,
+            )
+        if (
+            self.max_history_items != 24
+            and self.compression_trigger_items == 20
+            and self.compression_trigger_items >= self.max_history_items
+        ):
+            object.__setattr__(
+                self,
+                "compression_trigger_items",
+                self.max_history_items - 1,
+            )
+        if (
+            self.compression_target_items == 12
+            and self.compression_target_items >= self.compression_trigger_items
+        ):
+            object.__setattr__(
+                self,
+                "compression_target_items",
+                self.compression_trigger_items - 1,
             )
 
 
@@ -197,9 +270,24 @@ def _deduplicate(values: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _decode_summary_payload(text: str) -> object:
+    normalized = text.strip()
+    lines = normalized.splitlines()
+    if (
+        len(lines) >= 3
+        and lines[0] == "```json"
+        and lines[-1] == "```"
+    ):
+        body = "\n".join(lines[1:-1])
+        if "```" in body:
+            raise json.JSONDecodeError("multiple summary fences", normalized, 0)
+        normalized = body
+    return json.loads(normalized)
+
+
 def _parse_summary(text: str) -> ContextSummary:
     try:
-        payload = json.loads(text)
+        payload = _decode_summary_payload(text)
     except (TypeError, json.JSONDecodeError) as exc:
         raise _SummaryValidationError("summary must be valid JSON") from exc
     if not isinstance(payload, dict) or set(payload) != _SUMMARY_FIELDS:
@@ -241,7 +329,7 @@ def _merge_local_invariants(
     state: AgentState,
 ) -> ContextSummary:
     local_facts = (
-        f"workspace: {state.workspace}",
+        "workspace: configured root",
         f"logical_model_calls: {state.logical_model_call_count}",
         f"provider_attempts: {state.model_call_count}",
         f"tool_calls: {state.tool_call_count}",
@@ -311,9 +399,24 @@ def _bounded_newest(values: list[str]) -> tuple[str, ...]:
     return _deduplicate(tuple(value[:512] for value in values[-8:]))
 
 
+def _safe_summary_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    windows = PureWindowsPath(value)
+    normalized = value.replace("\\", "/")
+    posix = PurePosixPath(normalized)
+    if windows.drive or windows.is_absolute() or posix.is_absolute():
+        return None
+    if any(part == ".." for part in posix.parts):
+        return None
+    safe = posix.as_posix()
+    return None if safe in {"", ".."} else safe[:512]
+
+
 def _fallback_summary(
     state: AgentState,
     messages: tuple[Message, ...],
+    max_summary_chars: int,
 ) -> ContextSummary:
     facts: list[str] = []
     files: list[str] = []
@@ -350,7 +453,9 @@ def _fallback_summary(
                     "replace_text",
                     "write_file",
                 }:
-                    files.append(path)
+                    safe_path = _safe_summary_path(path)
+                    if safe_path is not None:
+                        files.append(safe_path)
         if isinstance(message, ToolResult):
             evidence = message.output if message.status == "ok" else message.error
             evidence = evidence or ""
@@ -364,11 +469,15 @@ def _fallback_summary(
                 )
                 avoid.append(f"repeat {message.tool_name} without a changed input")
 
+    for observation in state.progress.exploration.observations:
+        if observation.target_label is not None:
+            files.append(observation.target_label)
+
     empty: JSONObject = {}
-    summary = ContextSummary(
+    summary_without_files = ContextSummary(
         goal=state.task,
         established_facts=_bounded_newest(facts),
-        files_examined=_bounded_newest(files),
+        files_examined=(),
         changes_made=(),
         commands_and_results=_bounded_newest(commands),
         unresolved_errors=_bounded_newest(errors),
@@ -376,7 +485,25 @@ def _fallback_summary(
         verification_state=empty,
         avoid_repeating=_bounded_newest(avoid),
     )
-    return _merge_local_invariants(summary, state)
+    summary = _merge_local_invariants(summary_without_files, state)
+    accepted: list[str] = []
+    for target in dict.fromkeys(value[:512] for value in files):
+        candidate = ContextSummary(
+            goal=summary.goal,
+            established_facts=summary.established_facts,
+            files_examined=tuple((*accepted, target)),
+            changes_made=summary.changes_made,
+            commands_and_results=summary.commands_and_results,
+            unresolved_errors=summary.unresolved_errors,
+            open_issues=summary.open_issues,
+            verification_state=summary.verification_state,
+            avoid_repeating=summary.avoid_repeating,
+        )
+        if len(candidate.to_json()) > max_summary_chars:
+            break
+        accepted.append(target)
+        summary = candidate
+    return summary
 
 
 class ContextManager:
@@ -400,8 +527,8 @@ class ContextManager:
     def requires_compression(self, messages: tuple[Message, ...]) -> bool:
         size = self.measure(messages)
         return (
-            size.serialized_chars > self._limits.max_serialized_chars
-            or size.history_items > self._limits.max_history_items
+            size.serialized_chars >= self._limits.compression_trigger_chars
+            or size.history_items >= self._limits.compression_trigger_items
         )
 
     def prepare(
@@ -423,7 +550,7 @@ class ContextManager:
                 summary_source=SummarySource.NONE,
             )
         initial, prefix, turns = _partition_complete_turns(state.messages)
-        maximum_removable = len(turns) - 1
+        maximum_removable = len(turns)
         if maximum_removable <= 0:
             raise ContextPreparationError(
                 TerminationReason.CONTEXT_BUDGET_EXHAUSTED
@@ -437,38 +564,79 @@ class ContextManager:
             for turn in turns[:removable_turn_count]
             for message in turn
         )
-        summary_source = SummarySource.MODEL
-        summary_model_failed = False
-        try:
-            response = invoke_model(
-                self._model_client,
-                ModelRequest(
-                    messages=(UserMessage(_summary_prompt(removed_messages)),),
-                    tool_schemas=(),
-                    max_output_tokens=self._limits.summary_max_output_tokens,
-                    continuation_items=(),
-                ),
-                budget,
-                purpose=ModelCallPurpose.SUMMARY,
-            )
-            if (
-                response.text is None
-                or not response.text.strip()
-                or response.tool_calls
-            ):
-                raise _SummaryValidationError("summary response is invalid")
-            summary = _merge_local_invariants(
-                _parse_summary(response.text),
+        summary_source = SummarySource.FALLBACK
+        summary_model_failed = state.summary_fallback_latched
+        if state.summary_fallback_latched:
+            summary = _fallback_summary(
                 state,
+                removed_messages,
+                self._limits.max_summary_chars,
             )
-            if len(summary.to_json()) > self._limits.max_summary_chars:
-                raise _SummaryValidationError("summary is too large")
-        except (FatalModelError, ModelBudgetExceeded):
-            raise
-        except (ModelError, _SummaryValidationError):
-            summary = _fallback_summary(state, removed_messages)
-            summary_source = SummarySource.FALLBACK
-            summary_model_failed = True
+        else:
+            summary_source = SummarySource.MODEL
+            summary_model_failed = False
+            try:
+                response = invoke_model(
+                    self._model_client,
+                    ModelRequest(
+                        messages=(UserMessage(_summary_prompt(removed_messages)),),
+                        tool_schemas=(),
+                        max_output_tokens=self._limits.summary_max_output_tokens,
+                        continuation_items=(),
+                        instructions=None,
+                    ),
+                    budget,
+                    purpose=ModelCallPurpose.SUMMARY,
+                )
+                if (
+                    response.text is None
+                    or not response.text.strip()
+                    or response.tool_calls
+                ):
+                    raise _SummaryValidationError("summary response is invalid")
+                summary = _merge_local_invariants(
+                    _parse_summary(response.text),
+                    state,
+                )
+                if len(summary.to_json()) > self._limits.max_summary_chars:
+                    raise _SummaryValidationError("summary is too large")
+            except FatalModelError:
+                raise
+            except ModelBudgetExceeded as exc:
+                if exc.reason not in {
+                    ModelBudgetReason.SUMMARY_LOGICAL_CALL_LIMIT,
+                    ModelBudgetReason.SUMMARY_PROVIDER_ATTEMPT_LIMIT,
+                }:
+                    raise
+                state.summary_fallback_latched = True
+                state.summary_fallback_reason = SummaryFallbackReason.SUMMARY_BUDGET
+                summary = _fallback_summary(
+                    state,
+                    removed_messages,
+                    self._limits.max_summary_chars,
+                )
+                summary_source = SummarySource.FALLBACK
+                summary_model_failed = True
+            except ModelError:
+                state.summary_fallback_latched = True
+                state.summary_fallback_reason = SummaryFallbackReason.MODEL_ERROR
+                summary = _fallback_summary(
+                    state,
+                    removed_messages,
+                    self._limits.max_summary_chars,
+                )
+                summary_source = SummarySource.FALLBACK
+                summary_model_failed = True
+            except _SummaryValidationError:
+                state.summary_fallback_latched = True
+                state.summary_fallback_reason = SummaryFallbackReason.INVALID_SUMMARY
+                summary = _fallback_summary(
+                    state,
+                    removed_messages,
+                    self._limits.max_summary_chars,
+                )
+                summary_source = SummarySource.FALLBACK
+                summary_model_failed = True
         for candidate_count in range(
             removable_turn_count,
             maximum_removable + 1,
@@ -486,6 +654,7 @@ class ContextManager:
                 candidate_summary = _fallback_summary(
                     state,
                     candidate_removed,
+                    self._limits.max_summary_chars,
                 )
                 candidate_source = SummarySource.FALLBACK
                 candidate_model_failed = summary_model_failed
@@ -509,10 +678,11 @@ class ContextManager:
             prepared_size = self.measure(messages)
             if (
                 prepared_size.serialized_chars
-                <= self._limits.max_serialized_chars
+                <= self._limits.compression_target_chars
                 and prepared_size.history_items
-                <= self._limits.max_history_items
+                <= self._limits.compression_target_items
             ):
+                ModelRequest(messages=messages)
                 return PreparedContext(
                     messages=messages,
                     continuation_items=(),

@@ -10,6 +10,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 import re
 import uuid
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.messages import JSONObject, JSONValue
 from coding_agent.run_mode import RunMode
 
@@ -331,7 +332,12 @@ def _validate_verification_activity(data: JSONObject) -> None:
         "error",
     }:
         raise ValueError("verification status is invalid")
-    if data["source"] not in {None, "model", "user_verify"}:
+    if data["source"] not in {
+        None,
+        "model",
+        "user_verify",
+        "local_integrity",
+    }:
         raise ValueError("verification source is invalid")
     _require_optional_integer(data["exit_code"], "exit_code")
     if not isinstance(data["timed_out"], bool) or not isinstance(data["truncated"], bool):
@@ -420,6 +426,7 @@ class SessionRunRecord:
     ordinal: int
     status: SessionRunStatus
     run_mode: RunMode
+    budget_profile: BudgetProfile
     user_event_sequence: int
     started_at_utc: str | None
     finished_at_utc: str | None
@@ -434,6 +441,8 @@ class SessionRunRecord:
         _require_positive_int(self.ordinal, "ordinal")
         _require_enum(self.status, SessionRunStatus, "status")
         _require_enum(self.run_mode, RunMode, "run_mode")
+        if type(self.budget_profile) is not BudgetProfile:
+            raise TypeError("budget_profile must be BudgetProfile")
         _require_positive_int(self.user_event_sequence, "user_event_sequence")
         _require_optional_timestamp(self.started_at_utc, "started_at_utc")
         _require_optional_timestamp(self.finished_at_utc, "finished_at_utc")
@@ -685,6 +694,8 @@ _PERSISTED_REPORT_FIELDS = frozenset(
         "schema_version",
         "run_id",
         "run_mode",
+        "budget_profile",
+        "phase",
         "status",
         "exit_code",
         "termination_reason",
@@ -692,7 +703,10 @@ _PERSISTED_REPORT_FIELDS = frozenset(
         "mutation_index",
         "validation_index",
         "verification",
+        "main_model_calls",
+        "summary_model_calls",
         "logical_model_calls",
+        "summary_provider_attempts",
         "provider_attempts",
         "tool_calls",
         "verification_attempts",
@@ -802,12 +816,24 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
     _require_fields(normalized, _PERSISTED_REPORT_FIELDS, "report")
 
     schema_version = normalized["schema_version"]
-    if schema_version != 2 or isinstance(schema_version, bool):
-        raise ValueError("schema_version must be 2")
+    if schema_version != 3 or isinstance(schema_version, bool):
+        raise ValueError("schema_version must be 3")
     run_id = _require_id(normalized["run_id"], "run_id")
     run_mode = normalized["run_mode"]
     if run_mode not in {"modify", "read_only"}:
         raise ValueError("run_mode must be modify or read_only")
+    budget_profile = normalized["budget_profile"]
+    if budget_profile not in {"standard", "deep"}:
+        raise ValueError("budget_profile must be standard or deep")
+    phase = normalized["phase"]
+    if phase is not None and phase not in {
+        "discover",
+        "act",
+        "verify",
+        "recover",
+        "finish",
+    }:
+        raise ValueError("phase must be a known phase or null")
     status = normalized["status"]
     if status not in {"success", "answered", "failed", "interrupted"}:
         raise ValueError("status must be terminal")
@@ -857,8 +883,7 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
             raise ValueError("successful report lacks fresh verification")
     elif status == "answered":
         if (
-            run_mode != "read_only"
-            or changed_paths
+            changed_paths
             or mutation_index != 0
             or validation_index is not None
             or verification_attempts != 0
@@ -876,6 +901,34 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
         ):
             raise ValueError("answered report has invalid facts")
     token_usage = _project_token_usage(normalized["token_usage"])
+    main_model_calls = _require_optional_non_negative_int(
+        normalized["main_model_calls"], "main_model_calls"
+    )
+    summary_model_calls = _require_optional_non_negative_int(
+        normalized["summary_model_calls"], "summary_model_calls"
+    )
+    summary_provider_attempts = _require_optional_non_negative_int(
+        normalized["summary_provider_attempts"], "summary_provider_attempts"
+    )
+    logical_model_calls = _require_non_negative_int(
+        normalized["logical_model_calls"], "logical_model_calls"
+    )
+    provider_attempts = _require_non_negative_int(
+        normalized["provider_attempts"], "provider_attempts"
+    )
+    split_counts = (
+        main_model_calls,
+        summary_model_calls,
+        summary_provider_attempts,
+    )
+    if any(value is None for value in split_counts):
+        if any(value is not None for value in split_counts):
+            raise ValueError("historical split counts must all be null")
+    elif (
+        logical_model_calls != main_model_calls + summary_model_calls
+        or summary_provider_attempts > provider_attempts
+    ):
+        raise ValueError("model count fields are inconsistent")
     log_failure_code = _require_optional_text(
         normalized["log_failure_code"], "log_failure_code"
     )
@@ -887,6 +940,8 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
         "schema_version": schema_version,
         "run_id": run_id,
         "run_mode": run_mode,
+        "budget_profile": budget_profile,
+        "phase": phase,
         "status": status,
         "exit_code": exit_code,
         "termination_reason": termination_reason,
@@ -894,12 +949,11 @@ def make_persisted_run_report(report: JSONObject) -> JSONObject:
         "mutation_index": mutation_index,
         "validation_index": validation_index,
         "verification": verification,
-        "logical_model_calls": _require_non_negative_int(
-            normalized["logical_model_calls"], "logical_model_calls"
-        ),
-        "provider_attempts": _require_non_negative_int(
-            normalized["provider_attempts"], "provider_attempts"
-        ),
+        "main_model_calls": main_model_calls,
+        "summary_model_calls": summary_model_calls,
+        "logical_model_calls": logical_model_calls,
+        "summary_provider_attempts": summary_provider_attempts,
+        "provider_attempts": provider_attempts,
         "tool_calls": _require_non_negative_int(normalized["tool_calls"], "tool_calls"),
         "verification_attempts": verification_attempts,
         "context_compressions": _require_non_negative_int(

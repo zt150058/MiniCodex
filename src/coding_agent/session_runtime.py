@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
+
+from coding_agent.budget import BudgetProfile
 from typing import TYPE_CHECKING, Protocol
 
 from coding_agent.agent import CancellationCheck, ConfirmedTextHandler
@@ -126,10 +128,13 @@ class SessionRunRequest:
     initial_user_message: str = field(repr=False)
     skill_bundle: SkillInstructionBundle | None = field(default=None, repr=False)
     run_mode: RunMode = RunMode.MODIFY
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD
 
     def __post_init__(self) -> None:
         if type(self.run_mode) is not RunMode:
             raise TypeError("run_mode must be RunMode")
+        if type(self.budget_profile) is not BudgetProfile:
+            raise TypeError("budget_profile must be BudgetProfile")
         if self.skill_bundle is not None and type(self.skill_bundle) is not SkillInstructionBundle:
             raise TypeError("skill_bundle must be SkillInstructionBundle or None")
         for value, name in (
@@ -213,6 +218,7 @@ class AgentSessionRunExecutor:
             self._base_config,
             task=request.current_message,
             run_mode=request.run_mode,
+            budget_profile=request.budget_profile,
         )
         skill_instructions = (
             None if request.skill_bundle is None else request.skill_bundle.text

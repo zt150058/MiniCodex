@@ -10,6 +10,7 @@ from typing import TextIO
 
 import pytest
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.cli import build_parser, main
 from coding_agent.config import ApiMode, ConfigError, RunConfig, load_run_config
 from coding_agent.run_mode import RunMode
@@ -49,6 +50,53 @@ def test_config_defaults_to_modify(tmp_path: Path) -> None:
     )
 
     assert config.run_mode is RunMode.MODIFY
+
+
+def test_config_defaults_to_standard_budget(tmp_path: Path) -> None:
+    config = load_run_config(
+        task="inspect",
+        workspace=tmp_path,
+        model=None,
+        verify_command=None,
+        environ=valid_environ(),
+    )
+
+    assert config.budget_profile is BudgetProfile.STANDARD
+
+
+def test_cli_accepts_deep_budget_profile(tmp_path: Path) -> None:
+    captured: list[RunConfig] = []
+
+    exit_code = main(
+        [
+            "inspect",
+            "--workspace",
+            str(tmp_path),
+            "--budget-profile",
+            "deep",
+        ],
+        environ=valid_environ(),
+        application=lambda config, **streams: captured.append(config) or 0,
+    )
+
+    assert exit_code == 0
+    assert captured[0].budget_profile is BudgetProfile.DEEP
+
+
+@pytest.mark.parametrize("value", ["", "DEEP", "auto", True, 1])
+def test_config_rejects_invalid_budget_profile(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(ConfigError, match="budget profile"):
+        load_run_config(
+            task="inspect",
+            workspace=tmp_path,
+            model=None,
+            verify_command=None,
+            environ=valid_environ(),
+            budget_profile=value,  # type: ignore[arg-type]
+        )
 
 
 def test_config_accepts_read_only(tmp_path: Path) -> None:

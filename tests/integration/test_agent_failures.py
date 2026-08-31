@@ -19,6 +19,7 @@ from coding_agent.logging import (
 )
 from coding_agent.messages import AssistantMessage, ModelResponse, ToolCall, ToolResult
 from coding_agent.model import FakeModelClient, ModelClient
+from coding_agent.progress import ProgressLimits
 from coding_agent.state import AgentStatus
 from coding_agent.tools.base import ExecutionContext
 from coding_agent.tools.filesystem import ReadFileTool
@@ -88,7 +89,7 @@ def test_forced_verification_never_passes_before_budget_stop(
 ) -> None:
     workspace = _copy_demo(tmp_path)
     fake = FakeModelClient(
-        tuple(ModelResponse(text=f"still broken {index}") for index in range(12))
+        tuple(ModelResponse(text=f"still broken {index}") for index in range(25))
     )
 
     code, report, stdout, stderr = _run_with_fake(
@@ -100,10 +101,12 @@ def test_forced_verification_never_passes_before_budget_stop(
 
     assert code == report["exit_code"] == 1
     assert report["status"] == "failed"
-    assert report["termination_reason"] == "logical_model_call_limit"
-    assert report["logical_model_calls"] == 12
-    assert report["provider_attempts"] == 12
-    assert report["verification_attempts"] == 12
+    assert report["termination_reason"] == "main_model_call_limit"
+    assert report["logical_model_calls"] == 25
+    assert report["main_model_calls"] == 24
+    assert report["summary_model_calls"] == 1
+    assert report["provider_attempts"] == 25
+    assert report["verification_attempts"] == 24
     assert report["verification"]["exit_code"] == 1  # type: ignore[index]
     assert "success" not in stdout.getvalue()
     assert stderr.getvalue() == ""
@@ -147,7 +150,6 @@ def test_new_mutation_invalidates_previous_model_verification(
                 )
             ),
             ModelResponse(text="done with stale evidence"),
-            *(ModelResponse(text=f"still stale {index}") for index in range(9)),
         )
     )
 
@@ -160,7 +162,8 @@ def test_new_mutation_invalidates_previous_model_verification(
 
     assert code == report["exit_code"] == 1
     assert report["status"] == "failed"
-    assert report["termination_reason"] == "logical_model_call_limit"
+    assert report["termination_reason"] == "changes_unverified"
+    assert report["main_model_calls"] == 3
     assert report["mutation_index"] == 1
     assert report["validation_index"] == 0
     assert report["verification_attempts"] == 1
@@ -168,7 +171,9 @@ def test_new_mutation_invalidates_previous_model_verification(
     assert stderr.getvalue() == ""
 
 
-def test_repeated_tool_call_stops_before_fourth_dispatch(tmp_path: Path) -> None:
+def test_duplicate_read_decision_handshake_stops_as_no_progress(
+    tmp_path: Path,
+) -> None:
     (tmp_path / "sample.txt").write_text("unchanged\n", encoding="utf-8")
     responses = tuple(
         ModelResponse(
@@ -180,7 +185,7 @@ def test_repeated_tool_call_stops_before_fourth_dispatch(tmp_path: Path) -> None
                 ),
             )
         )
-        for index in range(3)
+        for index in range(4)
     )
     fake = FakeModelClient(responses)
 
@@ -192,11 +197,11 @@ def test_repeated_tool_call_stops_before_fourth_dispatch(tmp_path: Path) -> None
     )
 
     assert code == report["exit_code"] == 1
-    assert report["termination_reason"] == "repeated_tool_call"
-    assert report["logical_model_calls"] == 3
-    assert report["provider_attempts"] == 3
-    assert report["tool_calls"] == 3
-    assert len(fake.requests) == 3
+    assert report["termination_reason"] == "no_progress"
+    assert report["logical_model_calls"] == 4
+    assert report["provider_attempts"] == 4
+    assert report["tool_calls"] == 4
+    assert len(fake.requests) == 4
     assert stderr.getvalue() == ""
 
 
@@ -296,12 +301,14 @@ def _context_runner(
             model_client=fake,
             limits=ContextLimits(
                 max_serialized_chars=60_000,
-                max_history_items=18,
+                max_history_items=20,
                 recent_turns=8,
+                compression_target_items=18,
             ),
         ),
         clock=lambda: 0.0,
         event_sink=logger,
+        progress_limits=ProgressLimits(100, 100, 100, 100, 1),
     )
 
 

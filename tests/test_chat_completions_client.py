@@ -49,6 +49,7 @@ from coding_agent.model import (
     ModelClient,
     ModelObservation,
     ModelObservationKind,
+    ModelOutputLimitError,
     TransientModelError,
     invoke_model,
 )
@@ -668,6 +669,11 @@ def response_with_choices(choices: object) -> SimpleNamespace:
     return SimpleNamespace(id="chatcmpl_bad", choices=choices, usage=None)
 
 
+def test_finish_reason_length_is_a_distinct_output_limit_error() -> None:
+    with pytest.raises(ModelOutputLimitError, match="output token limit"):
+        _parse_response(chat_response(finish_reason="length"))
+
+
 @pytest.mark.parametrize(
     ("response", "reason"),
     [
@@ -694,7 +700,6 @@ def response_with_choices(choices: object) -> SimpleNamespace:
             "choice message is invalid",
         ),
         (chat_response(role="user"), "choice message is invalid"),
-        (chat_response(finish_reason="length"), "finish reason is not supported"),
         (
             chat_response(finish_reason="content_filter"),
             "finish reason is not supported",

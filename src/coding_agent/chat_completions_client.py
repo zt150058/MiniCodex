@@ -35,8 +35,10 @@ from coding_agent.messages import (
 )
 from coding_agent.model import (
     FatalModelError,
+    InvalidModelResponseError,
     ModelCallBudget,
     ModelError,
+    ModelOutputLimitError,
     TransientModelError,
     _model_error_code,
     invoke_model,
@@ -52,7 +54,7 @@ from coding_agent.streaming import (
 )
 
 
-class InvalidChatCompletionsResponseError(ModelError):
+class InvalidChatCompletionsResponseError(InvalidModelResponseError):
     """The provider returned a completed but unusable Chat payload."""
 
     observation_error_code = "invalid_model_response"
@@ -159,6 +161,10 @@ def _parse_response(response: object) -> ModelResponse:
         "finish_reason",
         "finish reason is not supported",
     )
+    if finish_reason == "length":
+        raise ModelOutputLimitError(
+            "Chat Completions response reached the output token limit"
+        )
     if finish_reason not in {"stop", "tool_calls"}:
         raise _invalid_response("finish reason is not supported")
 
@@ -776,6 +782,17 @@ class ChatCompletionsModelClient:
                 )
                 self._sleeper(delay)
                 continue
+            try:
+                parsed = _parse_response(response)
+            except (InvalidChatCompletionsResponseError, ModelOutputLimitError) as exc:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code=_model_error_code(exc),
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
             budget.finish_provider_attempt(
                 purpose,
                 provider_attempt_index,
@@ -783,7 +800,7 @@ class ChatCompletionsModelClient:
                 retry_scheduled=False,
                 retry_delay_ms=None,
             )
-            return _parse_response(response)
+            return parsed
 
         raise AssertionError("unreachable Chat Completions retry loop")
 
@@ -886,6 +903,15 @@ class ChatCompletionsModelClient:
                     purpose,
                     provider_attempt_index,
                     error_code="invalid_model_response",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except ModelOutputLimitError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="model_output_limit",
                     retry_scheduled=False,
                     retry_delay_ms=None,
                 )

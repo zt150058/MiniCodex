@@ -16,7 +16,7 @@ from coding_agent.messages import JSONObject, JSONValue
 from coding_agent.session import utc_now
 
 
-SESSION_UPDATE_SCHEMA_VERSION = 2
+SESSION_UPDATE_SCHEMA_VERSION = 3
 _ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _SAFE_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _NAME_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
@@ -26,6 +26,11 @@ class SessionUpdateKind(StrEnum):
     RUN_QUEUED = "run_queued"
     RUN_STARTED = "run_started"
     RUN_CANCELLING = "run_cancelling"
+    RUN_PROGRESS = "run_progress"
+    PHASE_CHANGED = "phase_changed"
+    DECISION_CHECKPOINT = "decision_checkpoint"
+    CONTEXT_COMPRESSED = "context_compressed"
+    NO_PROGRESS_DETECTED = "no_progress_detected"
     ASSISTANT_TEXT_DELTA = "assistant_text_delta"
     ASSISTANT_TEXT_COMMITTED = "assistant_text_committed"
     ASSISTANT_TEXT_DISCARDED = "assistant_text_discarded"
@@ -196,6 +201,105 @@ def _validate_payload(kind: SessionUpdateKind, data: JSONObject) -> None:
         if data["status"] != expected:
             raise ValueError("run lifecycle status is invalid")
         return
+    if kind is SessionUpdateKind.RUN_PROGRESS:
+        _require_exact(
+            data,
+            {
+                "budget_profile",
+                "phase",
+                "main_model_calls",
+                "main_model_limit",
+                "summary_model_calls",
+                "summary_model_limit",
+                "provider_attempts",
+                "provider_attempt_limit",
+                "tool_calls",
+                "tool_limit",
+            },
+            kind.value,
+        )
+        if data["budget_profile"] not in {"standard", "deep"}:
+            raise ValueError("budget_profile is invalid")
+        if data["phase"] not in {"discover", "act", "verify", "finish"}:
+            raise ValueError("phase is invalid")
+        for field_name in (
+            "main_model_calls",
+            "summary_model_calls",
+            "provider_attempts",
+            "tool_calls",
+        ):
+            _require_nonnegative(data[field_name], field_name)
+        for field_name in (
+            "main_model_limit",
+            "summary_model_limit",
+            "provider_attempt_limit",
+            "tool_limit",
+        ):
+            _require_positive(data[field_name], field_name)
+        if any(
+            data[count_name] > data[limit_name]
+            for count_name, limit_name in (
+                ("main_model_calls", "main_model_limit"),
+                ("summary_model_calls", "summary_model_limit"),
+                ("provider_attempts", "provider_attempt_limit"),
+                ("tool_calls", "tool_limit"),
+            )
+        ):
+            raise ValueError("run progress count exceeds its limit")
+        return
+    if kind is SessionUpdateKind.PHASE_CHANGED:
+        _require_exact(data, {"from_phase", "to_phase", "epoch"}, kind.value)
+        phases = {"discover", "act", "verify", "finish"}
+        if data["from_phase"] not in phases or data["to_phase"] not in phases:
+            raise ValueError("phase is invalid")
+        if data["from_phase"] == data["to_phase"]:
+            raise ValueError("phase transition must change phase")
+        _require_nonnegative(data["epoch"], "epoch")
+        return
+    if kind is SessionUpdateKind.DECISION_CHECKPOINT:
+        _require_exact(
+            data,
+            {"reason", "phase", "main_calls_remaining"},
+            kind.value,
+        )
+        if data["reason"] not in {
+            "exploration_limit",
+            "final_call_reserve",
+            "verification_failure",
+            "final_read_allowance_exhausted",
+            "duplicate_only_turn",
+        }:
+            raise ValueError("checkpoint reason is invalid")
+        if data["phase"] not in {"discover", "act", "verify", "finish"}:
+            raise ValueError("phase is invalid")
+        _require_nonnegative(data["main_calls_remaining"], "main_calls_remaining")
+        return
+    if kind is SessionUpdateKind.CONTEXT_COMPRESSED:
+        _require_exact(
+            data,
+            {"summary_source", "before_chars", "after_chars"},
+            kind.value,
+        )
+        if data["summary_source"] not in {"model", "fallback"}:
+            raise ValueError("summary_source is invalid")
+        before = _require_nonnegative(data["before_chars"], "before_chars")
+        after = _require_nonnegative(data["after_chars"], "after_chars")
+        if after >= before:
+            raise ValueError("context compression must reduce size")
+        return
+    if kind is SessionUpdateKind.NO_PROGRESS_DETECTED:
+        _require_exact(
+            data,
+            {"phase", "post_checkpoint_main_turns"},
+            kind.value,
+        )
+        if data["phase"] not in {"discover", "act", "verify", "finish"}:
+            raise ValueError("phase is invalid")
+        _require_nonnegative(
+            data["post_checkpoint_main_turns"],
+            "post_checkpoint_main_turns",
+        )
+        return
     if kind in {
         SessionUpdateKind.ASSISTANT_TEXT_DELTA,
         SessionUpdateKind.ASSISTANT_TEXT_COMMITTED,
@@ -250,7 +354,11 @@ def _validate_payload(kind: SessionUpdateKind, data: JSONObject) -> None:
             {"source", "attempt_index", "mutation_index"},
             kind.value,
         )
-        if data["source"] not in {"model", "user_verify"}:
+        if data["source"] not in {
+            "model",
+            "user_verify",
+            "local_integrity",
+        }:
             raise ValueError("verification source is invalid")
         _require_positive(data["attempt_index"], "attempt_index")
         _require_nonnegative(data["mutation_index"], "mutation_index")
@@ -271,7 +379,11 @@ def _validate_payload(kind: SessionUpdateKind, data: JSONObject) -> None:
             },
             kind.value,
         )
-        if data["source"] not in {"model", "user_verify"}:
+        if data["source"] not in {
+            "model",
+            "user_verify",
+            "local_integrity",
+        }:
             raise ValueError("verification source is invalid")
         if data["status"] not in {"passed", "failed", "timed_out", "error"}:
             raise ValueError("verification status is invalid")
@@ -420,6 +532,24 @@ class SessionEventHub:
             self._retained_bytes = 0
             self._next_sequence = 1
             self._condition.notify_all()
+
+    def forget_runs(self, run_ids: tuple[str, ...]) -> bool:
+        if type(run_ids) is not tuple:
+            raise TypeError("run_ids must be tuple")
+        normalized = tuple(_require_id(run_id, "run_id") for run_id in run_ids)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("run_ids must contain unique ids")
+        with self._condition:
+            if self._run_id not in normalized:
+                return False
+            self._session_id = None
+            self._run_id = None
+            self._events.clear()
+            self._lifecycle_updates.clear()
+            self._retained_bytes = 0
+            self._next_sequence = 1
+            self._condition.notify_all()
+            return True
 
     def _scrub(self, value: JSONValue) -> JSONValue:
         if isinstance(value, str):

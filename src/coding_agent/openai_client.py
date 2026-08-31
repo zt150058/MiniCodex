@@ -34,10 +34,12 @@ from coding_agent.messages import (
 )
 from coding_agent.model import (
     FatalModelError,
+    InvalidModelResponseError,
     ModelBudgetExceeded,
     ModelBudgetReason,
     ModelCallBudget,
     ModelError,
+    ModelOutputLimitError,
     TransientModelError,
     _model_error_code,
     invoke_model,
@@ -53,7 +55,7 @@ from coding_agent.streaming import (
 )
 
 
-class InvalidOpenAIResponseError(ModelError):
+class InvalidOpenAIResponseError(InvalidModelResponseError):
     """The provider returned a completed but unusable Responses payload."""
 
     observation_error_code = "invalid_model_response"
@@ -258,7 +260,24 @@ def _parse_response(
     response_id = _field(response, "id", "missing response id")
     if not isinstance(response_id, str) or not response_id.strip():
         raise _invalid_response("missing response id")
-    if _field(response, "status", "response status is not completed") != "completed":
+    response_status = _field(
+        response,
+        "status",
+        "response status is not completed",
+    )
+    if response_status == "incomplete":
+        details = _field(
+            response,
+            "incomplete_details",
+            "response status is not completed",
+        )
+        if _field(details, "reason", "response status is not completed") == (
+            "max_output_tokens"
+        ):
+            raise ModelOutputLimitError(
+                "OpenAI Responses response reached the output token limit"
+            )
+    if response_status != "completed":
         raise _invalid_response("response status is not completed")
     if _field(response, "error", "response contains an error") is not None:
         raise _invalid_response("response contains an error")
@@ -616,11 +635,11 @@ def _consume_responses_stream(
                 raise _invalid_response("duplicate function argument done")
             accumulator.done_name = name
             accumulator.done_arguments = arguments
-        elif event_type == "response.completed":
+        elif event_type in {"response.completed", "response.incomplete"}:
             terminal = _field(
                 event,
                 "response",
-                "completed response is missing",
+                "terminal response is missing",
             )
         else:
             if not isinstance(event_type, str):
@@ -950,6 +969,15 @@ class OpenAIResponsesClient:
                     purpose,
                     provider_attempt_index,
                     error_code="invalid_model_response",
+                    retry_scheduled=False,
+                    retry_delay_ms=None,
+                )
+                raise
+            except ModelOutputLimitError:
+                budget.finish_provider_attempt(
+                    purpose,
+                    provider_attempt_index,
+                    error_code="model_output_limit",
                     retry_scheduled=False,
                     retry_delay_ms=None,
                 )

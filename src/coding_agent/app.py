@@ -13,16 +13,17 @@ from coding_agent.agent import (
 )
 from coding_agent.chat_completions_client import ChatCompletionsModelClient
 from coding_agent.config import ApiMode, RunConfig
-from coding_agent.context import ContextManager
+from coding_agent.context import ContextLimits, ContextManager
 from coding_agent.instructions import RunInstructionBuilder
 from coding_agent.logging import RunEventLogger, RunEventObserver, RunLogError
 from coding_agent.model import ModelClient
 from coding_agent.openai_client import OpenAIResponsesClient
+from coding_agent.progress import ProgressLimits
 from coding_agent.report import FinalReport
 from coding_agent.run_mode import RunMode
 from coding_agent.state import AgentState, AgentStatus, TerminationReason
 from coding_agent.streaming import ModelStreamHandler
-from coding_agent.termination import TerminationPolicy
+from coding_agent.termination import TerminationLimits, TerminationPolicy
 from coding_agent.tools.base import ExecutionContext
 from coding_agent.tools.filesystem import (
     ListDirectoryTool,
@@ -163,8 +164,14 @@ def execute_agent_run(
             )
         registry = ToolRegistry(tools)
         model_client = selected.model_client(config)
-        context_manager = ContextManager(model_client=model_client)
-        termination_policy = TerminationPolicy()
+        context_manager = ContextManager(
+            model_client=model_client,
+            limits=ContextLimits(),
+        )
+        termination_policy = TerminationPolicy(
+            TerminationLimits.for_profile(config.budget_profile)
+        )
+        progress_limits = ProgressLimits.for_profile(config.budget_profile)
         instruction_snapshot = RunInstructionBuilder().build(
             config.workspace,
             skill_instructions=skill_instructions,
@@ -185,6 +192,8 @@ def execute_agent_run(
             cancellation_requested=cancellation_requested,
             initial_user_message=initial_user_message,
             run_mode=config.run_mode,
+            budget_profile=config.budget_profile,
+            progress_limits=progress_limits,
         )
     except KeyboardInterrupt:
         _close_after_failed_setup(logger)

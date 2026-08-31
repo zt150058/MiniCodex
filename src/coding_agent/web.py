@@ -25,13 +25,15 @@ from .session import (
 )
 from .session_controller import SessionController, SessionView
 from .session_events import SessionUpdateBatch, SessionUpdateKind
+from .budget import BudgetProfile
 from .run_mode import RunMode
 from .skills import SkillCatalogDiagnostic, SkillCatalogView, SkillDescriptor
 from .web_auth import WebAccessPolicy, WebAuthorizationError
 
 
 MAX_MUTATION_BODY_BYTES = 131_072
-_MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH"})
+_MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_SKILL_IMPORT_PATH = "/api/v1/skills/import"
 _CONTROLLER_ERROR_STATUS = {
     "invalid_message": 400,
     "invalid_skill_selection": 400,
@@ -52,6 +54,8 @@ _CONTROLLER_ERROR_STATUS = {
     "storage_unavailable": 503,
     "database_corrupt": 503,
     "schema_unsupported": 503,
+    "session_delete_failed": 503,
+    "session_deletion_recovery_failed": 503,
 }
 _EVENT_CURSOR_PATTERN = re.compile(r"[0-9]+\Z")
 _ACCESS_TOKEN_MARKER = "__CODING_AGENT_ACCESS_TOKEN__"
@@ -136,12 +140,22 @@ class _CreateSessionRequest(BaseModel):
     message: StrictStr
     skill_ids: tuple[StrictStr, ...] = ()
     run_mode: RunMode = RunMode.MODIFY
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD
 
     @field_validator("run_mode", mode="before")
     @classmethod
     def accept_exact_run_mode(cls, value: object) -> object:
         if type(value) is str and value in {mode.value for mode in RunMode}:
             return RunMode(value)
+        return value
+
+    @field_validator("budget_profile", mode="before")
+    @classmethod
+    def accept_exact_budget_profile(cls, value: object) -> object:
+        if type(value) is str and value in {
+            profile.value for profile in BudgetProfile
+        }:
+            return BudgetProfile(value)
         return value
 
     @field_validator("skill_ids", mode="before")
@@ -157,12 +171,22 @@ class _FollowUpRequest(BaseModel):
 
     message: StrictStr
     run_mode: RunMode = RunMode.MODIFY
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD
 
     @field_validator("run_mode", mode="before")
     @classmethod
     def accept_exact_run_mode(cls, value: object) -> object:
         if type(value) is str and value in {mode.value for mode in RunMode}:
             return RunMode(value)
+        return value
+
+    @field_validator("budget_profile", mode="before")
+    @classmethod
+    def accept_exact_budget_profile(cls, value: object) -> object:
+        if type(value) is str and value in {
+            profile.value for profile in BudgetProfile
+        }:
+            return BudgetProfile(value)
         return value
 
 
@@ -200,7 +224,12 @@ class _BoundedMutationBody:
             if total > self._maximum_bytes:
                 while message.get("more_body", False):
                     message = await receive()
-                response = _error_response("request_too_large", status_code=413)
+                code = (
+                    "skill_archive_too_large"
+                    if scope.get("path") == _SKILL_IMPORT_PATH
+                    else "request_too_large"
+                )
+                response = _error_response(code, status_code=413)
                 await response(scope, receive, send)
                 return
             if not message.get("more_body", False):
@@ -226,6 +255,27 @@ def _error_response(code: str, *, status_code: int) -> JSONResponse:
     )
 
 
+def _required_media_type(method: str, path: str) -> str | None:
+    if method == "POST" and path == _SKILL_IMPORT_PATH:
+        return "application/zip"
+    if method == "DELETE":
+        return None
+    if method in _MUTATION_METHODS:
+        return "application/json"
+    return None
+
+
+def _skill_import_error_status(code: str) -> int | None:
+    return {
+        "invalid_skill_archive": 400,
+        "unsafe_skill_archive": 400,
+        "skill_catalog_unavailable": 409,
+        "skill_already_exists": 409,
+        "controller_busy": 409,
+        "skill_install_failed": 500,
+    }.get(code)
+
+
 def _serialize_session(record: SessionRecord) -> dict[str, object]:
     return {
         "session_id": record.session_id,
@@ -244,6 +294,7 @@ def _serialize_run(record: SessionRunRecord) -> dict[str, object]:
         "ordinal": record.ordinal,
         "status": record.status.value,
         "run_mode": record.run_mode.value,
+        "budget_profile": record.budget_profile.value,
         "started_at_utc": record.started_at_utc,
         "finished_at_utc": record.finished_at_utc,
         "agent_status": record.agent_status,
@@ -455,11 +506,23 @@ def create_web_app(
                 tuple(request.scope["headers"]),
                 require_bearer=is_api,
             )
-            if is_api and request.method in _MUTATION_METHODS:
+            required_media_type = _required_media_type(
+                request.method,
+                request.url.path,
+            )
+            if is_api and required_media_type is not None:
                 media_type = request.headers.get("content-type", "").split(";", 1)[0]
-                if media_type.strip().lower() != "application/json":
+                if media_type.strip().lower() != required_media_type:
                     response = _error_response(
                         "unsupported_media_type",
+                        status_code=415,
+                    )
+                elif (
+                    request.url.path == _SKILL_IMPORT_PATH
+                    and request.headers.get("content-encoding", "").strip()
+                ):
+                    response = _error_response(
+                        "unsupported_content_encoding",
                         status_code=415,
                     )
                 else:
@@ -538,11 +601,13 @@ def create_web_app(
             payload.message,
             skill_ids=payload.skill_ids,
             run_mode=payload.run_mode,
+            budget_profile=payload.budget_profile,
         )
         return {
             "session_id": handle.session_id,
             "run_id": handle.run_id,
             "run_mode": handle.run_mode.value,
+            "budget_profile": handle.budget_profile.value,
         }
 
     @app.get("/api/v1/sessions")
@@ -562,6 +627,23 @@ def create_web_app(
         skill_ids = controller.get_session_skills(session_id)
         return _serialize_session_view(view, skill_ids=skill_ids)
 
+    @app.delete("/api/v1/sessions/{session_id}", response_model=None)
+    async def delete_session(
+        session_id: str,
+        request: Request,
+    ) -> dict[str, object] | JSONResponse:
+        if await request.body():
+            return _error_response("invalid_request", status_code=400)
+        result = controller.delete_session(session_id)
+        payload: dict[str, object] = {
+            "session_id": result.session_id,
+            "deleted": True,
+            "cleanup_pending": result.cleanup_pending,
+        }
+        if result.cleanup_pending:
+            payload["warning_code"] = "session_log_cleanup_pending"
+        return payload
+
     @app.post("/api/v1/sessions/{session_id}/messages", status_code=202)
     def submit_message(
         session_id: str,
@@ -571,16 +653,34 @@ def create_web_app(
             session_id,
             payload.message,
             run_mode=payload.run_mode,
+            budget_profile=payload.budget_profile,
         )
         return {
             "session_id": handle.session_id,
             "run_id": handle.run_id,
             "run_mode": handle.run_mode.value,
+            "budget_profile": handle.budget_profile.value,
         }
 
     @app.get("/api/v1/skills")
     def list_skills() -> dict[str, object]:
         return _serialize_skill_catalog(controller.list_skills())
+
+    @app.post(_SKILL_IMPORT_PATH, status_code=201, response_model=None)
+    async def import_skill(
+        request: Request,
+    ) -> dict[str, object] | JSONResponse:
+        archive = await request.body()
+        if not archive:
+            return _error_response("invalid_skill_archive", status_code=400)
+        try:
+            descriptor = controller.import_skill_archive(archive)
+        except SessionControllerError as exc:
+            status_code = _skill_import_error_status(exc.code)
+            if status_code is None:
+                raise
+            return _error_response(exc.code, status_code=status_code)
+        return _serialize_skill(descriptor)
 
     @app.get("/api/v1/sessions/{session_id}/skills")
     def get_session_skills(session_id: str) -> dict[str, object]:

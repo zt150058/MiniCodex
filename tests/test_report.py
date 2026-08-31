@@ -8,12 +8,14 @@ import sys
 
 import pytest
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.logging import RunMetadata, TokenUsageTotals
 from coding_agent.agent import AgentRunner
 from coding_agent.logging import RunEventLogger
 from coding_agent.messages import ModelResponse, ToolResultMetadata
 from coding_agent.model import FakeModelClient, ModelClient, invoke_model
 from coding_agent.openai_client import OpenAIResponsesClient
+from coding_agent.progress import AgentPhase
 from coding_agent.context import ContextManager
 from coding_agent.report import (
     MAX_REPORT_COMPLETION_CHARS,
@@ -42,6 +44,7 @@ def successful_state(tmp_path: Path) -> AgentState:
     state.completion_text = "all checks passed"
     state.mutation_index = 2
     state.modified_paths = ("b.py", "a.py")
+    state.main_model_call_count = 3
     state.logical_model_call_count = 3
     state.model_call_count = 4
     state.tool_call_count = 5
@@ -60,6 +63,7 @@ def successful_state(tmp_path: Path) -> AgentState:
         duration_ms=125,
         error=None,
     )
+    state.progress.transition(AgentPhase.FINISH)
     return state
 
 
@@ -89,9 +93,61 @@ def answered_state(tmp_path: Path) -> AgentState:
     )
     state.status = AgentStatus.ANSWERED
     state.completion_text = "Project summary"
+    state.main_model_call_count = 1
     state.logical_model_call_count = 1
     state.model_call_count = 1
+    state.progress.transition(AgentPhase.FINISH)
     return state
+
+
+def test_final_report_contains_profile_phase_and_split_counts(
+    tmp_path: Path,
+) -> None:
+    state = successful_state(tmp_path)
+    state.budget_profile = BudgetProfile.DEEP
+    state.progress.transition(AgentPhase.ACT)
+    state.progress.transition(AgentPhase.VERIFY)
+    state.progress.transition(AgentPhase.FINISH)
+    state.main_model_call_count = 7
+    state.summary_model_call_count = 2
+    state.logical_model_call_count = 9
+    state.summary_provider_attempt_count = 2
+    state.model_call_count = 10
+
+    payload = FinalReport.from_state(state, run_metadata()).to_dict()
+
+    assert payload["schema_version"] == 3
+    assert payload["budget_profile"] == "deep"
+    assert payload["phase"] == "finish"
+    assert payload["main_model_calls"] == 7
+    assert payload["summary_model_calls"] == 2
+    assert payload["logical_model_calls"] == 9
+    assert payload["summary_provider_attempts"] == 2
+    assert payload["provider_attempts"] == 10
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda state: setattr(state, "logical_model_call_count", 4),
+        lambda state: setattr(state, "summary_provider_attempt_count", 5),
+        lambda state: state.progress.transition(AgentPhase.ACT),
+    ],
+    ids=("split_counts", "provider_counts", "terminal_phase"),
+)
+def test_final_report_rejects_split_count_and_terminal_phase_invariants(
+    tmp_path: Path,
+    corrupt: object,
+) -> None:
+    state = successful_state(tmp_path)
+    state.main_model_call_count = 3
+    state.summary_model_call_count = 0
+    state.summary_provider_attempt_count = 0
+    state.progress.transition(AgentPhase.FINISH)
+    corrupt(state)  # type: ignore[operator]
+
+    with pytest.raises(ReportInvariantError):
+        FinalReport.from_state(state, run_metadata())
 
 
 def test_answered_report_is_successful_without_verification(
@@ -100,7 +156,7 @@ def test_answered_report_is_successful_without_verification(
     report = FinalReport.from_state(answered_state(tmp_path), run_metadata())
     payload = report.to_dict()
 
-    assert report.schema_version == 2
+    assert report.schema_version == 3
     assert report.run_mode is RunMode.READ_ONLY
     assert report.status is AgentStatus.ANSWERED
     assert report.exit_code == 0
@@ -111,6 +167,8 @@ def test_answered_report_is_successful_without_verification(
         "schema_version",
         "run_id",
         "run_mode",
+        "budget_profile",
+        "phase",
         "status",
         "exit_code",
         "completion",
@@ -120,7 +178,10 @@ def test_answered_report_is_successful_without_verification(
         "mutation_index",
         "validation_index",
         "verification",
+        "main_model_calls",
+        "summary_model_calls",
         "logical_model_calls",
+        "summary_provider_attempts",
         "provider_attempts",
         "tool_calls",
         "verification_attempts",
@@ -133,10 +194,23 @@ def test_answered_report_is_successful_without_verification(
     assert payload["run_mode"] == "read_only"
 
 
+def test_modify_capability_answered_report_preserves_selected_mode(
+    tmp_path: Path,
+) -> None:
+    state = answered_state(tmp_path)
+    state.run_mode = RunMode.MODIFY
+
+    report = FinalReport.from_state(state, run_metadata())
+
+    assert report.run_mode is RunMode.MODIFY
+    assert report.status is AgentStatus.ANSWERED
+    assert report.exit_code == 0
+    assert report.verification.status is VerificationStatus.NOT_RUN
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
-        ("run_mode", RunMode.MODIFY),
         ("completion_text", ""),
         ("mutation_index", 1),
         ("modified_paths", ("x.py",)),
@@ -250,8 +324,8 @@ def test_report_scrubs_before_exact_character_truncation_and_hides_repr(
         "schema_version",
         "run_id",
         "run_mode",
-        "status",
-        "exit_code",
+        "budget_profile",
+        "phase",
     ]
 
 
@@ -278,6 +352,26 @@ def test_non_success_exit_mapping_is_explicit(
 
     assert report.exit_code == expected_exit
     assert report.termination_reason is reason
+
+
+def test_changes_unverified_report_is_failed_and_preserves_safe_facts(
+    tmp_path: Path,
+) -> None:
+    state = AgentState.start("write", tmp_path, 0.0)
+    state.status = AgentStatus.FAILED
+    state.termination_reason = TerminationReason.CHANGES_UNVERIFIED
+    state.failure_reason = TerminationReason.CHANGES_UNVERIFIED.value
+    state.mutation_index = 1
+    state.modified_paths = ("task_manager.py",)
+    state.verification_status = VerificationStatus.STALE
+
+    report = FinalReport.from_state(state, run_metadata())
+
+    assert report.status is AgentStatus.FAILED
+    assert report.exit_code == 1
+    assert report.termination_reason is TerminationReason.CHANGES_UNVERIFIED
+    assert report.changed_paths == ("task_manager.py",)
+    assert report.verification.status is VerificationStatus.STALE
 
 
 @pytest.mark.parametrize(
@@ -316,14 +410,14 @@ class PassingVerificationExecutor:
         )
 
 
-class FailOnSeventhWrite:
+class FailOnNinthWrite:
     def __init__(self, wrapped: object) -> None:
         self.wrapped = wrapped
         self.write_calls = 0
 
     def write(self, value: str) -> int:
         self.write_calls += 1
-        if self.write_calls == 7:
+        if self.write_calls == 9:
             raise OSError("private terminal failure")
         return self.wrapped.write(value)  # type: ignore[attr-defined,no-any-return]
 
@@ -388,7 +482,7 @@ def test_terminal_log_failure_produces_nonzero_report_without_second_terminal(
     tmp_path: Path,
 ) -> None:
     logger = RunEventLogger.create(tmp_path, run_id="b" * 32)
-    stream = FailOnSeventhWrite(logger._stream)  # type: ignore[attr-defined]
+    stream = FailOnNinthWrite(logger._stream)  # type: ignore[attr-defined]
     logger._stream = stream  # type: ignore[attr-defined]
     runner = AgentRunner(
         model_client=FakeModelClient((ModelResponse(text="candidate"),)),
@@ -410,7 +504,7 @@ def test_terminal_log_failure_produces_nonzero_report_without_second_terminal(
     assert state.termination_reason is TerminationReason.AUDIT_LOG_FAILURE
     assert report.exit_code == 1
     assert report.log_failure_code == "log_write_failed"
-    assert stream.write_calls == 7
+    assert stream.write_calls == 9
     assert all(event["event_type"] != "run_completed" for event in events)
 
 

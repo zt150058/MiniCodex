@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.run_mode import RunMode
 from coding_agent.safety import (
     AuthorizedCommand,
@@ -38,6 +39,7 @@ class RunConfig:
     base_url: str | None = field(default=None, repr=False)
     verify_command: AuthorizedCommand | None = field(default=None, repr=False)
     run_mode: RunMode = RunMode.MODIFY
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_mode, RunMode):
@@ -46,6 +48,8 @@ class RunConfig:
             raise ConfigError(
                 "api mode must be one of: responses, chat-completions"
             )
+        if type(self.budget_profile) is not BudgetProfile:
+            raise ConfigError("budget profile must be 'standard' or 'deep'")
         if self.api_mode is ApiMode.RESPONSES:
             if self.base_url is not None:
                 raise ConfigError("--base-url is not allowed with responses")
@@ -111,6 +115,7 @@ def load_run_config(
     base_url: str | None = None,
     environ: Mapping[str, str] | None = None,
     run_mode: RunMode | str = RunMode.MODIFY,
+    budget_profile: BudgetProfile | str = BudgetProfile.STANDARD,
 ) -> RunConfig:
     source = os.environ if environ is None else environ
 
@@ -120,6 +125,13 @@ def load_run_config(
         selected_run_mode = RunMode(run_mode)
     except (TypeError, ValueError):
         raise ConfigError("run mode must be 'modify' or 'read_only'") from None
+
+    if isinstance(budget_profile, bool):
+        raise ConfigError("budget profile must be 'standard' or 'deep'")
+    try:
+        selected_budget_profile = BudgetProfile(budget_profile)
+    except (TypeError, ValueError):
+        raise ConfigError("budget profile must be 'standard' or 'deep'") from None
 
     try:
         selected_mode = ApiMode(api_mode)
@@ -195,4 +207,5 @@ def load_run_config(
         base_url=normalized_base_url,
         verify_command=authorized_verify,
         run_mode=selected_run_mode,
+        budget_profile=selected_budget_profile,
     )

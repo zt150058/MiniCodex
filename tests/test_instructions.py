@@ -97,6 +97,36 @@ def test_modify_instructions_name_only_modify_capabilities(tmp_path: Path) -> No
     assert "inspect_git" not in snapshot.text
 
 
+def test_modify_instructions_publish_exact_safe_verification_forms(
+    tmp_path: Path,
+) -> None:
+    text = RunInstructionBuilder().build(
+        tmp_path,
+        run_mode=RunMode.MODIFY,
+    ).text
+
+    assert "one process per run_command call" in text
+    assert "python <workspace-relative-file.py>" in text
+    assert "python -m pytest" in text
+    assert "python -m unittest" in text
+    assert 'purpose="verification"' in text
+    assert "run_java_tests" in text
+    assert "&&" in text and "pipes" in text
+
+
+def test_modify_instructions_distinguish_answers_from_changed_success(
+    tmp_path: Path,
+) -> None:
+    text = RunInstructionBuilder().build(
+        tmp_path,
+        run_mode=RunMode.MODIFY,
+    ).text
+
+    assert "A direct answer is allowed when no file was changed" in text
+    assert "local integrity validation" in text
+    assert "does not claim tests or compilation ran" in text
+
+
 def test_read_only_instructions_name_only_read_capabilities(
     tmp_path: Path,
 ) -> None:
@@ -116,6 +146,18 @@ def test_read_only_instructions_name_only_read_capabilities(
         "run_java_tests",
     ):
         assert unavailable not in snapshot.text
+
+
+def test_read_only_instructions_do_not_advertise_execution_forms(
+    tmp_path: Path,
+) -> None:
+    text = RunInstructionBuilder().build(
+        tmp_path,
+        run_mode=RunMode.READ_ONLY,
+    ).text
+
+    assert "python <workspace-relative-file.py>" not in text
+    assert 'purpose="verification"' not in text
 
 
 def test_skill_text_cannot_change_read_only_capability_statement(

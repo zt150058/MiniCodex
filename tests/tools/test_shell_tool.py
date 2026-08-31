@@ -85,7 +85,13 @@ def test_run_command_schema_is_strict_and_timeout_is_not_model_facing() -> None:
     assert RunCommandTool.name == "run_command"
     assert RunCommandTool.schema == {
         "name": "run_command",
-        "description": "Run an authorized command in the workspace.",
+        "description": (
+            "Run a single process in the workspace. Use no shell operators. "
+            "Supported verification forms: python "
+            "<workspace-relative-file.py>, python -m pytest ..., or python -m "
+            "unittest ... with purpose=\"verification\". Use run_java_tests "
+            "for Java verification."
+        ),
         "strict": True,
         "parameters": {
             "type": "object",
@@ -100,6 +106,18 @@ def test_run_command_schema_is_strict_and_timeout_is_not_model_facing() -> None:
             "additionalProperties": False,
         },
     }
+
+
+def test_run_command_schema_describes_single_process_verification_contract() -> None:
+    description = RunCommandTool.schema["description"]
+
+    assert isinstance(description, str)
+    assert "single process" in description
+    assert "python <workspace-relative-file.py>" in description
+    assert "python -m pytest" in description
+    assert 'purpose="verification"' in description
+    assert "run_java_tests" in description
+    assert "no shell operators" in description
 
 
 @pytest.mark.parametrize(

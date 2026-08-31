@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
 import math
 import threading
 from threading import Condition, Event, Thread
+import zipfile
 
 import pytest
 
+import coding_agent.session_controller as session_controller_module
+from coding_agent.budget import BudgetProfile
 from coding_agent.session import (
     NewSessionEvent,
     PersistedSessionEventKind,
@@ -22,9 +26,19 @@ from coding_agent.session_controller import CancellationResult, SessionControlle
 from coding_agent.logging import EventType, RunEvent
 from coding_agent.run_mode import RunMode
 from coding_agent.session_events import SessionEventHub, SessionUpdateKind
+from coding_agent.session_deletion import (
+    SessionDeletionError,
+    SessionDeletionService,
+)
 from coding_agent.session_runtime import SessionRunOutcome, SessionRunRequest
 from coding_agent.session_store import SQLiteSessionStore, WorkspaceSessionLease
-from coding_agent.skills import SkillCatalog, SkillDescriptor
+from coding_agent.skill_packages import SkillPackageInstaller
+from coding_agent.skills import (
+    SkillCatalog,
+    SkillCatalogView,
+    SkillDescriptor,
+    SkillSource,
+)
 from coding_agent.streaming import ModelStreamEvent, ModelStreamEventKind
 
 
@@ -72,6 +86,63 @@ def failed_outcome(reason: str = "empty_model_response") -> SessionRunOutcome:
     )
 
 
+def changes_unverified_outcome() -> SessionRunOutcome:
+    audit_run_id = "7" * 32
+    report = {
+        "schema_version": 3,
+        "run_id": audit_run_id,
+        "run_mode": "modify",
+        "budget_profile": "standard",
+        "phase": "finish",
+        "status": "failed",
+        "exit_code": 1,
+        "termination_reason": "changes_unverified",
+        "changed_paths": ["task_manager.py"],
+        "mutation_index": 1,
+        "validation_index": None,
+        "verification": {
+            "status": "stale",
+            "source": None,
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "duration_ms": None,
+            "validation_index": None,
+            "error_code": None,
+        },
+        "main_model_calls": 3,
+        "summary_model_calls": 0,
+        "logical_model_calls": 3,
+        "summary_provider_attempts": 0,
+        "provider_attempts": 3,
+        "tool_calls": 2,
+        "verification_attempts": 0,
+        "context_compressions": 0,
+        "token_usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "total_tokens": 15,
+            "responses_with_usage": 3,
+            "responses_without_usage": 0,
+        },
+        "elapsed_ms": 250,
+        "log_failure_code": None,
+        "log_path": f".coding-agent/logs/{audit_run_id}.jsonl",
+    }
+    return SessionRunOutcome(
+        status=SessionRunStatus.FAILED,
+        agent_status="failed",
+        termination_reason="changes_unverified",
+        audit_run_id=audit_run_id,
+        safe_summary=make_safe_run_summary(
+            report,
+            status="failed",
+            termination_reason="changes_unverified",
+        ),
+        final_report=report,
+    )
+
+
 def interrupted_outcome() -> SessionRunOutcome:
     return SessionRunOutcome(
         status=SessionRunStatus.INTERRUPTED,
@@ -94,6 +165,8 @@ def make_controller(
     store: SQLiteSessionStore | None = None,
     thread_factory: object | None = None,
     skill_catalog: SkillCatalog | None = None,
+    skill_installer: SkillPackageInstaller | None = None,
+    session_deletion: SessionDeletionService | None = None,
 ) -> SessionController:
     lease = WorkspaceSessionLease.acquire(tmp_path)
     selected_store = store or SQLiteSessionStore(tmp_path)
@@ -106,14 +179,431 @@ def make_controller(
     kwargs: dict[str, object] = {}
     if thread_factory is not None:
         kwargs["thread_factory"] = thread_factory
-    return SessionController(
-        store=selected_store,
-        lease=lease,
-        executor=executor,  # type: ignore[arg-type]
-        event_hub=SessionEventHub(),
-        skill_catalog=selected_catalog,
-        **kwargs,  # type: ignore[arg-type]
+    if skill_installer is not None:
+        kwargs["skill_installer"] = skill_installer
+    if session_deletion is not None:
+        kwargs["session_deletion"] = session_deletion
+    try:
+        return SessionController(
+            store=selected_store,
+            lease=lease,
+            executor=executor,  # type: ignore[arg-type]
+            event_hub=SessionEventHub(),
+            skill_catalog=selected_catalog,
+            **kwargs,  # type: ignore[arg-type]
+        )
+    except BaseException:
+        lease.close()
+        raise
+
+
+def test_session_deletion_open_uses_exact_factory_service_and_recovers(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[Path, object]] = []
+    services: list[SessionDeletionService] = []
+
+    class RecordingService(SessionDeletionService):
+        def __init__(self, workspace: Path, store: object) -> None:
+            super().__init__(workspace, store)  # type: ignore[arg-type]
+            self.recovery_calls = 0
+
+        def recover_pending(self) -> None:
+            self.recovery_calls += 1
+
+    def factory(workspace: Path, store: object) -> SessionDeletionService:
+        calls.append((workspace, store))
+        service = RecordingService(workspace, store)
+        services.append(service)
+        return service
+
+    controller = SessionController.open(
+        tmp_path,
+        BlockingExecutor(tmp_path, (failed_outcome(),)),
+        session_deletion_factory=factory,  # type: ignore[arg-type]
     )
+
+    assert len(calls) == 1
+    assert calls[0][0] == tmp_path.resolve(strict=True)
+    assert calls[0][1] is controller._store
+    assert controller._session_deletion is services[0]
+    assert services[0].recovery_calls == 1  # type: ignore[attr-defined]
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_session_deletion_open_default_composes_exact_dependency(
+    tmp_path: Path,
+) -> None:
+    controller = SessionController.open(
+        tmp_path,
+        BlockingExecutor(tmp_path, (failed_outcome(),)),
+    )
+
+    assert type(controller._session_deletion) is SessionDeletionService
+    assert controller._session_deletion.store is controller._store
+    assert controller._session_deletion.workspace == controller.workspace
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+@pytest.mark.parametrize("mismatch", ("store", "workspace"))
+def test_session_deletion_open_rejects_dependency_identity_and_closes_lease(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    def factory(workspace: Path, store: object) -> SessionDeletionService:
+        if mismatch == "store":
+            other_store = SQLiteSessionStore(workspace)
+        else:
+            other_workspace = tmp_path / "other"
+            other_workspace.mkdir()
+            other_store = SQLiteSessionStore(other_workspace)
+        other_store.initialize()
+        return SessionDeletionService(other_store.workspace, other_store)
+
+    with pytest.raises(SessionControllerError) as captured:
+        SessionController.open(
+            tmp_path,
+            BlockingExecutor(tmp_path, (failed_outcome(),)),
+            session_deletion_factory=factory,  # type: ignore[arg-type]
+        )
+
+    assert captured.value.code == "invalid_session_state"
+    replacement = WorkspaceSessionLease.acquire(tmp_path)
+    replacement.close()
+
+
+def test_session_deletion_recovery_failure_is_stable_and_closes_lease(
+    tmp_path: Path,
+) -> None:
+    class FailingRecoveryService(SessionDeletionService):
+        def recover_pending(self) -> None:
+            raise SessionDeletionError("session_deletion_recovery_failed")
+
+    with pytest.raises(SessionControllerError) as captured:
+        SessionController.open(
+            tmp_path,
+            BlockingExecutor(tmp_path, (failed_outcome(),)),
+            session_deletion_factory=lambda workspace, store: (
+                FailingRecoveryService(workspace, store)
+            ),
+        )
+
+    assert captured.value.code == "session_deletion_recovery_failed"
+    replacement = WorkspaceSessionLease.acquire(tmp_path)
+    replacement.close()
+
+
+def test_session_deletion_factory_failure_is_stable_and_closes_lease(
+    tmp_path: Path,
+) -> None:
+    def failing_factory(workspace: Path, store: object) -> SessionDeletionService:
+        del workspace, store
+        raise OSError("private factory detail")
+
+    with pytest.raises(SessionControllerError) as captured:
+        SessionController.open(
+            tmp_path,
+            BlockingExecutor(tmp_path, (failed_outcome(),)),
+            session_deletion_factory=failing_factory,  # type: ignore[arg-type]
+        )
+
+    assert captured.value.code == "invalid_session_state"
+    replacement = WorkspaceSessionLease.acquire(tmp_path)
+    replacement.close()
+
+
+def test_delete_session_removes_session_and_forgets_retained_run(
+    tmp_path: Path,
+) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+    handle = controller.create_session("delete retained session")
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=1.0)
+    assert controller.read_updates(handle.run_id).events
+
+    result = controller.delete_session(handle.session_id)
+
+    assert result.session_id == handle.session_id
+    assert result.run_ids == (handle.run_id,)
+    assert controller._event_run_id is None
+    with pytest.raises(SessionControllerError) as missing_session:
+        controller.get_session(handle.session_id)
+    assert missing_session.value.code == "session_not_found"
+    with pytest.raises(SessionControllerError) as missing_updates:
+        controller.read_updates(handle.run_id)
+    assert missing_updates.value.code == "run_not_found"
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_delete_session_rejects_active_controller_as_busy(tmp_path: Path) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+    handle = controller.create_session("active")
+    assert executor.started.wait(timeout=1.0)
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.delete_session(handle.session_id)
+
+    assert captured.value.code == "controller_busy"
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=1.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_delete_session_rejects_non_idle_session(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path)
+    controller = make_controller(
+        tmp_path,
+        BlockingExecutor(tmp_path, (failed_outcome(),)),
+        store=store,
+    )
+    submission = store.create_session("queued outside controller")
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.delete_session(submission.session.session_id)
+
+    assert captured.value.code == "invalid_session_state"
+    assert store.session_exists(submission.session.session_id) is True
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    (("closed", "controller_closed"), ("degraded", "controller_degraded")),
+)
+def test_delete_session_honors_unavailable_controller_state(
+    tmp_path: Path,
+    state: str,
+    expected: str,
+) -> None:
+    controller = make_controller(
+        tmp_path,
+        BlockingExecutor(tmp_path, (failed_outcome(),)),
+    )
+    if state == "closed":
+        assert controller.shutdown(timeout_seconds=1.0) is True
+    else:
+        controller._degraded = True
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.delete_session("1" * 32)
+
+    assert captured.value.code == expected
+    if state == "degraded":
+        controller._degraded = False
+        assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_delete_session_translates_failure_and_releases_admission(
+    tmp_path: Path,
+) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+    handle = controller.create_session("terminal")
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(handle.run_id, timeout_seconds=1.0)
+    real_delete = controller._session_deletion.delete
+
+    def fail_delete(session_id: str) -> object:
+        del session_id
+        raise SessionDeletionError("session_delete_failed")
+
+    controller._session_deletion.delete = fail_delete  # type: ignore[method-assign]
+    with pytest.raises(SessionControllerError) as captured:
+        controller.delete_session(handle.session_id)
+    assert captured.value.code == "session_delete_failed"
+
+    controller._session_deletion.delete = real_delete  # type: ignore[method-assign]
+    assert controller.delete_session(handle.session_id).session_id == handle.session_id
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def skill_archive(skill_id: str = "review") -> bytes:
+    raw = (
+        f"---\nid: {skill_id}\nname: Review\n"
+        "description: Review safely.\n---\nReview the workspace.\n"
+    ).encode("utf-8")
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as package:
+        package.writestr(f"{skill_id}/SKILL.md", raw)
+    return output.getvalue()
+
+
+def test_skill_installer_must_match_exact_workspace_root(tmp_path: Path) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    wrong = SkillPackageInstaller(tmp_path / "other-skills")
+    with pytest.raises(SessionControllerError) as captured:
+        make_controller(tmp_path, executor, skill_installer=wrong)
+    assert captured.value.code == "invalid_session_state"
+
+
+def test_skill_installer_injection_requires_exact_concrete_type(tmp_path: Path) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    with pytest.raises(TypeError, match="skill_installer must be"):
+        make_controller(
+            tmp_path,
+            executor,
+            skill_installer=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_import_skill_archive_publishes_and_rediscovers_exact_descriptor(
+    tmp_path: Path,
+) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+
+    descriptor = controller.import_skill_archive(skill_archive())
+
+    assert descriptor.skill_id == "review"
+    assert descriptor.source is SkillSource.WORKSPACE
+    assert controller.list_skills().skills == (descriptor,)
+    assert (tmp_path / ".coding-agent" / "skills" / "review" / "SKILL.md").is_file()
+    assert controller.list_sessions() == ()
+
+
+def test_import_skill_archive_rejects_existing_user_skill_before_writing(
+    tmp_path: Path,
+) -> None:
+    user_root = tmp_path / "user-skills"
+    write_skill(user_root, "review", "Review the workspace.")
+    catalog = SkillCatalog(
+        user_root=user_root,
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.import_skill_archive(skill_archive())
+
+    assert captured.value.code == "skill_already_exists"
+    assert not (tmp_path / ".coding-agent" / "skills").exists()
+
+
+def test_import_skill_archive_releases_admission_after_invalid_archive(
+    tmp_path: Path,
+) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.import_skill_archive(b"not-a-zip")
+    assert captured.value.code == "invalid_skill_archive"
+
+    descriptor = controller.import_skill_archive(skill_archive("second"))
+    assert descriptor.skill_id == "second"
+
+
+def test_import_skill_archive_rejects_unusable_preflight_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = SkillCatalog(
+        user_root=tmp_path / "user-skills",
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    monkeypatch.setattr(
+        catalog,
+        "discover",
+        lambda: SkillCatalogView(skills=(), diagnostics=(), usable=False),
+    )
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.import_skill_archive(skill_archive())
+
+    assert captured.value.code == "skill_catalog_unavailable"
+    assert not catalog.workspace_root.exists()
+
+
+def test_import_skill_archive_holds_single_admission_while_installing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installer = SkillPackageInstaller(tmp_path / ".coding-agent" / "skills")
+    original_install = installer.install
+    entered = Event()
+    release = Event()
+
+    def blocking_install(archive: bytes) -> SkillDescriptor:
+        entered.set()
+        assert release.wait(timeout=2.0)
+        return original_install(archive)
+
+    monkeypatch.setattr(installer, "install", blocking_install)
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_installer=installer)
+    results: list[SkillDescriptor] = []
+    worker = Thread(
+        target=lambda: results.append(controller.import_skill_archive(skill_archive())),
+    )
+    worker.start()
+    assert entered.wait(timeout=1.0)
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.create_session("must be rejected")
+    assert captured.value.code == "controller_busy"
+
+    release.set()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert [item.skill_id for item in results] == ["review"]
+
+
+def test_import_skill_archive_post_publish_mismatch_preserves_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = SkillCatalog(
+        user_root=tmp_path / "user-skills",
+        workspace_root=tmp_path / ".coding-agent" / "skills",
+    )
+    real_discover = catalog.discover
+    calls = 0
+
+    def racing_discover() -> SkillCatalogView:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_discover()
+        return SkillCatalogView(skills=(), diagnostics=(), usable=False)
+
+    monkeypatch.setattr(catalog, "discover", racing_discover)
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor, skill_catalog=catalog)
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.import_skill_archive(skill_archive())
+
+    assert captured.value.code == "skill_install_failed"
+    assert (catalog.workspace_root / "review" / "SKILL.md").is_file()
+
+
+def test_import_skill_archive_honors_closed_controller_state(tmp_path: Path) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.import_skill_archive(skill_archive())
+
+    assert captured.value.code == "controller_closed"
+
+
+def test_import_skill_archive_honors_degraded_controller_state(tmp_path: Path) -> None:
+    executor = BlockingExecutor(tmp_path, (failed_outcome(),))
+    controller = make_controller(tmp_path, executor)
+    controller._degraded = True
+
+    with pytest.raises(SessionControllerError) as captured:
+        controller.import_skill_archive(skill_archive())
+
+    assert captured.value.code == "controller_degraded"
 
 
 def write_skill(root: Path, skill_id: str, body: str) -> Path:
@@ -304,6 +794,47 @@ def test_same_session_can_submit_independent_run_modes(tmp_path: Path) -> None:
     assert executor.requests[1].run_mode is RunMode.MODIFY
     assert controller.get_session(first.session_id).runs[0].run_mode is RunMode.READ_ONLY
     assert controller.get_session(first.session_id).runs[1].run_mode is RunMode.MODIFY
+
+    executor.release.set()
+    controller.wait_for_run(second.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_follow_up_can_choose_new_profile_without_mutating_prior_run(
+    tmp_path: Path,
+) -> None:
+    executor = BlockingExecutor(
+        tmp_path,
+        (failed_outcome("first_finished"), failed_outcome("second_finished")),
+    )
+    controller = make_controller(tmp_path, executor)
+
+    first = controller.create_session(
+        "inspect",
+        budget_profile=BudgetProfile.STANDARD,
+    )
+    assert executor.started.wait(timeout=1.0)
+    executor.release.set()
+    controller.wait_for_run(first.run_id, timeout_seconds=2.0)
+
+    executor.started.clear()
+    executor.release.clear()
+    second = controller.submit_message(
+        first.session_id,
+        "go deeper",
+        budget_profile=BudgetProfile.DEEP,
+    )
+    assert executor.started.wait(timeout=1.0)
+
+    runs = controller.get_session(first.session_id).runs
+    assert [run.budget_profile for run in runs] == [
+        BudgetProfile.STANDARD,
+        BudgetProfile.DEEP,
+    ]
+    assert first.budget_profile is BudgetProfile.STANDARD
+    assert second.budget_profile is BudgetProfile.DEEP
+    assert executor.requests[0].budget_profile is BudgetProfile.STANDARD
+    assert executor.requests[1].budget_profile is BudgetProfile.DEEP
 
     executor.release.set()
     controller.wait_for_run(second.run_id, timeout_seconds=2.0)
@@ -610,7 +1141,7 @@ def test_idle_session_accepts_follow_up_with_safe_narrative(
     assert controller.shutdown(timeout_seconds=1.0) is True
 
 
-def _safe_tool_completed_event() -> RunEvent:
+def _safe_tool_completed_event(safe_error_code: str | None = None) -> RunEvent:
     return RunEvent(
         schema_version=1,
         run_id="8" * 32,
@@ -622,8 +1153,8 @@ def _safe_tool_completed_event() -> RunEvent:
             "ordinal": 1,
             "tool_name": "read_file",
             "call_id_hash": "a" * 64,
-            "status": "ok",
-            "safe_error_code": None,
+            "status": "rejected" if safe_error_code is not None else "ok",
+            "safe_error_code": safe_error_code,
             "output_chars": 99,
             "exit_code": None,
             "timed_out": False,
@@ -632,9 +1163,105 @@ def _safe_tool_completed_event() -> RunEvent:
             "changed_paths": [],
             "mutation_index_before": 0,
             "mutation_index_after": 0,
-            "executed": True,
+            "executed": safe_error_code is None,
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("audit_code", "wire_code"),
+    [
+        ("security_rejected:executable_denied", "executable_denied"),
+        ("agent_rejected:decision_required", "decision_required"),
+        ("agent_rejected:verification_required", "verification_required"),
+        ("tool_error", "tool_error"),
+        ("tool_rejected", "tool_rejected"),
+        (None, None),
+    ],
+)
+def test_tool_error_code_is_projected_to_safe_session_wire_code(
+    tmp_path: Path,
+    audit_code: str | None,
+    wire_code: str | None,
+) -> None:
+    class ScriptedExecutor:
+        workspace = tmp_path.resolve(strict=True)
+
+        def execute(self, request: object, **handlers: object) -> SessionRunOutcome:
+            del request
+            audit = handlers["run_event_handler"]
+            audit(_safe_tool_completed_event(safe_error_code=audit_code))  # type: ignore[operator]
+            return failed_outcome()
+
+    controller = make_controller(tmp_path, ScriptedExecutor())
+    handle = controller.create_session("project safe code")
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+
+    view = controller.get_session(handle.session_id)
+    persisted = next(
+        event
+        for event in view.events
+        if event.kind is PersistedSessionEventKind.TOOL_ACTIVITY
+    )
+    updates = controller.read_updates(handle.run_id).events
+    published = next(
+        item for item in updates if item.kind is SessionUpdateKind.TOOL_FINISHED
+    )
+
+    assert persisted.data["safe_error_code"] == wire_code
+    assert published.data["safe_error_code"] == wire_code
+    assert all(
+        item.kind is not SessionUpdateKind.CONTROLLER_ERROR for item in updates
+    )
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+@pytest.mark.parametrize(
+    "unsafe_code",
+    [
+        "security_rejected:not_a_safety_code",
+        "agent_rejected:not_an_agent_code",
+        "unknown_namespace:value",
+    ],
+)
+def test_safe_session_wire_code_rejects_unknown_namespaces(
+    unsafe_code: str,
+) -> None:
+    helper = getattr(
+        session_controller_module,
+        "_session_safe_tool_error_code",
+    )
+
+    with pytest.raises(ValueError, match="^invalid_safe_error_code$"):
+        helper(unsafe_code)
+
+
+def test_changes_unverified_session_detail_survives_controller_reload(
+    tmp_path: Path,
+) -> None:
+    class ImmediateExecutor:
+        workspace = tmp_path.resolve(strict=True)
+
+        def execute(self, request: object, **handlers: object) -> SessionRunOutcome:
+            del request, handlers
+            return changes_unverified_outcome()
+
+    controller = make_controller(tmp_path, ImmediateExecutor())
+    handle = controller.create_session("write a Python file")
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+    reloaded = make_controller(tmp_path, ImmediateExecutor())
+    view = reloaded.get_session(handle.session_id)
+    run = view.runs[0]
+
+    assert run.status is SessionRunStatus.FAILED
+    assert run.agent_status == "failed"
+    assert run.termination_reason == "changes_unverified"
+    assert run.final_report is not None
+    assert run.final_report["changed_paths"] == ["task_manager.py"]
+    assert run.final_report["verification"]["status"] == "stale"
+    assert reloaded.shutdown(timeout_seconds=1.0) is True
 
 
 def test_stream_commit_discard_and_audit_event_mapping(tmp_path: Path) -> None:
@@ -704,6 +1331,141 @@ def test_stream_commit_discard_and_audit_event_mapping(tmp_path: Path) -> None:
     rendered = repr(events)
     for forbidden in ("discard me", "call_id", "arguments", "stdout", "raw result"):
         assert forbidden not in rendered
+    assert controller.shutdown(timeout_seconds=1.0) is True
+
+
+def test_convergence_audit_events_project_safe_progress_updates(
+    tmp_path: Path,
+) -> None:
+    class ConvergenceExecutor:
+        workspace = tmp_path.resolve(strict=True)
+
+        def execute(self, request: object, **handlers: object) -> SessionRunOutcome:
+            del request
+            publish = handlers["run_event_handler"]  # type: ignore[assignment]
+            events = (
+                (
+                    EventType.RUN_STARTED,
+                    {
+                        "task_chars": 7,
+                        "mutation_index": 0,
+                        "run_mode": "modify",
+                        "budget_profile": "deep",
+                        "max_main_model_calls": 40,
+                        "max_summary_model_calls": 6,
+                        "max_provider_attempts": 80,
+                        "max_summary_provider_attempts": 12,
+                        "max_tool_calls": 140,
+                        "max_runtime_seconds": 1800,
+                        "verification_tool_reserve": 1,
+                    },
+                ),
+                (
+                    EventType.PHASE_CHANGED,
+                    {"from_phase": "discover", "to_phase": "act", "epoch": 1},
+                ),
+                (
+                    EventType.DECISION_CHECKPOINT,
+                    {
+                        "reason": "exploration_limit",
+                        "phase": "act",
+                        "main_calls_remaining": 33,
+                    },
+                ),
+                (
+                    EventType.CONTEXT_COMPRESSION_COMPLETED,
+                    {
+                        "before_chars": 49_000,
+                        "before_items": 21,
+                        "after_chars": 31_000,
+                        "after_items": 11,
+                        "summary_source": "fallback",
+                        "summary_model_failed": True,
+                        "continuation_cleared": True,
+                    },
+                ),
+                (
+                    EventType.NO_PROGRESS_DETECTED,
+                    {"phase": "act", "post_checkpoint_main_turns": 2},
+                ),
+                (
+                    EventType.RUN_COMPLETED,
+                    {
+                        "status": "failed",
+                        "termination_reason": "no_progress",
+                        "budget_profile": "deep",
+                        "phase": "act",
+                        "main_model_calls": 7,
+                        "summary_model_calls": 1,
+                        "logical_model_calls": 8,
+                        "summary_provider_attempts": 1,
+                        "provider_attempts": 9,
+                        "tool_calls": 12,
+                        "verification_attempts": 0,
+                        "mutation_index": 0,
+                        "validation_index": None,
+                        "elapsed_ms": 50,
+                    },
+                ),
+            )
+            for sequence, (event_type, data) in enumerate(events, start=1):
+                publish(  # type: ignore[operator]
+                    RunEvent(
+                        schema_version=3,
+                        run_id="8" * 32,
+                        sequence=sequence,
+                        timestamp_utc="2026-08-29T00:00:00.000000Z",
+                        elapsed_ms=sequence,
+                        event_type=event_type,
+                        data=data,  # type: ignore[arg-type]
+                    )
+                )
+            return failed_outcome("no_progress")
+
+    controller = make_controller(tmp_path, ConvergenceExecutor())
+    handle = controller.create_session(
+        "inspect",
+        budget_profile=BudgetProfile.DEEP,
+    )
+    controller.wait_for_run(handle.run_id, timeout_seconds=2.0)
+    updates = controller.read_updates(handle.run_id).events
+    selected = [
+        update
+        for update in updates
+        if update.kind
+        in {
+            SessionUpdateKind.RUN_PROGRESS,
+            SessionUpdateKind.PHASE_CHANGED,
+            SessionUpdateKind.DECISION_CHECKPOINT,
+            SessionUpdateKind.CONTEXT_COMPRESSED,
+            SessionUpdateKind.NO_PROGRESS_DETECTED,
+        }
+    ]
+
+    assert [update.kind for update in selected] == [
+        SessionUpdateKind.RUN_PROGRESS,
+        SessionUpdateKind.PHASE_CHANGED,
+        SessionUpdateKind.RUN_PROGRESS,
+        SessionUpdateKind.DECISION_CHECKPOINT,
+        SessionUpdateKind.CONTEXT_COMPRESSED,
+        SessionUpdateKind.NO_PROGRESS_DETECTED,
+        SessionUpdateKind.RUN_PROGRESS,
+    ]
+    assert selected[-1].data == {
+        "budget_profile": "deep",
+        "phase": "act",
+        "main_model_calls": 7,
+        "main_model_limit": 40,
+        "summary_model_calls": 1,
+        "summary_model_limit": 6,
+        "provider_attempts": 9,
+        "provider_attempt_limit": 80,
+        "tool_calls": 12,
+        "tool_limit": 140,
+    }
+    encoded = "".join(update.to_json() for update in selected)
+    for forbidden in ("summary_text", "continuation", "instructions", "Bearer "):
+        assert forbidden not in encoded
     assert controller.shutdown(timeout_seconds=1.0) is True
 
 
@@ -1038,6 +1800,7 @@ def test_shutdown_timeout_includes_blocked_session_admission(tmp_path: Path) -> 
             *,
             selected_skills: tuple[SkillDescriptor, ...] = (),
             run_mode: RunMode = RunMode.MODIFY,
+            budget_profile: BudgetProfile = BudgetProfile.STANDARD,
         ):  # type: ignore[no-untyped-def]
             self.create_entered.set()
             assert self.release_create.wait(timeout=2.0)
@@ -1045,6 +1808,7 @@ def test_shutdown_timeout_includes_blocked_session_admission(tmp_path: Path) -> 
                 message,
                 selected_skills=selected_skills,
                 run_mode=run_mode,
+                budget_profile=budget_profile,
             )
 
     store = BlockingCreateStore(tmp_path)
@@ -1093,6 +1857,7 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
             *,
             selected_skills: tuple[SkillDescriptor, ...] = (),
             run_mode: RunMode = RunMode.MODIFY,
+            budget_profile: BudgetProfile = BudgetProfile.STANDARD,
         ):  # type: ignore[no-untyped-def]
             self.submit_entered.set()
             assert self.release_submit.wait(timeout=2.0)
@@ -1101,6 +1866,7 @@ def test_shutdown_timeout_includes_blocked_follow_up_admission(
                 message,
                 selected_skills=selected_skills,
                 run_mode=run_mode,
+                budget_profile=budget_profile,
             )
 
     store = BlockingSubmitStore(tmp_path)

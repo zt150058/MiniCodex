@@ -11,6 +11,7 @@ from coding_agent.agent import AgentRunner
 from coding_agent.chat_completions_client import ChatCompletionsModelClient
 from coding_agent.context import ContextLimits, ContextManager
 from coding_agent.messages import JSONObject, ToolResult
+from coding_agent.progress import ProgressLimits
 from coding_agent.state import AgentStatus
 from coding_agent.tools.base import (
     ExecutionContext,
@@ -122,6 +123,7 @@ def _runner(
     outcomes: tuple[object, ...],
     *,
     context_limits: ContextLimits | None = None,
+    progress_limits: ProgressLimits | None = None,
 ) -> tuple[AgentRunner, FakeCompletionsResource, EchoTool]:
     sdk = FakeSDKClient(*outcomes)
     client = ChatCompletionsModelClient(
@@ -142,6 +144,7 @@ def _runner(
             else ContextManager(model_client=client)
         ),
         clock=lambda: 0.0,
+        progress_limits=progress_limits,
     )
     return runner, sdk.chat.completions, tool
 
@@ -318,9 +321,11 @@ def test_compressed_history_remains_legal_and_continues_chat(
         outcomes,
         context_limits=ContextLimits(
             max_serialized_chars=60_000,
-            max_history_items=18,
+            max_history_items=20,
             recent_turns=8,
+            compression_target_items=18,
         ),
+        progress_limits=ProgressLimits(100, 100, 100, 100, 1),
     )
 
     state = runner.run("compress legal Chat history")
@@ -333,10 +338,12 @@ def test_compressed_history_remains_legal_and_continues_chat(
     assert len(resource.calls) == 11
     assert "tools" not in resource.calls[9]
     final_messages = _messages(resource.calls[10])
-    assert len(final_messages) == 18
-    assert final_messages[0]["role"] == "user"
+    assert len(final_messages) == 19
+    assert final_messages[0]["role"] == "system"
+    assert str(final_messages[0]["content"]).startswith("Exploration coverage:")
     assert final_messages[1]["role"] == "user"
-    summary = final_messages[1]["content"]
+    assert final_messages[2]["role"] == "user"
+    summary = final_messages[2]["content"]
     assert isinstance(summary, str)
     assert summary.startswith("coding-agent context summary\n")
     for request in resource.calls:

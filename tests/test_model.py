@@ -20,17 +20,29 @@ from coding_agent.model import (
     FakeModelClient,
     FakeModelExhaustedError,
     FatalModelError,
+    InvalidModelResponseError,
     ModelBudgetExceeded,
     ModelBudgetReason,
     ModelCallBudget,
     ModelCallPurpose,
     ModelClient,
     ModelError,
+    ModelOutputLimitError,
     ModelObservation,
     ModelObservationKind,
     TransientModelError,
     invoke_model,
 )
+
+
+def test_model_response_failures_expose_stable_safe_codes() -> None:
+    invalid = InvalidModelResponseError("safe invalid response")
+    limited = ModelOutputLimitError("safe output limit")
+
+    assert isinstance(invalid, ModelError)
+    assert invalid.observation_error_code == "invalid_model_response"
+    assert isinstance(limited, ModelError)
+    assert limited.observation_error_code == "model_output_limit"
 
 
 class RecordingModelObserver:
@@ -389,3 +401,76 @@ def test_model_budget_rejects_invalid_counts_and_limits(
 ) -> None:
     with pytest.raises(ValueError):
         ModelCallBudget(**changes)  # type: ignore[arg-type]
+
+
+def _layered_budget() -> ModelCallBudget:
+    return ModelCallBudget(
+        max_logical_calls=28,
+        max_provider_attempts=48,
+        max_main_logical_calls=24,
+        max_summary_logical_calls=4,
+        max_summary_provider_attempts=8,
+    )
+
+
+def test_main_and_summary_logical_limits_are_independent() -> None:
+    budget = _layered_budget()
+    request = _request("layered logical counts")
+
+    for _ in range(24):
+        index = budget.begin_logical_call(ModelCallPurpose.MAIN, request)
+        budget.finish_logical_call(
+            ModelCallPurpose.MAIN,
+            index,
+            response=ModelResponse(text="ok"),
+            error_code=None,
+        )
+    for _ in range(4):
+        index = budget.begin_logical_call(ModelCallPurpose.SUMMARY, request)
+        budget.finish_logical_call(
+            ModelCallPurpose.SUMMARY,
+            index,
+            response=ModelResponse(text="ok"),
+            error_code=None,
+        )
+
+    assert budget.logical_calls == 28
+    assert budget.main_logical_calls == 24
+    assert budget.summary_logical_calls == 4
+    with pytest.raises(ModelBudgetExceeded) as main_error:
+        budget.begin_logical_call(ModelCallPurpose.MAIN, request)
+    assert main_error.value.reason is ModelBudgetReason.MAIN_LOGICAL_CALL_LIMIT
+    assert budget.logical_calls == 28
+    assert budget.main_logical_calls == 24
+
+
+def test_summary_provider_subcap_never_exceeds_global_cap() -> None:
+    budget = _layered_budget()
+    budget.begin_logical_call(
+        ModelCallPurpose.SUMMARY,
+        _request("summary provider attempts"),
+    )
+
+    for expected in range(1, 9):
+        assert budget.begin_provider_attempt(ModelCallPurpose.SUMMARY) == expected
+
+    with pytest.raises(ModelBudgetExceeded) as caught:
+        budget.begin_provider_attempt(ModelCallPurpose.SUMMARY)
+    assert caught.value.reason is ModelBudgetReason.SUMMARY_PROVIDER_ATTEMPT_LIMIT
+    assert budget.provider_attempts == 8
+    assert budget.summary_provider_attempts == 8
+
+
+def test_legacy_budget_without_purpose_caps_keeps_task9_semantics() -> None:
+    budget = ModelCallBudget(max_logical_calls=1, max_provider_attempts=3)
+    budget.begin_logical_call(
+        ModelCallPurpose.MAIN,
+        _request("legacy provider attempts"),
+    )
+
+    assert [
+        budget.begin_provider_attempt(ModelCallPurpose.MAIN) for _ in range(3)
+    ] == [1, 2, 3]
+    with pytest.raises(ModelBudgetExceeded) as caught:
+        budget.begin_provider_attempt(ModelCallPurpose.MAIN)
+    assert caught.value.reason is ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT

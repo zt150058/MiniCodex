@@ -6,8 +6,10 @@ from collections import deque
 
 import pytest
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.session import SessionControllerError
 from coding_agent.session_controller import CancellationResult, RunHandle
+from coding_agent.session_deletion import SessionDeletionResult
 from coding_agent.run_mode import RunMode
 from coding_agent.web_auth import WebAccessPolicy
 from tests.web_support import (
@@ -48,6 +50,128 @@ def test_health_requires_auth_and_returns_exact_schema() -> None:
     assert allowed.json() == {"schema_version": 1, "status": "ok"}
     assert allowed.headers["cache-control"] == "no-store"
     assert controller.calls == []
+
+
+def test_delete_session_is_authenticated_bodyless_and_delegates_exact_id() -> None:
+    controller = RecordingController()
+    app = make_app(controller)
+
+    denied = asyncio.run(
+        request(app, "DELETE", f"/api/v1/sessions/{SESSION_ID}")
+    )
+    allowed = asyncio.run(
+        request(
+            app,
+            "DELETE",
+            f"/api/v1/sessions/{SESSION_ID}",
+            content=b"",
+            headers={**auth_headers(), "Content-Type": "text/plain"},
+        )
+    )
+
+    assert denied.status_code == 401
+    assert denied.json() == {"error": {"code": "unauthorized"}}
+    assert allowed.status_code == 200
+    assert allowed.json() == {
+        "session_id": SESSION_ID,
+        "deleted": True,
+        "cleanup_pending": False,
+    }
+    assert allowed.headers["cache-control"] == "no-store"
+    assert controller.calls == [("delete_session", SESSION_ID)]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_status", "expected_code"),
+    (
+        (b"{}", 400, "invalid_request"),
+        (b"x", 400, "invalid_request"),
+        (b"x" * 131_073, 413, "request_too_large"),
+    ),
+    ids=("json", "one-byte", "oversized"),
+)
+def test_delete_session_rejects_every_nonempty_body_before_delegation(
+    content: bytes,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "DELETE",
+            f"/api/v1/sessions/{SESSION_ID}",
+            content=content,
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"error": {"code": expected_code}}
+    assert controller.calls == []
+
+
+def test_delete_session_cleanup_warning_omits_runs_and_private_details() -> None:
+    private_run_id = "f" * 32
+    controller = RecordingController(
+        delete_result=SessionDeletionResult(
+            SESSION_ID,
+            (private_run_id,),
+            True,
+        )
+    )
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "DELETE",
+            f"/api/v1/sessions/{SESSION_ID}",
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_id": SESSION_ID,
+        "deleted": True,
+        "cleanup_pending": True,
+        "warning_code": "session_log_cleanup_pending",
+    }
+    assert private_run_id not in response.text
+    assert "run_ids" not in response.text
+    assert "staging" not in response.text.lower()
+    assert "\\" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("code", "status"),
+    (
+        ("session_not_found", 404),
+        ("invalid_session_state", 409),
+        ("controller_busy", 409),
+        ("storage_unavailable", 503),
+        ("session_delete_failed", 503),
+        ("session_deletion_recovery_failed", 503),
+    ),
+)
+def test_delete_session_uses_route_stable_error_mapping(
+    code: str,
+    status: int,
+) -> None:
+    controller = RecordingController(
+        errors={"delete_session": SessionControllerError(code)}
+    )
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "DELETE",
+            f"/api/v1/sessions/{SESSION_ID}",
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == status
+    assert response.json() == {"error": {"code": code}}
+    assert controller.calls == [("delete_session", SESSION_ID)]
 
 
 def test_unhandled_route_error_is_stable_and_private(capsys) -> None:
@@ -169,10 +293,15 @@ def test_create_session_accepts_exact_body_limit() -> None:
         "session_id": controller.create_handle.session_id,
         "run_id": controller.create_handle.run_id,
         "run_mode": "modify",
+        "budget_profile": "standard",
     }
     assert controller.calls[0][0] == "create_session"
     assert len(controller.calls[0][1]) == 131_058
-    assert controller.calls[0][2:] == ((), RunMode.MODIFY)
+    assert controller.calls[0][2:] == (
+        (),
+        RunMode.MODIFY,
+        BudgetProfile.STANDARD,
+    )
 
 
 def test_create_session_rejects_first_byte_over_body_limit() -> None:
@@ -273,6 +402,7 @@ def test_create_session_delegates_message_and_ordered_skill_ids() -> None:
         "session_id": SESSION_ID,
         "run_id": RUN_ID,
         "run_mode": "modify",
+        "budget_profile": "standard",
     }
     assert controller.calls == [
         (
@@ -280,6 +410,7 @@ def test_create_session_delegates_message_and_ordered_skill_ids() -> None:
             "repair tests",
             ("python-testing",),
             RunMode.MODIFY,
+            BudgetProfile.STANDARD,
         ),
     ]
 
@@ -391,6 +522,7 @@ def test_session_detail_uses_allowlisted_projection_and_selected_skills() -> Non
                 "ordinal": 1,
                 "status": "queued",
                 "run_mode": "modify",
+                "budget_profile": "standard",
                 "started_at_utc": None,
                 "finished_at_utc": None,
                 "agent_status": None,
@@ -455,9 +587,16 @@ def test_session_follow_up_delegates_and_returns_accepted_handle() -> None:
         "session_id": SESSION_ID,
         "run_id": SECOND_RUN_ID,
         "run_mode": "modify",
+        "budget_profile": "standard",
     }
     assert controller.calls == [
-        ("submit_message", SESSION_ID, "continue", RunMode.MODIFY)
+        (
+            "submit_message",
+            SESSION_ID,
+            "continue",
+            RunMode.MODIFY,
+            BudgetProfile.STANDARD,
+        )
     ]
 
 
@@ -487,7 +626,7 @@ def test_run_mode_defaults_to_modify(
     assert response.status_code == expected_status
     assert response.json()["run_mode"] == "modify"
     assert controller.calls[0][0] == call_name
-    assert controller.calls[0][-1] is RunMode.MODIFY
+    assert controller.calls[0][-2] is RunMode.MODIFY
 
 
 @pytest.mark.parametrize("mode", tuple(RunMode))
@@ -504,8 +643,18 @@ def test_create_and_follow_up_accept_exact_run_modes(
     expected_status: int,
 ) -> None:
     controller = RecordingController(
-        create_handle=RunHandle(SESSION_ID, RUN_ID, mode),
-        follow_up_handle=RunHandle(SESSION_ID, SECOND_RUN_ID, mode),
+        create_handle=RunHandle(
+            SESSION_ID,
+            RUN_ID,
+            mode,
+            BudgetProfile.STANDARD,
+        ),
+        follow_up_handle=RunHandle(
+            SESSION_ID,
+            SECOND_RUN_ID,
+            mode,
+            BudgetProfile.STANDARD,
+        ),
     )
     response = asyncio.run(
         request(
@@ -519,7 +668,7 @@ def test_create_and_follow_up_accept_exact_run_modes(
 
     assert response.status_code == expected_status
     assert response.json()["run_mode"] == mode.value
-    assert controller.calls[0][-1] is mode
+    assert controller.calls[0][-2] is mode
 
 
 @pytest.mark.parametrize("value", ["auto", "READ_ONLY", "", 1, True, None, []])
@@ -538,6 +687,85 @@ def test_rest_rejects_invalid_run_mode_without_controller_call(
             "POST",
             path,
             json={"message": "hello", "run_mode": value},
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": {"code": "invalid_request"}}
+    assert controller.calls == []
+
+
+def test_budget_profile_defaults_to_standard() -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            "/api/v1/sessions",
+            json={"message": "hello", "skill_ids": [], "run_mode": "modify"},
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == 201
+    assert response.json()["budget_profile"] == "standard"
+    assert controller.calls[0][-1] is BudgetProfile.STANDARD
+
+
+@pytest.mark.parametrize("profile", tuple(BudgetProfile))
+@pytest.mark.parametrize(
+    ("path", "expected_status"),
+    [
+        ("/api/v1/sessions", 201),
+        (f"/api/v1/sessions/{SESSION_ID}/messages", 202),
+    ],
+)
+def test_create_and_follow_up_accept_exact_budget_profiles(
+    profile: BudgetProfile,
+    path: str,
+    expected_status: int,
+) -> None:
+    controller = RecordingController(
+        create_handle=RunHandle(SESSION_ID, RUN_ID, RunMode.MODIFY, profile),
+        follow_up_handle=RunHandle(
+            SESSION_ID,
+            SECOND_RUN_ID,
+            RunMode.MODIFY,
+            profile,
+        ),
+    )
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            path,
+            json={"message": "hello", "budget_profile": profile.value},
+            headers=auth_headers(),
+        )
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["budget_profile"] == profile.value
+    assert controller.calls[0][-1] is profile
+
+
+@pytest.mark.parametrize("value", ["", "DEEP", "auto", None, True, 1, {}])
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/sessions", f"/api/v1/sessions/{SESSION_ID}/messages"],
+)
+def test_rest_rejects_invalid_budget_profile_before_controller(
+    value: object,
+    path: str,
+) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            path,
+            json={"message": "hello", "budget_profile": value},
             headers=auth_headers(),
         )
     )
@@ -589,6 +817,118 @@ def test_skill_catalog_projects_only_public_metadata_in_order() -> None:
     }
     assert controller.private_skill_instruction not in response.text
     assert controller.calls == [("list_skills",)]
+
+
+def test_skill_import_accepts_exact_raw_limit_and_projects_public_descriptor() -> None:
+    archive = b"z" * 131_072
+    controller = RecordingController()
+
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            "/api/v1/skills/import",
+            content=archive,
+            headers={**auth_headers(), "Content-Type": "application/zip"},
+        )
+    )
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "skill_id": "review",
+        "name": "Review",
+        "description": "Review safely.",
+        "source": "workspace",
+        "sha256": "c" * 64,
+        "char_count": 12,
+    }
+    assert controller.calls == [("import_skill_archive", archive)]
+    assert "z" * 128 not in response.text
+
+
+def test_skill_import_rejects_first_raw_byte_over_limit() -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            "/api/v1/skills/import",
+            content=b"z" * 131_073,
+            headers={**auth_headers(), "Content-Type": "application/zip"},
+        )
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {"error": {"code": "skill_archive_too_large"}}
+    assert controller.calls == []
+
+
+@pytest.mark.parametrize(
+    ("content", "extra_headers", "status", "code"),
+    [
+        (b"", {"Content-Type": "application/zip"}, 400, "invalid_skill_archive"),
+        (b"zip", {}, 415, "unsupported_media_type"),
+        (b"zip", {"Content-Type": "application/json"}, 415, "unsupported_media_type"),
+        (
+            b"zip",
+            {"Content-Type": "application/zip", "Content-Encoding": "gzip"},
+            415,
+            "unsupported_content_encoding",
+        ),
+    ],
+)
+def test_skill_import_rejects_invalid_body_media_and_encoding(
+    content: bytes,
+    extra_headers: dict[str, str],
+    status: int,
+    code: str,
+) -> None:
+    controller = RecordingController()
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            "/api/v1/skills/import",
+            content=content,
+            headers={**auth_headers(), **extra_headers},
+        )
+    )
+
+    assert response.status_code == status
+    assert response.json() == {"error": {"code": code}}
+    assert controller.calls == []
+
+
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        ("invalid_skill_archive", 400),
+        ("unsafe_skill_archive", 400),
+        ("skill_catalog_unavailable", 409),
+        ("skill_already_exists", 409),
+        ("controller_busy", 409),
+        ("skill_install_failed", 500),
+    ],
+)
+def test_skill_import_uses_route_specific_stable_error_mapping(
+    code: str,
+    status: int,
+) -> None:
+    controller = RecordingController(
+        errors={"import_skill_archive": SessionControllerError(code)}
+    )
+    response = asyncio.run(
+        request(
+            make_app(controller),
+            "POST",
+            "/api/v1/skills/import",
+            content=b"zip",
+            headers={**auth_headers(), "Content-Type": "application/zip"},
+        )
+    )
+
+    assert response.status_code == status
+    assert response.json() == {"error": {"code": code}}
 
 
 def test_get_and_set_session_skill_selection_preserves_order() -> None:

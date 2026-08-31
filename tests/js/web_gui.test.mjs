@@ -43,7 +43,7 @@ test("closed fenced code creates explicit pre and code nodes", () => {
 
   assert.equal(findElements(container, "pre").length, 1);
   assert.equal(findElements(container, "code")[0].textContent, "print(1)\n");
-  assert.equal(container.textContent, "Agentbefore\nprint(1)\nafter");
+  assert.equal(container.textContent, "MiniCodexbefore\nprint(1)\nafter");
 });
 
 
@@ -54,7 +54,146 @@ test("an unclosed fence remains plain text", () => {
   gui.appendMessage(document, container, "assistant", "before\n```py\nsecret");
 
   assert.equal(findElements(container, "pre").length, 0);
-  assert.equal(container.textContent, "Agentbefore\n```py\nsecret");
+  assert.equal(container.textContent, "MiniCodexbefore\n```py\nsecret");
+});
+
+
+test("assistant messages render common Markdown as semantic DOM", () => {
+  const document = new TestDocument();
+  const container = document.createElement("section");
+
+  gui.appendMessage(
+    document,
+    container,
+    "assistant",
+    [
+      "# 标题",
+      "",
+      "包含 **粗体**、*斜体*、~~删除~~ 和 `inline()`。",
+      "",
+      "- 第一项",
+      "- 第二项",
+      "",
+      "1. 步骤一",
+      "2. 步骤二",
+      "",
+      "> 引用内容",
+      "",
+      "---",
+    ].join("\n"),
+  );
+
+  assert.equal(findElements(container, "h1")[0].textContent, "标题");
+  assert.equal(findElements(container, "strong")[0].textContent, "粗体");
+  assert.equal(findElements(container, "em")[0].textContent, "斜体");
+  assert.equal(findElements(container, "del")[0].textContent, "删除");
+  assert.equal(findElements(container, "code")[0].textContent, "inline()");
+  assert.deepEqual(
+    findElements(container, "ul")[0].childNodes.map((node) => node.textContent),
+    ["第一项", "第二项"],
+  );
+  assert.deepEqual(
+    findElements(container, "ol")[0].childNodes.map((node) => node.textContent),
+    ["步骤一", "步骤二"],
+  );
+  assert.equal(findElements(container, "blockquote")[0].textContent, "引用内容");
+  assert.equal(findElements(container, "hr").length, 1);
+});
+
+
+test("assistant Markdown tables render headers rows and alignment", () => {
+  const document = new TestDocument();
+  const container = document.createElement("section");
+
+  gui.appendMessage(
+    document,
+    container,
+    "assistant",
+    [
+      "| 名称 | 状态 | 数量 |",
+      "| :--- | :---: | ---: |",
+      "| **构建** | 通过 | 12 |",
+      "| 测试 | 通过 | 48 |",
+    ].join("\n"),
+  );
+
+  const table = findElements(container, "table")[0];
+  assert.equal(table.parentNode.className, "markdown-table-wrapper");
+  assert.deepEqual(
+    findElements(table, "th").map((cell) => cell.textContent),
+    ["名称", "状态", "数量"],
+  );
+  assert.deepEqual(
+    findElements(table, "th").map((cell) => cell.className),
+    ["markdown-align-left", "markdown-align-center", "markdown-align-right"],
+  );
+  assert.deepEqual(
+    findElements(table, "td").map((cell) => cell.textContent),
+    ["构建", "通过", "12", "测试", "通过", "48"],
+  );
+  assert.equal(findElements(table, "strong")[0].textContent, "构建");
+});
+
+
+test("Markdown preserves coding text in headings and table cells", () => {
+  const document = new TestDocument();
+  const container = document.createElement("section");
+
+  gui.appendMessage(
+    document,
+    container,
+    "assistant",
+    [
+      "# C#",
+      "",
+      "| 路径 | 说明 |",
+      "| --- | --- |",
+      "| C:\\work\\main.py | A\\|B |",
+    ].join("\n"),
+  );
+
+  assert.equal(findElements(container, "h1")[0].textContent, "C#");
+  assert.deepEqual(
+    findElements(container, "td").map((cell) => cell.textContent),
+    ["C:\\work\\main.py", "A|B"],
+  );
+});
+
+
+test("assistant Markdown creates only allowlisted safe links", () => {
+  const document = new TestDocument();
+  const container = document.createElement("section");
+
+  gui.appendMessage(
+    document,
+    container,
+    "assistant",
+    "[文档](https://example.com/docs) [邮件](mailto:test@example.com) [危险](javascript:alert(1))",
+  );
+
+  const links = findElements(container, "a");
+  assert.deepEqual(links.map((link) => link.textContent), ["文档", "邮件"]);
+  assert.deepEqual(
+    links.map((link) => link.getAttribute("href")),
+    ["https://example.com/docs", "mailto:test@example.com"],
+  );
+  assert.equal(links[0].getAttribute("target"), "_blank");
+  assert.equal(links[0].getAttribute("rel"), "noopener noreferrer");
+  assert.equal(container.textContent.includes("[危险](javascript:alert(1))"), true);
+});
+
+
+test("user messages preserve Markdown source as plain text", () => {
+  const document = new TestDocument();
+  const container = document.createElement("section");
+  const source = "# 原始任务\n\n**不要改写**\n\n| A | B |\n| --- | --- |";
+
+  gui.appendMessage(document, container, "user", source);
+
+  assert.equal(container.textContent, `你${source}`);
+  for (const tag of ["h1", "strong", "table", "p"]) {
+    assert.equal(findElements(container, tag).length, 0);
+  }
 });
 
 
@@ -162,11 +301,16 @@ test("mutation API methods send exact paths and JSON bodies once", async () => {
   });
 
   assert.deepEqual(
-    await api.createSession("repair tests", ["workspace:review"], "read_only"),
+    await api.createSession(
+      "repair tests",
+      ["workspace:review"],
+      "read_only",
+      "deep",
+    ),
     responses[0],
   );
   assert.deepEqual(
-    await api.submitFollowUp("s1", "continue", "modify"),
+    await api.submitFollowUp("s1", "continue", "modify", "standard"),
     responses[1],
   );
   assert.deepEqual(
@@ -187,8 +331,13 @@ test("mutation API methods send exact paths and JSON bodies once", async () => {
   assert.deepEqual(
     await Promise.all(calls.map((request) => request.clone().json())),
     [
-      { message: "repair tests", skill_ids: ["workspace:review"], run_mode: "read_only" },
-      { message: "continue", run_mode: "modify" },
+      {
+        message: "repair tests",
+        skill_ids: ["workspace:review"],
+        run_mode: "read_only",
+        budget_profile: "deep",
+      },
+      { message: "continue", run_mode: "modify", budget_profile: "standard" },
       { skill_ids: ["workspace:review"] },
       {},
     ],
@@ -201,6 +350,53 @@ test("mutation API methods send exact paths and JSON bodies once", async () => {
     ),
     true,
   );
+});
+
+
+test("delete session sends one authenticated bodyless request to the encoded URL", async () => {
+  const calls = [];
+  const payload = {
+    session_id: "session/value",
+    deleted: true,
+    cleanup_pending: false,
+  };
+  const api = gui.createApiClient({
+    accessToken: "fixed-test-token",
+    fetchImpl: async (request) => {
+      calls.push(request);
+      return Response.json(payload);
+    },
+  });
+
+  assert.deepEqual(await api.deleteSession("session/value"), payload);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://local.invalid/api/v1/sessions/session%2Fvalue");
+  assert.equal(calls[0].method, "DELETE");
+  assert.equal(calls[0].headers.get("authorization"), "Bearer fixed-test-token");
+  assert.equal(calls[0].headers.get("content-type"), null);
+  assert.equal(await calls[0].clone().text(), "");
+});
+
+
+test("delete session failure is stable and is never retried", async () => {
+  const calls = [];
+  const api = gui.createApiClient({
+    accessToken: "fixed-test-token",
+    fetchImpl: async (request) => {
+      calls.push(request);
+      return Response.json(
+        { error: { code: "controller_busy", private: "secret" } },
+        { status: 409 },
+      );
+    },
+  });
+
+  await assert.rejects(
+    api.deleteSession("s1"),
+    (error) => error instanceof gui.WebClientError && error.code === "controller_busy",
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(String(calls[0]).includes("secret"), false);
 });
 
 
@@ -230,6 +426,216 @@ test("session and skill reads use exact authenticated routes", async () => {
     ),
     true,
   );
+});
+
+
+test("skill import sends one authenticated raw zip request", async () => {
+  const calls = [];
+  const archive = new Blob([new Uint8Array([1, 2, 3])], {
+    type: "application/zip",
+  });
+  const api = gui.createApiClient({
+    accessToken: "fixed-test-token",
+    fetchImpl: async (request) => {
+      calls.push(request);
+      return Response.json({ skill_id: "review" }, { status: 201 });
+    },
+  });
+
+  assert.deepEqual(await api.importSkillArchive(archive), { skill_id: "review" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "POST");
+  assert.equal(calls[0].url, "http://local.invalid/api/v1/skills/import");
+  assert.equal(calls[0].headers.get("authorization"), "Bearer fixed-test-token");
+  assert.equal(calls[0].headers.get("content-type"), "application/zip");
+  assert.equal((await calls[0].clone().arrayBuffer()).byteLength, archive.size);
+});
+
+
+test("empty skill catalog imports one archive and auto-selects the new draft skill", async () => {
+  const { document, elements } = controllerFixture();
+  const archive = new Blob(["zip"], { type: "application/zip" });
+  archive.name = "review.zip";
+  let catalogCalls = 0;
+  const imported = [];
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => {
+      catalogCalls += 1;
+      return catalogCalls === 1
+        ? { skills: [], diagnostics: [], usable: true }
+        : {
+            skills: [{
+              skill_id: "review",
+              name: "Review",
+              description: "Review safely.",
+              source: "workspace",
+            }],
+            diagnostics: [],
+            usable: true,
+          };
+    },
+    importSkillArchive: async (file) => {
+      imported.push(file);
+      return { skill_id: "review" };
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+
+  assert.equal(elements.skillEmptyState.hidden, false);
+  elements.skillImportButton.dispatchEvent({ type: "click" });
+  assert.equal(elements.skillFileInput.clickCount, 1);
+  elements.skillFileInput.files = [archive];
+  elements.skillFileInput.value = "review.zip";
+  elements.skillFileInput.dispatchEvent({ type: "change" });
+  await controller.whenIdle();
+
+  assert.deepEqual(imported, [archive]);
+  assert.equal(catalogCalls, 2);
+  assert.deepEqual(controller.getState().selectedSkillIds, ["review"]);
+  assert.equal(elements.skillEmptyState.hidden, true);
+  assert.equal(elements.skillImportStatus.textContent, "已导入 Review");
+  assert.equal(elements.skillFileInput.value, "");
+  controller.destroy();
+});
+
+
+test("skill import is single-flight and persists auto-selection only for an idle session", async () => {
+  const { document, elements } = controllerFixture();
+  const archive = new Blob(["zip"], { type: "application/zip" });
+  let resolveImport;
+  let importCalls = 0;
+  const saved = [];
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Idle", status: "idle", last_run_id: null }],
+    }),
+    listSkills: async () => ({
+      skills: importCalls
+        ? [{ skill_id: "review", name: "Review", description: "", source: "workspace" }]
+        : [],
+      diagnostics: [],
+      usable: true,
+    }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Idle", status: "idle", last_run_id: null },
+      runs: [], events: [], skill_ids: [],
+    }),
+    importSkillArchive: async () => {
+      importCalls += 1;
+      return new Promise((resolve) => { resolveImport = resolve; });
+    },
+    saveSkillSelection: async (sessionId, skillIds) => {
+      saved.push([sessionId, skillIds]);
+      return { skill_ids: skillIds };
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+
+  elements.skillFileInput.files = [archive];
+  elements.skillFileInput.dispatchEvent({ type: "change" });
+  elements.skillFileInput.dispatchEvent({ type: "change" });
+  await Promise.resolve();
+  assert.equal(importCalls, 1);
+  assert.equal(elements.skillImportButton.disabled, true);
+  resolveImport({ skill_id: "review" });
+  await controller.whenIdle();
+
+  assert.deepEqual(saved, [["s1", ["review"]]]);
+  assert.equal(elements.skillImportButton.disabled, false);
+  controller.destroy();
+});
+
+
+test("successful import restores idle selection when automatic persistence fails", async () => {
+  const { document, elements } = controllerFixture();
+  const archive = new Blob(["zip"], { type: "application/zip" });
+  let importCalls = 0;
+  let saveCalls = 0;
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Idle", status: "idle", last_run_id: null }],
+    }),
+    listSkills: async () => ({
+      skills: importCalls
+        ? [{ skill_id: "review", name: "Review", description: "", source: "workspace" }]
+        : [],
+      diagnostics: [],
+      usable: true,
+    }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Idle", status: "idle", last_run_id: null },
+      runs: [], events: [], skill_ids: [],
+    }),
+    importSkillArchive: async () => {
+      importCalls += 1;
+      return { skill_id: "review" };
+    },
+    saveSkillSelection: async () => {
+      saveCalls += 1;
+      throw new gui.WebClientError("invalid_skill_selection");
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+
+  elements.skillFileInput.files = [archive];
+  elements.skillFileInput.dispatchEvent({ type: "change" });
+  await controller.whenIdle();
+
+  assert.equal(importCalls, 1);
+  assert.equal(saveCalls, 1);
+  assert.deepEqual(controller.getState().selectedSkillIds, []);
+  assert.equal(
+    elements.skillImportStatus.textContent,
+    "已导入 Review；自动选择失败：invalid_skill_selection",
+  );
+  controller.destroy();
+});
+
+
+test("skill import is disabled during active runs and exposes only a stable failure code", async () => {
+  const { document, elements } = controllerFixture();
+  let importCalls = 0;
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Busy", status: "running", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    importSkillArchive: async () => {
+      importCalls += 1;
+      throw new gui.WebClientError("invalid_skill_archive");
+    },
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+
+  assert.equal(elements.skillImportButton.disabled, true);
+  elements.skillFileInput.files = [new Blob(["bad"] )];
+  elements.skillFileInput.dispatchEvent({ type: "change" });
+  await controller.whenIdle();
+  assert.equal(importCalls, 0);
+
+  controller.getState().sessions[0].status = "idle";
+  elements.skillFileInput.files = [new Blob(["bad"] )];
+  elements.skillFileInput.dispatchEvent({ type: "change" });
+  await controller.whenIdle();
+  assert.equal(importCalls, 1);
+  assert.equal(elements.skillImportStatus.textContent, "导入失败：invalid_skill_archive");
+  assert.equal(elements.skillFileInput.value, "");
+  controller.destroy();
 });
 
 
@@ -277,10 +683,13 @@ test("initial UI state is safe exact and independent", () => {
     skillDiagnostics: [],
     selectedSkillIds: [],
     selectedRunMode: "modify",
+    selectedBudgetProfile: "standard",
     activeRunId: null,
     lastSequence: 0,
     provisionalText: "",
     activities: [],
+    runProgress: null,
+    transientStatus: null,
     connection: "connecting",
     phase: "waiting",
     errorCode: null,
@@ -314,6 +723,10 @@ function controllerFixture() {
     skillToggle: ["button", "skill-toggle"],
     skillPanel: ["div", "skill-panel"],
     skillSummary: ["span", "skill-summary"],
+    skillImportButton: ["button", "skill-import-button"],
+    skillFileInput: ["input", "skill-file-input"],
+    skillEmptyState: ["p", "skill-empty-state"],
+    skillImportStatus: ["p", "skill-import-status"],
     conversationTitle: ["h1", "conversation-title"],
     runStatus: ["span", "run-status"],
     runPhase: ["span", "run-phase"],
@@ -328,6 +741,9 @@ function controllerFixture() {
     runModeControl: ["div", "run-mode-control"],
     runModeModifyButton: ["button", "run-mode-modify"],
     runModeReadOnlyButton: ["button", "run-mode-read-only"],
+    budgetProfileControl: ["div", "budget-profile-control"],
+    budgetProfileStandardButton: ["button", "budget-profile-standard"],
+    budgetProfileDeepButton: ["button", "budget-profile-deep"],
   })) {
     elements[name] = document.createElement(tag);
     elements[name].setAttribute("id", id);
@@ -336,16 +752,62 @@ function controllerFixture() {
   elements.skillToggle.setAttribute("aria-expanded", "false");
   elements.skillToggle.setAttribute("aria-controls", "skill-panel");
   elements.skillPanel.hidden = true;
+  elements.skillFileInput.files = [];
+  elements.skillFileInput.clickCount = 0;
+  elements.skillFileInput.click = () => {
+    elements.skillFileInput.clickCount += 1;
+  };
   elements.connectionStatus.dataset.visible = "false";
   elements.connectionStatus.setAttribute("aria-hidden", "true");
   elements.runModeModifyButton.dataset.runMode = "modify";
   elements.runModeReadOnlyButton.dataset.runMode = "read_only";
+  elements.budgetProfileStandardButton.dataset.budgetProfile = "standard";
+  elements.budgetProfileDeepButton.dataset.budgetProfile = "deep";
   elements.emptyState = document.createElement("div");
   elements.emptyState.setAttribute("id", "empty-state");
   elements.emptyState.className = "empty-state";
-  elements.emptyState.append(document.createTextNode("把一个清晰的代码任务交给 Agent"));
+  elements.emptyState.append(document.createTextNode("把一个清晰的代码任务交给 MiniCodex"));
   elements.conversationLog.append(elements.emptyState);
   return { document, elements };
+}
+
+
+function sessionSelectButtons(root) {
+  return findElements(root, "button").filter(
+    (button) => button.className === "session-button",
+  );
+}
+
+
+function sessionDeleteButtons(root) {
+  return findElements(root, "button").filter(
+    (button) => button.className === "session-delete-button",
+  );
+}
+
+
+function deletionControllerApi(sessions, { deleteImpl } = {}) {
+  const loads = [];
+  return {
+    loads,
+    listSessions: async () => ({ sessions }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async (sessionId) => {
+      loads.push(sessionId);
+      const session = sessions.find((item) => item.session_id === sessionId);
+      return {
+        session: { ...session },
+        runs: [],
+        events: [],
+        skill_ids: [],
+      };
+    },
+    deleteSession: deleteImpl ?? (async (sessionId) => ({
+      session_id: sessionId,
+      deleted: true,
+      cleanup_pending: false,
+    })),
+  };
 }
 
 
@@ -406,6 +868,262 @@ test("session list renders only a compact title with the full title available", 
 });
 
 
+test("session deletion confirmation uses safe title and false sends no request", async () => {
+  const { document, elements } = controllerFixture();
+  const sessions = [
+    { session_id: "s1", title: "<b>Plain title</b>", status: "idle", last_run_id: null },
+  ];
+  const deleted = [];
+  const confirmations = [];
+  const api = deletionControllerApi(sessions, {
+    deleteImpl: async (sessionId) => {
+      deleted.push(sessionId);
+      return { session_id: sessionId, deleted: true, cleanup_pending: false };
+    },
+  });
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    confirmDelete: (message) => confirmations.push(message) && false,
+  });
+  await controller.initialize();
+
+  const deleteButton = sessionDeleteButtons(elements.sessionList)[0];
+  elements.sessionList.dispatchEvent({ type: "click", target: deleteButton });
+  await controller.whenIdle();
+
+  assert.deepEqual(confirmations, ["确定删除会话“<b>Plain title</b>”？此操作无法撤销。"]);
+  assert.deepEqual(deleted, []);
+  assert.equal(controller.getState().sessions.length, 1);
+  assert.equal(findElements(elements.sessionList, "b").length, 0);
+  controller.destroy();
+});
+
+
+test("confirmed deletion is single-flight and disables every delete control", async () => {
+  const { document, elements } = controllerFixture();
+  const sessions = [
+    { session_id: "s1", title: "First", status: "idle", last_run_id: null },
+    { session_id: "s2", title: "Second", status: "idle", last_run_id: null },
+  ];
+  let releaseDelete;
+  const pendingDelete = new Promise((resolve) => {
+    releaseDelete = resolve;
+  });
+  const calls = [];
+  const api = deletionControllerApi(sessions, {
+    deleteImpl: async (sessionId) => {
+      calls.push(sessionId);
+      return pendingDelete;
+    },
+  });
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    confirmDelete: () => true,
+  });
+  await controller.initialize();
+
+  const first = sessionDeleteButtons(elements.sessionList)[0];
+  elements.sessionList.dispatchEvent({ type: "click", target: first });
+  elements.sessionList.dispatchEvent({ type: "click", target: first });
+  await Promise.resolve();
+
+  assert.deepEqual(calls, ["s1"]);
+  assert.equal(
+    sessionDeleteButtons(elements.sessionList).every((button) => button.disabled),
+    true,
+  );
+  releaseDelete({ session_id: "s1", deleted: true, cleanup_pending: false });
+  await controller.whenIdle();
+  assert.deepEqual(controller.getState().sessions.map((item) => item.session_id), ["s2"]);
+  controller.destroy();
+});
+
+
+for (const status of ["running", "cancelling"]) {
+  test(`active ${status} state disables every delete control`, async () => {
+    const { document, elements } = controllerFixture();
+    const sessions = [
+      { session_id: "active", title: "Active", status, last_run_id: "r1" },
+      { session_id: "idle", title: "Idle", status: "idle", last_run_id: null },
+    ];
+    const calls = [];
+    const api = deletionControllerApi(sessions, {
+      deleteImpl: async (sessionId) => calls.push(sessionId),
+    });
+    const controller = gui.createUiController({
+      document,
+      elements,
+      api,
+      confirmDelete: () => true,
+    });
+    await controller.initialize();
+
+    const buttons = sessionDeleteButtons(elements.sessionList);
+    assert.equal(buttons.length, 2);
+    assert.equal(buttons.every((button) => button.disabled), true);
+    elements.sessionList.dispatchEvent({ type: "click", target: buttons[1] });
+    await controller.whenIdle();
+    assert.deepEqual(calls, []);
+    controller.destroy();
+  });
+}
+
+
+test("deleting an unselected row preserves the selected session without reload", async () => {
+  const { document, elements } = controllerFixture();
+  const sessions = [
+    { session_id: "s1", title: "First", status: "idle", last_run_id: null },
+    { session_id: "s2", title: "Selected", status: "idle", last_run_id: null },
+    { session_id: "s3", title: "Third", status: "idle", last_run_id: null },
+  ];
+  const api = deletionControllerApi(sessions);
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    confirmDelete: () => true,
+  });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: sessionSelectButtons(elements.sessionList)[1],
+  });
+  await controller.whenIdle();
+
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: sessionDeleteButtons(elements.sessionList)[0],
+  });
+  await controller.whenIdle();
+
+  assert.equal(controller.getState().selectedSessionId, "s2");
+  assert.deepEqual(api.loads, ["s2"]);
+  assert.deepEqual(controller.getState().sessions.map((item) => item.session_id), ["s2", "s3"]);
+  controller.destroy();
+});
+
+
+test("selected deletion chooses next then previous and last enters empty state", async () => {
+  for (const scenario of [
+    { ids: ["s1", "s2", "s3"], selected: "s2", expected: "s3" },
+    { ids: ["s1", "s2"], selected: "s2", expected: "s1" },
+    { ids: ["s1"], selected: "s1", expected: null },
+  ]) {
+    const { document, elements } = controllerFixture();
+    const sessions = scenario.ids.map((sessionId) => ({
+      session_id: sessionId,
+      title: sessionId,
+      status: "idle",
+      last_run_id: null,
+    }));
+    const api = deletionControllerApi(sessions);
+    const controller = gui.createUiController({
+      document,
+      elements,
+      api,
+      confirmDelete: () => true,
+    });
+    await controller.initialize();
+    const selectedIndex = scenario.ids.indexOf(scenario.selected);
+    elements.sessionList.dispatchEvent({
+      type: "click",
+      target: sessionSelectButtons(elements.sessionList)[selectedIndex],
+    });
+    await controller.whenIdle();
+    elements.sessionList.dispatchEvent({
+      type: "click",
+      target: sessionDeleteButtons(elements.sessionList)[selectedIndex],
+    });
+    await controller.whenIdle();
+
+    assert.equal(controller.getState().selectedSessionId, scenario.expected);
+    if (scenario.expected === null) {
+      assert.equal(controller.getState().selectedSession, null);
+      assert.deepEqual(elements.conversationLog.childNodes, [elements.emptyState]);
+    } else {
+      assert.equal(api.loads.at(-1), scenario.expected);
+    }
+    controller.destroy();
+  }
+});
+
+
+test("delete failure preserves row and selection", async () => {
+  const { document, elements } = controllerFixture();
+  const sessions = [
+    { session_id: "s1", title: "Keep", status: "idle", last_run_id: null },
+  ];
+  const api = deletionControllerApi(sessions, {
+    deleteImpl: async () => {
+      throw new gui.WebClientError("controller_busy");
+    },
+  });
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    confirmDelete: () => true,
+  });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: sessionSelectButtons(elements.sessionList)[0],
+  });
+  await controller.whenIdle();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: sessionDeleteButtons(elements.sessionList)[0],
+  });
+  await controller.whenIdle();
+
+  assert.equal(controller.getState().selectedSessionId, "s1");
+  assert.deepEqual(controller.getState().sessions.map((item) => item.session_id), ["s1"]);
+  assert.equal(elements.connectionStatus.textContent, "请求失败：controller_busy");
+  controller.destroy();
+});
+
+
+test("cleanup pending renders only the fixed local warning", async () => {
+  const { document, elements } = controllerFixture();
+  const sessions = [
+    { session_id: "s1", title: "Delete", status: "idle", last_run_id: null },
+  ];
+  const api = deletionControllerApi(sessions, {
+    deleteImpl: async () => ({
+      session_id: "s1",
+      deleted: true,
+      cleanup_pending: true,
+      warning_code: "private-provider-warning",
+      private: "D:\\secret\\staging",
+    }),
+  });
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    confirmDelete: () => true,
+  });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: sessionDeleteButtons(elements.sessionList)[0],
+  });
+  await controller.whenIdle();
+
+  assert.equal(
+    elements.connectionStatus.textContent,
+    "会话已删除；部分本地日志将在下次启动时继续清理。",
+  );
+  assert.equal(elements.connectionStatus.textContent.includes("private"), false);
+  assert.equal(elements.connectionStatus.textContent.includes("secret"), false);
+  controller.destroy();
+});
+
+
 test("no selected session keeps the start prompt after initialization and reset", async () => {
   const { document, elements } = controllerFixture();
   const api = {
@@ -436,7 +1154,7 @@ test("no selected session keeps the start prompt after initialization and reset"
   assert.deepEqual(elements.conversationLog.childNodes, [elements.emptyState]);
   assert.equal(
     elements.conversationLog.textContent,
-    "把一个清晰的代码任务交给 Agent",
+    "把一个清晰的代码任务交给 MiniCodex",
   );
   controller.destroy();
 });
@@ -525,6 +1243,63 @@ test("controller captures selected read-only mode and locks it during a run", as
   assert.deepEqual(calls, [{ message: "Inspect", skillIds: [], runMode: "read_only" }]);
   assert.equal(elements.runModeModifyButton.disabled, true);
   assert.equal(elements.runModeReadOnlyButton.disabled, true);
+  controller.destroy();
+});
+
+
+test("budget profile defaults standard and is sent per run", async () => {
+  const { document, elements } = controllerFixture();
+  const calls = [];
+  const api = {
+    listSessions: async () => ({ sessions: [] }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    createSession: async (message, skillIds, runMode, budgetProfile) => {
+      calls.push({ message, skillIds, runMode, budgetProfile });
+      return {
+        session_id: "s1",
+        run_id: "r1",
+        run_mode: runMode,
+        budget_profile: budgetProfile,
+      };
+    },
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Inspect", status: "running", last_run_id: "r1" },
+      runs: [{
+        run_id: "r1",
+        status: "running",
+        run_mode: "modify",
+        budget_profile: "deep",
+        started_at_utc: null,
+      }],
+      events: [{ run_id: "r1", sequence: 1, kind: "user_message", data: { content: "Inspect" } }],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({
+    document,
+    elements,
+    api,
+    streamConsumer: async () => "terminal",
+  });
+  await controller.initialize();
+
+  assert.equal(controller.getState().selectedBudgetProfile, "standard");
+  elements.budgetProfileControl.dispatchEvent({
+    type: "click",
+    target: elements.budgetProfileDeepButton,
+  });
+  elements.messageInput.value = "Inspect";
+  elements.messageComposer.dispatchEvent(submitEvent());
+  await controller.whenIdle();
+
+  assert.deepEqual(calls, [{
+    message: "Inspect",
+    skillIds: [],
+    runMode: "modify",
+    budgetProfile: "deep",
+  }]);
+  assert.equal(elements.budgetProfileStandardButton.disabled, true);
+  assert.equal(elements.budgetProfileDeepButton.disabled, true);
   controller.destroy();
 });
 
@@ -752,8 +1527,12 @@ test("an active session locks mutations but keeps history navigation enabled", a
 
   assert.equal(elements.sendButton.disabled, true);
   assert.equal(findElements(elements.skillList, "input")[0].disabled, true);
-  const buttons = findElements(elements.sessionList, "button");
+  const buttons = sessionSelectButtons(elements.sessionList);
   assert.equal(buttons.every((button) => !button.disabled), true);
+  assert.equal(
+    sessionDeleteButtons(elements.sessionList).every((button) => button.disabled),
+    true,
+  );
   elements.sessionList.dispatchEvent({ type: "click", target: buttons[1] });
   await controller.whenIdle();
   assert.equal(controller.getState().selectedSessionId, "idle");
@@ -821,6 +1600,74 @@ test("controller renders only the safe terminal reason for a failed run", async 
   assert.equal(rendered.includes("运行失败"), true);
   assert.equal(rendered.includes("invalid_model_response"), true);
   assert.equal(rendered.includes("must-not-render"), false);
+});
+
+
+test("unverified changes render one actionable terminal card after reload", async () => {
+  const { document, elements } = controllerFixture();
+  const api = {
+    listSessions: async () => ({
+      sessions: [{ session_id: "s1", title: "Pending", status: "idle", last_run_id: "r1" }],
+    }),
+    listSkills: async () => ({ skills: [], diagnostics: [], usable: true }),
+    loadSession: async () => ({
+      session: { session_id: "s1", title: "Pending", status: "idle", last_run_id: "r1" },
+      runs: [{
+        run_id: "r1",
+        status: "failed",
+        agent_status: "failed",
+        termination_reason: "changes_unverified",
+        final_report: {
+          changed_paths: ["task_manager.py"],
+          verification: { status: "stale" },
+        },
+      }],
+      events: [
+        {
+          run_id: "r1",
+          sequence: 1,
+          kind: "user_message",
+          data: { content: "write a Python file" },
+        },
+        {
+          run_id: "r1",
+          sequence: 2,
+          kind: "tool_activity",
+          data: {
+            tool_name: "run_command",
+            status: "rejected",
+            duration_ms: 0,
+            exit_code: null,
+            timed_out: false,
+            truncated: false,
+            safe_error_code: "executable_denied",
+            changed_paths: [],
+          },
+        },
+      ],
+      skill_ids: [],
+    }),
+  };
+  const controller = gui.createUiController({ document, elements, api });
+  await controller.initialize();
+  elements.sessionList.dispatchEvent({
+    type: "click",
+    target: findElements(elements.sessionList, "button")[0],
+  });
+  await controller.whenIdle();
+
+  const cards = findElements(elements.conversationLog, "div").filter(
+    (element) => element.classList.contains("activity-card--changes-unverified"),
+  );
+  const rendered = elements.conversationLog.textContent;
+  controller.destroy();
+
+  assert.equal(cards.length, 1);
+  assert.match(rendered, /修改待验证/);
+  assert.match(rendered, /task_manager\.py/);
+  assert.match(rendered, /尚未执行或尚未通过/);
+  assert.match(rendered, /executable_denied/);
+  assert.doesNotMatch(rendered, /运行失败/);
 });
 
 
@@ -1307,6 +2154,77 @@ test("SSE reducer handles provisional confirmed discarded activity and terminal 
 });
 
 
+test("active header projects phase budgets and checkpoint without an activity bubble", () => {
+  const { document, elements } = controllerFixture();
+  const state = gui.createInitialUiState();
+  const run = {
+    run_id: "r1",
+    status: "running",
+    budget_profile: "standard",
+  };
+  state.activeRunId = "r1";
+  state.selectedSession = {
+    session: { session_id: "s1", status: "running", last_run_id: "r1" },
+    runs: [run],
+    events: [],
+  };
+
+  gui.reduceSessionUpdate(state, reducerFrame(1, "run_progress", {
+    budget_profile: "standard",
+    phase: "discover",
+    main_model_calls: 8,
+    main_model_limit: 24,
+    summary_model_calls: 1,
+    summary_model_limit: 4,
+    provider_attempts: 10,
+    provider_attempt_limit: 48,
+    tool_calls: 17,
+    tool_limit: 80,
+  }));
+  gui.reduceSessionUpdate(state, reducerFrame(2, "decision_checkpoint", {
+    reason: "exploration_limit",
+    phase: "discover",
+    main_calls_remaining: 16,
+  }));
+  gui.renderRunHeader(
+    document,
+    elements,
+    run,
+    state.phase,
+    state.runProgress,
+    state.transientStatus,
+  );
+
+  assert.match(elements.runPhase.textContent, /调查中.*标准.*8\/24.*17\/80/);
+  assert.equal(elements.runStatus.textContent, "根据已有信息作出决策");
+  assert.deepEqual(state.activities, []);
+});
+
+
+test("terminal update clears transient convergence status", () => {
+  const state = gui.createInitialUiState();
+  state.activeRunId = "r1";
+  state.selectedSession = {
+    session: { session_id: "s1", status: "running", last_run_id: "r1" },
+    runs: [{ run_id: "r1", status: "running", budget_profile: "deep" }],
+    events: [],
+  };
+  gui.reduceSessionUpdate(state, reducerFrame(1, "decision_checkpoint", {
+    reason: "final_call_reserve",
+    phase: "act",
+    main_calls_remaining: 4,
+  }));
+  gui.reduceSessionUpdate(state, reducerFrame(2, "run_finished", {
+    status: "succeeded",
+    agent_status: "answered",
+  }));
+
+  assert.equal(state.transientStatus, null);
+  assert.equal(state.runProgress, null);
+  assert.deepEqual(state.activities, []);
+});
+
+
 test("live narration and tool activity replace one another in one card", () => {
   const state = gui.createInitialUiState();
   state.activeRunId = "r1";
@@ -1595,7 +2513,7 @@ test("controller owns one stream and history navigation only aborts that stream"
     document, elements, api, streamConsumer,
   });
   await controller.initialize();
-  const buttons = findElements(elements.sessionList, "button");
+  const buttons = sessionSelectButtons(elements.sessionList);
   elements.sessionList.dispatchEvent({ type: "click", target: buttons[0] });
   await controller.whenIdle();
   assert.equal(streamCalls.length, 1);

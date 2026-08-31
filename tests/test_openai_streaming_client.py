@@ -28,6 +28,7 @@ from coding_agent.messages import (
 from coding_agent.model import (
     FatalModelError,
     ModelCallBudget,
+    ModelOutputLimitError,
     TransientModelError,
 )
 from coding_agent.openai_client import (
@@ -481,11 +482,10 @@ def test_responses_stream_replays_and_extends_continuation_without_duplicate_cal
     [
         (),
         (ns(type="response.failed"),),
-        (ns(type="response.incomplete"),),
         (ns(type="error"),),
         (ns(type="unsupported.output.delta", delta="x"),),
     ],
-    ids=["empty", "failed", "incomplete", "error", "unknown"],
+    ids=["empty", "failed", "error", "unknown"],
 )
 def test_responses_stream_rejects_invalid_terminal_shapes(
     stream_events: tuple[object, ...],
@@ -503,6 +503,42 @@ def test_responses_stream_rejects_invalid_terminal_shapes(
             lambda event: None,
         )
 
+    assert stream.closed is True
+
+
+def test_responses_stream_incomplete_output_limit_discards_partial_text() -> None:
+    terminal = ns(
+        id="resp-limited",
+        status="incomplete",
+        error=None,
+        incomplete_details=ns(reason="max_output_tokens"),
+        output=[],
+        usage=None,
+    )
+    events: list[ModelStreamEvent] = []
+    stream = FakeStream(
+        (
+            ns(type="response.output_text.delta", delta="private partial"),
+            ns(type="response.incomplete", response=terminal),
+        )
+    )
+    client = OpenAIResponsesClient(
+        model="test-model",
+        api_key="not-real",
+        sdk_client=FakeSDK(stream),
+    )
+
+    with pytest.raises(ModelOutputLimitError, match="output token limit") as caught:
+        client.stream(
+            ModelRequest(messages=(UserMessage("task"),)),
+            events.append,
+        )
+
+    assert "private partial" not in str(caught.value)
+    assert [event.kind for event in events] == [
+        ModelStreamEventKind.TEXT_DELTA,
+        ModelStreamEventKind.RESPONSE_DISCARDED,
+    ]
     assert stream.closed is True
 
 

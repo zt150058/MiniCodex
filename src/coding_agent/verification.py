@@ -7,10 +7,16 @@ from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 import sys
+import tomllib
 from typing import Protocol
 
 from coding_agent.messages import AssistantMessage, JSONObject, ToolCall, ToolResult
-from coding_agent.safety import AuthorizedCommand, CommandSource
+from coding_agent.safety import (
+    AuthorizedCommand,
+    CommandSource,
+    PathGuard,
+    SafetyViolation,
+)
 from coding_agent.state import AgentState, VerificationStatus
 from coding_agent.tools.base import ExecutionContext, ToolExecution
 from coding_agent.tools.shell import AuthorizedCommandExecutor, CommandStartError
@@ -28,6 +34,8 @@ _ERROR_CODES = frozenset(
     {"verification_command_start_failed", "verification_internal_error"}
 )
 _NON_EVIDENCE_ARGUMENTS = frozenset({"-h", "--help", "-V", "--version"})
+_LOCAL_INTEGRITY_COMMAND = "builtin:validate_changed_files"
+_LOCAL_INTEGRITY_MAX_BYTES = 524_288
 
 
 def _same_executable(left: str, right: str) -> bool:
@@ -514,6 +522,96 @@ class VerificationGate:
     def requires_execution(self) -> bool:
         return self._required_command is not None
 
+    def requires_local_integrity(self, state: AgentState) -> bool:
+        if not isinstance(state, AgentState):
+            raise TypeError("state must be AgentState")
+        return (
+            self._required_command is None
+            and state.has_unverified_changes
+            and bool(state.modified_paths)
+            and (
+                state.last_verification is None
+                or state.last_verification.source
+                is CommandSource.LOCAL_INTEGRITY
+            )
+            and not (
+                state.last_verification is not None
+                and state.last_verification.validation_index == state.mutation_index
+            )
+        )
+
+    def _evaluate_local_integrity(self, state: AgentState) -> VerificationResult:
+        checked_paths: list[str] = []
+        syntax_checked: list[str] = []
+        failure: tuple[str, str] | None = None
+        try:
+            guard = PathGuard(self._execution_context.workspace)
+            for relative_path in state.modified_paths:
+                guarded = guard.existing_file(relative_path)
+                with guarded.absolute.open("rb") as stream:
+                    raw = stream.read(_LOCAL_INTEGRITY_MAX_BYTES + 1)
+                if len(raw) > _LOCAL_INTEGRITY_MAX_BYTES:
+                    failure = (guarded.relative, "file_too_large")
+                    break
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    failure = (guarded.relative, "invalid_utf8")
+                    break
+                if "\x00" in text:
+                    failure = (guarded.relative, "binary_content")
+                    break
+                suffix = guarded.absolute.suffix.casefold()
+                try:
+                    if suffix == ".py":
+                        compile(text, guarded.relative, "exec")
+                        syntax_checked.append(guarded.relative)
+                    elif suffix == ".json":
+                        json.loads(text)
+                        syntax_checked.append(guarded.relative)
+                    elif suffix == ".toml":
+                        tomllib.loads(text)
+                        syntax_checked.append(guarded.relative)
+                except (SyntaxError, json.JSONDecodeError, tomllib.TOMLDecodeError):
+                    failure = (guarded.relative, "invalid_syntax")
+                    break
+                checked_paths.append(guarded.relative)
+        except (OSError, RuntimeError, SafetyViolation, TypeError, ValueError):
+            failure = ("", "invalid_changed_path")
+
+        payload: JSONObject = {
+            "checked_paths": checked_paths,
+            "syntax_checked": syntax_checked,
+        }
+        if failure is not None:
+            failed_path, reason = failure
+            payload["failure"] = {
+                "path": failed_path,
+                "reason": reason,
+            }
+        return VerificationResult(
+            status=(
+                VerificationStatus.PASSED
+                if failure is None
+                else VerificationStatus.FAILED
+            ),
+            validation_index=state.mutation_index,
+            command=_LOCAL_INTEGRITY_COMMAND,
+            source=CommandSource.LOCAL_INTEGRITY,
+            exit_code=0 if failure is None else 1,
+            stdout=json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            stderr="",
+            timed_out=False,
+            truncated=False,
+            duration_ms=0,
+            error=None,
+        )
+
     def observe_tool_result(
         self,
         state: AgentState,
@@ -604,6 +702,25 @@ class VerificationGate:
             ):
                 return VerificationDecision(
                     VerificationOutcome.SUCCESS, result, None, False
+                )
+            if self.requires_local_integrity(state):
+                state.verification_attempt_count += 1
+                state.verification_status = VerificationStatus.RUNNING
+                result = self._evaluate_local_integrity(state)
+                state.last_verification = result
+                state.verification_status = result.status
+                if result.status is VerificationStatus.PASSED:
+                    return VerificationDecision(
+                        VerificationOutcome.SUCCESS,
+                        result,
+                        None,
+                        True,
+                    )
+                return VerificationDecision(
+                    VerificationOutcome.CONTINUE,
+                    result,
+                    _feedback(result, state.mutation_index),
+                    True,
                 )
             return VerificationDecision(
                 VerificationOutcome.CONTINUE,

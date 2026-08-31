@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 from threading import Thread
+from typing import get_type_hints
 
 import pytest
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.run_mode import RunMode
 from coding_agent.session import (
     NewSessionEvent,
@@ -22,7 +25,12 @@ from coding_agent.session import (
     SessionStoreError,
     make_safe_run_summary,
 )
-from coding_agent.session_store import SQLiteSessionStore, WorkspaceSessionLease
+from coding_agent.session_store import (
+    SQLiteSessionStore,
+    SessionDeletionManifest,
+    SessionStore,
+    WorkspaceSessionLease,
+)
 from coding_agent.skills import (
     RunSkillSnapshotMetadata,
     SkillDescriptor,
@@ -31,6 +39,77 @@ from coding_agent.skills import (
 
 
 NOW = datetime(2026, 8, 29, 8, 0, tzinfo=timezone.utc)
+SESSION_ID = "1" * 32
+RUN_ID = "2" * 32
+AUDIT_ID = "a" * 32
+
+
+def test_session_deletion_manifest_is_immutable_ordered_and_private() -> None:
+    manifest = SessionDeletionManifest(
+        session_id=SESSION_ID,
+        run_ids=(RUN_ID, "3" * 32),
+        audit_run_ids=(AUDIT_ID, "b" * 32),
+    )
+
+    assert manifest.session_id == SESSION_ID
+    assert manifest.run_ids == (RUN_ID, "3" * 32)
+    assert manifest.audit_run_ids == (AUDIT_ID, "b" * 32)
+    assert "workspace" not in repr(manifest)
+    with pytest.raises(Exception):
+        manifest.session_id = "4" * 32  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    (
+        ("session_id", "invalid", ValueError),
+        ("run_ids", [RUN_ID], TypeError),
+        ("run_ids", ("invalid",), ValueError),
+        ("run_ids", (RUN_ID, RUN_ID), ValueError),
+        ("audit_run_ids", [AUDIT_ID], TypeError),
+        ("audit_run_ids", ("invalid",), ValueError),
+        ("audit_run_ids", (AUDIT_ID, AUDIT_ID), ValueError),
+    ),
+)
+def test_session_deletion_manifest_rejects_invalid_ids_and_collections(
+    field: str,
+    value: object,
+    error: type[Exception],
+) -> None:
+    values: dict[str, object] = {
+        "session_id": SESSION_ID,
+        "run_ids": (RUN_ID,),
+        "audit_run_ids": (AUDIT_ID,),
+    }
+    values[field] = value
+    with pytest.raises(error):
+        SessionDeletionManifest(**values)  # type: ignore[arg-type]
+
+
+def test_session_store_protocol_exposes_exact_deletion_signatures() -> None:
+    assert {
+        "get_session_deletion_manifest",
+        "session_exists",
+        "delete_session",
+    } <= SessionStore.__dict__.keys()
+    get_manifest = inspect.signature(SessionStore.get_session_deletion_manifest)
+    exists = inspect.signature(SessionStore.session_exists)
+    delete = inspect.signature(SessionStore.delete_session)
+    assert tuple(get_manifest.parameters) == ("self", "session_id")
+    assert tuple(exists.parameters) == ("self", "session_id")
+    assert tuple(delete.parameters) == ("self", "manifest")
+    assert get_type_hints(SessionStore.get_session_deletion_manifest) == {
+        "session_id": str,
+        "return": SessionDeletionManifest,
+    }
+    assert get_type_hints(SessionStore.session_exists) == {
+        "session_id": str,
+        "return": bool,
+    }
+    assert get_type_hints(SessionStore.delete_session) == {
+        "manifest": SessionDeletionManifest,
+        "return": type(None),
+    }
 
 
 def safe_tool_activity() -> dict[str, object]:
@@ -48,11 +127,15 @@ def safe_tool_activity() -> dict[str, object]:
 def persisted_failed_report(
     audit_run_id: str,
     reason: str = "empty_model_response",
+    *,
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD,
 ) -> dict[str, object]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "run_id": audit_run_id,
         "run_mode": "modify",
+        "budget_profile": budget_profile.value,
+        "phase": "discover",
         "status": "failed",
         "exit_code": 1,
         "termination_reason": reason,
@@ -69,7 +152,10 @@ def persisted_failed_report(
             "validation_index": None,
             "error_code": None,
         },
+        "main_model_calls": 0,
+        "summary_model_calls": 0,
         "logical_model_calls": 0,
+        "summary_provider_attempts": 0,
         "provider_attempts": 0,
         "tool_calls": 0,
         "verification_attempts": 0,
@@ -90,15 +176,25 @@ def persisted_failed_report(
 def _persisted_terminal_report(
     audit_run_id: str,
     mode: RunMode,
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD,
+    *,
+    agent_status: str | None = None,
 ) -> dict[str, object]:
-    report = persisted_failed_report(audit_run_id)
+    report = persisted_failed_report(
+        audit_run_id,
+        budget_profile=budget_profile,
+    )
     report["run_mode"] = mode.value
+    report["phase"] = "finish"
+    selected_status = agent_status or (
+        "answered" if mode is RunMode.READ_ONLY else "success"
+    )
     report.update(
-        status="answered" if mode is RunMode.READ_ONLY else "success",
+        status=selected_status,
         exit_code=0,
         termination_reason=None,
     )
-    if mode is RunMode.MODIFY:
+    if selected_status == "success":
         report.update(validation_index=0, verification_attempts=1)
         report["verification"] = {
             "status": "passed",
@@ -113,23 +209,55 @@ def _persisted_terminal_report(
     return report
 
 
-def _terminal_result(run_id: str, mode: RunMode) -> SessionRunResult:
+def _terminal_result(
+    run_id: str,
+    mode: RunMode,
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD,
+    *,
+    agent_status: str | None = None,
+) -> SessionRunResult:
     audit_run_id = "f" * 32
-    report = _persisted_terminal_report(audit_run_id, mode)
-    agent_status = "answered" if mode is RunMode.READ_ONLY else "success"
+    report = _persisted_terminal_report(
+        audit_run_id,
+        mode,
+        budget_profile,
+        agent_status=agent_status,
+    )
+    selected_status = agent_status or (
+        "answered" if mode is RunMode.READ_ONLY else "success"
+    )
     return SessionRunResult(
         run_id=run_id,
         status=SessionRunStatus.SUCCEEDED,
-        agent_status=agent_status,
+        agent_status=selected_status,
         termination_reason=None,
         audit_run_id=audit_run_id,
         safe_summary=make_safe_run_summary(
             report,
-            status=agent_status,
+            status=selected_status,
             termination_reason=None,
         ),
         final_report=report,
     )
+
+
+def test_finish_modify_run_accepts_zero_mutation_answered_result(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("question", run_mode=RunMode.MODIFY)
+
+    terminal = store.finish_run(
+        _terminal_result(
+            submission.run.run_id,
+            RunMode.MODIFY,
+            agent_status="answered",
+        )
+    )
+
+    assert terminal.status is SessionRunStatus.SUCCEEDED
+    assert terminal.agent_status == "answered"
+    assert terminal.final_report is not None
+    assert terminal.final_report["run_mode"] == "modify"
 
 
 @pytest.mark.parametrize("mode", tuple(RunMode))
@@ -167,13 +295,43 @@ def test_interrupted_read_only_recovery_preserves_mode(tmp_path: Path) -> None:
     assert store.get_run(submission.run.run_id).run_mode is RunMode.READ_ONLY
 
 
+@pytest.mark.parametrize("profile", tuple(BudgetProfile))
+def test_budget_profile_survives_create_start_finish_and_reopen(
+    tmp_path: Path,
+    profile: BudgetProfile,
+) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("message", budget_profile=profile)
+    run_id = submission.run.run_id
+
+    assert submission.run.budget_profile is profile
+    assert store.list_runs(submission.session.session_id)[0].budget_profile is profile
+    assert store.start_run(run_id).budget_profile is profile
+    assert store.finish_run(
+        _terminal_result(run_id, RunMode.MODIFY, profile)
+    ).budget_profile is profile
+
+    reopened = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    reopened.initialize()
+    assert reopened.get_run(run_id).budget_profile is profile
+
+
 def _version_1_report(
     audit_run_id: str,
     *,
     successful: bool,
 ) -> dict[str, object]:
     report = persisted_failed_report(audit_run_id)
-    report.pop("run_mode")
+    for field_name in (
+        "run_mode",
+        "budget_profile",
+        "phase",
+        "main_model_calls",
+        "summary_model_calls",
+        "summary_provider_attempts",
+    ):
+        report.pop(field_name)
     report["schema_version"] = 1
     if successful:
         report.update(
@@ -203,6 +361,24 @@ def _database_path(tmp_path: Path) -> Path:
 def _database_user_version(tmp_path: Path) -> int:
     with sqlite3.connect(_database_path(tmp_path)) as connection:
         return int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _create_version_3_store(tmp_path: Path) -> str:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    run_id = store.create_session("historical v3").run.run_id
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(session_runs)")
+        }
+        if "budget_profile" in columns:
+            connection.execute(
+                "ALTER TABLE session_runs DROP COLUMN budget_profile"
+            )
+        connection.execute("PRAGMA user_version = 3")
+        connection.commit()
+    return run_id
 
 
 def _session_run_columns(tmp_path: Path) -> tuple[str, ...]:
@@ -278,7 +454,7 @@ def _create_real_version_2_database(
         connection.commit()
 
 
-def test_fresh_store_schema_v3_persists_each_run_mode(tmp_path: Path) -> None:
+def test_fresh_store_schema_v4_persists_each_run_mode(tmp_path: Path) -> None:
     store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
     store.initialize()
     modify = store.create_session("modify", run_mode=RunMode.MODIFY)
@@ -291,7 +467,61 @@ def test_fresh_store_schema_v3_persists_each_run_mode(tmp_path: Path) -> None:
 
     assert store.get_run(modify.run.run_id).run_mode is RunMode.MODIFY
     assert store.get_run(readonly.run.run_id).run_mode is RunMode.READ_ONLY
-    assert _database_user_version(tmp_path) == 3
+    assert _database_user_version(tmp_path) == 4
+
+
+def test_fresh_schema_v4_persists_exact_budget_profiles(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    standard = store.create_session(
+        "one",
+        budget_profile=BudgetProfile.STANDARD,
+    )
+    store.recover_incomplete_runs()
+    deep = store.submit_message(
+        standard.session.session_id,
+        "two",
+        budget_profile=BudgetProfile.DEEP,
+    )
+
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        values = connection.execute(
+            "SELECT budget_profile FROM session_runs ORDER BY ordinal"
+        ).fetchall()
+    assert version == 4
+    assert [row[0] for row in values] == ["standard", "deep"]
+
+
+def test_schema_v3_migrates_historical_runs_to_standard_atomically(
+    tmp_path: Path,
+) -> None:
+    run_id = _create_version_3_store(tmp_path)
+
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+
+    assert store.get_run(run_id).budget_profile is BudgetProfile.STANDARD
+    assert _database_user_version(tmp_path) == 4
+
+
+def test_schema_v4_rejects_corrupt_budget_profile_without_partial_state(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    run = store.create_session("one").run
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE session_runs SET budget_profile = 'unlimited' WHERE run_id = ?",
+            (run.run_id,),
+        )
+        connection.commit()
+
+    with pytest.raises(SessionStoreError) as captured:
+        SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW).get_run(run.run_id)
+    assert captured.value.code == "database_corrupt"
 
 
 def test_version_2_store_migrates_runs_and_reports_atomically(
@@ -314,9 +544,14 @@ def test_version_2_store_migrates_runs_and_reports_atomically(
         ).fetchall()
     assert [row["run_mode"] for row in rows] == ["modify", "modify"]
     reports = [json.loads(row["final_report_json"]) for row in rows]
-    assert all(report["schema_version"] == 2 for report in reports)
+    assert all(report["schema_version"] == 3 for report in reports)
     assert all(report["run_mode"] == "modify" for report in reports)
-    assert _database_user_version(tmp_path) == 3
+    assert all(report["budget_profile"] == "standard" for report in reports)
+    assert all(report["phase"] is None for report in reports)
+    assert all(report["main_model_calls"] is None for report in reports)
+    assert all(report["summary_model_calls"] is None for report in reports)
+    assert all(report["summary_provider_attempts"] is None for report in reports)
+    assert _database_user_version(tmp_path) == 4
 
 
 def test_invalid_historical_report_rolls_back_entire_migration(
@@ -349,11 +584,11 @@ def test_fresh_schema_v3_rejects_invalid_run_mode_values(
             )
 
 
-def test_schema_newer_than_v3_is_rejected(tmp_path: Path) -> None:
+def test_schema_newer_than_v4_is_rejected(tmp_path: Path) -> None:
     internal = tmp_path / ".coding-agent"
     internal.mkdir()
     with sqlite3.connect(internal / "sessions.sqlite3") as connection:
-        connection.execute("PRAGMA user_version = 4")
+        connection.execute("PRAGMA user_version = 5")
     with pytest.raises(SessionStoreError) as captured:
         SQLiteSessionStore(tmp_path).initialize()
     assert captured.value.code == "schema_unsupported"
@@ -366,7 +601,7 @@ def test_initialize_creates_versioned_wal_database(tmp_path: Path) -> None:
     database = tmp_path / ".coding-agent" / "sessions.sqlite3"
     assert database.is_file()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
         names = {
             row[0]
             for row in connection.execute(
@@ -401,7 +636,7 @@ def test_initialize_migrates_v1_sessions_to_empty_skill_selection(
     assert migrated.get_skill_selection(submission.session.session_id) == ()
     assert migrated.get_run_skill_snapshots(submission.run.run_id) == ()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
 
 
 def test_skill_reads_distinguish_missing_parent_from_empty_children(
@@ -830,6 +1065,253 @@ def deterministic_store(tmp_path: Path) -> SQLiteSessionStore:
     return store
 
 
+def _failed_deletion_result(run_id: str, audit_run_id: str) -> SessionRunResult:
+    return SessionRunResult(
+        run_id=run_id,
+        status=SessionRunStatus.FAILED,
+        agent_status="failed",
+        termination_reason="empty_model_response",
+        audit_run_id=audit_run_id,
+        safe_summary=make_safe_run_summary(
+            None,
+            status="failed",
+            termination_reason="empty_model_response",
+        ),
+        final_report=None,
+    )
+
+
+def _deletion_store(
+    tmp_path: Path,
+) -> tuple[SQLiteSessionStore, str, str, tuple[str, ...], tuple[str, ...]]:
+    ids = iter(f"{digit:x}" * 32 for digit in range(1, 10))
+    store = SQLiteSessionStore(
+        tmp_path,
+        id_factory=lambda: next(ids),
+        utc_clock=lambda: NOW,
+    )
+    store.initialize()
+    selected = (descriptor("review", SkillSource.WORKSPACE),)
+    first = store.create_session("first", selected_skills=selected)
+    first_audit = "a" * 32
+    store.finish_run(_failed_deletion_result(first.run.run_id, first_audit))
+    second = store.submit_message(
+        first.session.session_id,
+        "second",
+        selected_skills=selected,
+    )
+    second_audit = "b" * 32
+    store.finish_run(_failed_deletion_result(second.run.run_id, second_audit))
+    other = store.create_session(
+        "other",
+        selected_skills=(descriptor("other", SkillSource.USER),),
+    )
+    store.finish_run(_failed_deletion_result(other.run.run_id, "c" * 32))
+    return (
+        store,
+        first.session.session_id,
+        other.session.session_id,
+        (first.run.run_id, second.run.run_id),
+        (first_audit, second_audit),
+    )
+
+
+def _target_row_counts(
+    tmp_path: Path,
+    session_id: str,
+    run_ids: tuple[str, ...],
+) -> tuple[int, int, int, int, int]:
+    placeholders = ",".join("?" for _ in run_ids)
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        return (
+            connection.execute(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            connection.execute(
+                f"SELECT COUNT(*) FROM run_skill_snapshots WHERE run_id IN ({placeholders})",
+                run_ids,
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM session_runs WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM session_skill_selections WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+            connection.execute(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()[0],
+        )
+
+
+def test_deletion_manifest_orders_runs_and_non_null_audits_by_ordinal(
+    tmp_path: Path,
+) -> None:
+    store, target_id, other_id, run_ids, audit_ids = _deletion_store(tmp_path)
+
+    manifest = store.get_session_deletion_manifest(target_id)
+
+    assert manifest == SessionDeletionManifest(target_id, run_ids, audit_ids)
+    assert store.session_exists(target_id) is True
+    assert store.session_exists(other_id) is True
+
+
+def test_deletion_manifest_omits_null_audit_ids_without_reordering_runs(
+    tmp_path: Path,
+) -> None:
+    store, target_id, _other_id, run_ids, audit_ids = _deletion_store(tmp_path)
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        connection.execute(
+            "UPDATE session_runs SET audit_run_id = NULL WHERE run_id = ?",
+            (run_ids[0],),
+        )
+        connection.commit()
+
+    manifest = store.get_session_deletion_manifest(target_id)
+
+    assert manifest.run_ids == run_ids
+    assert manifest.audit_run_ids == (audit_ids[1],)
+
+
+def test_delete_session_removes_exact_relational_rows_and_preserves_other(
+    tmp_path: Path,
+) -> None:
+    store, target_id, other_id, run_ids, _audit_ids = _deletion_store(tmp_path)
+    manifest = store.get_session_deletion_manifest(target_id)
+    other_before = store.get_session(other_id)
+    other_runs_before = store.list_runs(other_id)
+    assert all(count > 0 for count in _target_row_counts(tmp_path, target_id, run_ids))
+
+    store.delete_session(manifest)
+
+    assert store.session_exists(target_id) is False
+    assert store.session_exists(other_id) is True
+    assert store.get_session(other_id) == other_before
+    assert store.list_runs(other_id) == other_runs_before
+    assert _target_row_counts(tmp_path, target_id, run_ids) == (0, 0, 0, 0, 0)
+    with pytest.raises(SessionStoreError) as captured:
+        store.get_session_deletion_manifest(target_id)
+    assert captured.value.code == "session_not_found"
+
+
+@pytest.mark.parametrize("session_id", ("invalid", "A" * 32, "1" * 31))
+def test_deletion_store_methods_reject_invalid_session_ids(
+    tmp_path: Path,
+    session_id: str,
+) -> None:
+    store = SQLiteSessionStore(tmp_path)
+    store.initialize()
+    with pytest.raises(SessionStoreError) as manifest_error:
+        store.get_session_deletion_manifest(session_id)
+    assert manifest_error.value.code == "session_not_found"
+    with pytest.raises(SessionStoreError) as exists_error:
+        store.session_exists(session_id)
+    assert exists_error.value.code == "session_not_found"
+
+
+def test_delete_session_rejects_stale_manifest_without_row_loss(
+    tmp_path: Path,
+) -> None:
+    store, target_id, other_id, run_ids, _audit_ids = _deletion_store(tmp_path)
+    stale = store.get_session_deletion_manifest(target_id)
+    before = _target_row_counts(tmp_path, target_id, run_ids)
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        connection.execute(
+            "UPDATE session_runs SET audit_run_id = ? WHERE run_id = ?",
+            ("d" * 32, run_ids[-1]),
+        )
+        connection.commit()
+
+    with pytest.raises(SessionStoreError) as captured:
+        store.delete_session(stale)
+
+    assert captured.value.code == "invalid_session_state"
+    assert _target_row_counts(tmp_path, target_id, run_ids) == before
+    assert store.session_exists(target_id) is True
+    assert store.session_exists(other_id) is True
+
+
+def test_delete_session_rolls_back_children_when_run_delete_fails(
+    tmp_path: Path,
+) -> None:
+    store, target_id, other_id, run_ids, _audit_ids = _deletion_store(tmp_path)
+    manifest = store.get_session_deletion_manifest(target_id)
+    before = _target_row_counts(tmp_path, target_id, run_ids)
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_target_run_delete "
+            "BEFORE DELETE ON session_runs "
+            f"WHEN OLD.session_id = '{target_id}' "
+            "BEGIN SELECT RAISE(ABORT, 'private trigger detail'); END"
+        )
+        connection.commit()
+
+    with pytest.raises(SessionStoreError) as captured:
+        store.delete_session(manifest)
+
+    assert captured.value.code == "storage_unavailable"
+    assert "private trigger detail" not in repr(captured.value)
+    assert _target_row_counts(tmp_path, target_id, run_ids) == before
+    assert store.get_session_deletion_manifest(target_id) == manifest
+    assert store.session_exists(other_id) is True
+
+
+def test_delete_session_rejects_when_another_session_has_active_run(
+    tmp_path: Path,
+) -> None:
+    ids = iter(f"{digit:x}" * 32 for digit in range(1, 8))
+    store = SQLiteSessionStore(tmp_path, id_factory=lambda: next(ids))
+    store.initialize()
+    target = store.create_session("target")
+    store.finish_run(
+        _failed_deletion_result(target.run.run_id, "a" * 32)
+    )
+    manifest = store.get_session_deletion_manifest(target.session.session_id)
+    active = store.create_session("active")
+
+    with pytest.raises(SessionStoreError) as captured:
+        store.delete_session(manifest)
+
+    assert captured.value.code == "invalid_session_state"
+    assert store.session_exists(target.session.session_id) is True
+    assert store.get_run(active.run.run_id).status is SessionRunStatus.QUEUED
+
+
+def test_delete_session_skips_snapshot_in_clause_for_empty_run_set(
+    tmp_path: Path,
+) -> None:
+    store = SQLiteSessionStore(tmp_path, utc_clock=lambda: NOW)
+    store.initialize()
+    submission = store.create_session("empty historical session")
+    store.finish_run(
+        _failed_deletion_result(submission.run.run_id, "a" * 32)
+    )
+    with sqlite3.connect(_database_path(tmp_path)) as connection:
+        connection.execute(
+            "DELETE FROM session_events WHERE session_id = ?",
+            (submission.session.session_id,),
+        )
+        connection.execute(
+            "DELETE FROM run_skill_snapshots WHERE run_id = ?",
+            (submission.run.run_id,),
+        )
+        connection.execute(
+            "DELETE FROM session_runs WHERE run_id = ?",
+            (submission.run.run_id,),
+        )
+        connection.commit()
+    manifest = store.get_session_deletion_manifest(submission.session.session_id)
+    assert manifest.run_ids == ()
+    assert manifest.audit_run_ids == ()
+
+    store.delete_session(manifest)
+
+    assert store.session_exists(submission.session.session_id) is False
+
+
 def interrupted_result(run_id: str) -> SessionRunResult:
     return SessionRunResult(
         run_id=run_id,
@@ -1024,12 +1506,12 @@ def test_schema_unsupported_newer_version_is_not_replaced(tmp_path: Path) -> Non
     internal.mkdir()
     database = internal / "sessions.sqlite3"
     with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version = 4")
+        connection.execute("PRAGMA user_version = 5")
     with pytest.raises(SessionStoreError) as captured:
         SQLiteSessionStore(tmp_path).initialize()
     assert captured.value.code == "schema_unsupported"
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (4,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (5,)
 
 
 def test_database_corrupt_non_database_bytes_are_not_replaced(

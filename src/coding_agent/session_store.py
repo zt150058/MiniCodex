@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -30,6 +31,7 @@ from coding_agent.session import (
     uuid4_hex,
 )
 from coding_agent.logging import scrub_text
+from coding_agent.budget import BudgetProfile
 from coding_agent.run_mode import RunMode
 from coding_agent.skills import (
     RunSkillSnapshotMetadata,
@@ -38,11 +40,43 @@ from coding_agent.skills import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _INTERNAL_DIRECTORY = ".coding-agent"
 _DATABASE_NAME = "sessions.sqlite3"
 _LOCK_NAME = "sessions.lock"
 _SKILL_ID_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z")
+_SESSION_ENTITY_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+
+
+def _require_session_entity_id(value: object, field_name: str) -> str:
+    if (
+        type(value) is not str
+        or _SESSION_ENTITY_ID_PATTERN.fullmatch(value) is None
+    ):
+        raise ValueError(f"{field_name} must be a lowercase UUID hex string")
+    return value
+
+
+def _require_unique_id_tuple(value: object, field_name: str) -> tuple[str, ...]:
+    if type(value) is not tuple:
+        raise TypeError(f"{field_name} must be tuple")
+    for item in value:
+        _require_session_entity_id(item, field_name)
+    if len(set(value)) != len(value):
+        raise ValueError(f"{field_name} must contain unique ids")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class SessionDeletionManifest:
+    session_id: str
+    run_ids: tuple[str, ...]
+    audit_run_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _require_session_entity_id(self.session_id, "session_id")
+        _require_unique_id_tuple(self.run_ids, "run_ids")
+        _require_unique_id_tuple(self.audit_run_ids, "audit_run_ids")
 
 
 class SessionStore(Protocol):
@@ -56,8 +90,15 @@ class SessionStore(Protocol):
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> SessionSubmission: ...
     def get_session(self, session_id: str) -> SessionRecord: ...
+    def get_session_deletion_manifest(
+        self,
+        session_id: str,
+    ) -> SessionDeletionManifest: ...
+    def session_exists(self, session_id: str) -> bool: ...
+    def delete_session(self, manifest: SessionDeletionManifest) -> None: ...
     def get_run(self, run_id: str) -> SessionRunRecord: ...
     def get_skill_selection(self, session_id: str) -> tuple[str, ...]: ...
     def get_run_skill_snapshots(
@@ -78,6 +119,7 @@ class SessionStore(Protocol):
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> SessionSubmission: ...
     def start_run(self, run_id: str) -> SessionRunRecord: ...
     def append_event(self, event: NewSessionEvent) -> SessionEvent: ...
@@ -232,6 +274,8 @@ CREATE TABLE IF NOT EXISTS session_runs (
     ),
     run_mode TEXT NOT NULL DEFAULT 'modify'
         CHECK(run_mode IN ('modify', 'read_only')),
+    budget_profile TEXT NOT NULL DEFAULT 'standard'
+        CHECK(budget_profile IN ('standard', 'deep')),
     user_event_sequence INTEGER NOT NULL CHECK(user_event_sequence > 0),
     started_at_utc TEXT,
     finished_at_utc TEXT,
@@ -372,7 +416,11 @@ class SQLiteSessionStore:
                 if version == 1:
                     connection.executescript(_SCHEMA)
                     connection.commit()
-                self._migrate_to_version_3(connection)
+                if version in {1, 2}:
+                    self._migrate_to_version_3(connection)
+                self._migrate_to_version_4(connection)
+                connection.executescript(_SCHEMA)
+                connection.commit()
         except SessionStoreError:
             raise
         except sqlite3.Error as exc:
@@ -391,13 +439,8 @@ class SQLiteSessionStore:
         migrated = dict(value)
         migrated["schema_version"] = 2
         migrated["run_mode"] = RunMode.MODIFY.value
-        try:
-            projected = make_persisted_run_report(migrated)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            raise SessionStoreError("storage_unavailable") from None
-        if projected != migrated:
-            raise SessionStoreError("storage_unavailable")
-        return dict(projected)
+        cls._migrate_v2_report_to_v3(migrated)
+        return migrated
 
     @classmethod
     def _migrate_to_version_3(cls, connection: sqlite3.Connection) -> None:
@@ -423,6 +466,69 @@ class SQLiteSessionStore:
                 connection.execute(
                     "UPDATE session_runs SET final_report_json = ? WHERE run_id = ?",
                     (cls._canonical_json(migrated), row["run_id"]),
+                )
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+        except SessionStoreError:
+            connection.rollback()
+            raise
+        except (KeyError, TypeError, ValueError, sqlite3.Error):
+            connection.rollback()
+            raise SessionStoreError("storage_unavailable") from None
+
+    @classmethod
+    def _migrate_v2_report_to_v3(cls, value: object) -> dict[str, object]:
+        if not isinstance(value, dict) or value.get("schema_version") != 2:
+            raise SessionStoreError("storage_unavailable")
+        migrated = dict(value)
+        migrated.update(
+            schema_version=3,
+            budget_profile=BudgetProfile.STANDARD.value,
+            phase=None,
+            main_model_calls=None,
+            summary_model_calls=None,
+            summary_provider_attempts=None,
+        )
+        try:
+            projected = make_persisted_run_report(migrated)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise SessionStoreError("storage_unavailable") from None
+        if projected != migrated:
+            raise SessionStoreError("storage_unavailable")
+        return dict(projected)
+
+    @classmethod
+    def _migrate_to_version_4(cls, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(session_runs)")
+            }
+            if "budget_profile" not in columns:
+                connection.execute(
+                    "ALTER TABLE session_runs ADD COLUMN "
+                    "budget_profile TEXT NOT NULL DEFAULT 'standard' "
+                    "CHECK(budget_profile IN ('standard', 'deep'))"
+                )
+            rows = connection.execute(
+                "SELECT run_id, final_report_json FROM session_runs "
+                "WHERE final_report_json IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                report = cls._decode_json_object(row["final_report_json"])
+                if report.get("schema_version") == 2:
+                    report = cls._migrate_v2_report_to_v3(report)
+                else:
+                    try:
+                        projected = make_persisted_run_report(report)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        raise SessionStoreError("storage_unavailable") from None
+                    if projected != report:
+                        raise SessionStoreError("storage_unavailable")
+                connection.execute(
+                    "UPDATE session_runs SET final_report_json = ? WHERE run_id = ?",
+                    (cls._canonical_json(report), row["run_id"]),
                 )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
@@ -502,6 +608,7 @@ class SQLiteSessionStore:
                 ordinal=row["ordinal"],
                 status=SessionRunStatus(row["status"]),
                 run_mode=RunMode(row["run_mode"]),
+                budget_profile=BudgetProfile(row["budget_profile"]),
                 user_event_sequence=row["user_event_sequence"],
                 started_at_utc=row["started_at_utc"],
                 finished_at_utc=row["finished_at_utc"],
@@ -650,6 +757,51 @@ class SQLiteSessionStore:
             raise SessionStoreError("run_not_found")
         return row
 
+    @staticmethod
+    def _read_deletion_manifest(
+        connection: sqlite3.Connection,
+        session_id: str,
+    ) -> SessionDeletionManifest:
+        SQLiteSessionStore._select_session(connection, session_id)
+        rows = connection.execute(
+            "SELECT run_id, ordinal, audit_run_id "
+            "FROM session_runs WHERE session_id = ? ORDER BY ordinal ASC",
+            (session_id,),
+        ).fetchall()
+        run_ids: list[str] = []
+        audit_run_ids: list[str] = []
+        previous_ordinal = 0
+        try:
+            for row in rows:
+                ordinal = row["ordinal"]
+                run_id = row["run_id"]
+                audit_run_id = row["audit_run_id"]
+                if (
+                    type(ordinal) is not int
+                    or ordinal <= previous_ordinal
+                    or type(run_id) is not str
+                    or _SESSION_ENTITY_ID_PATTERN.fullmatch(run_id) is None
+                    or (
+                        audit_run_id is not None
+                        and (
+                            type(audit_run_id) is not str
+                            or _SESSION_ENTITY_ID_PATTERN.fullmatch(audit_run_id) is None
+                        )
+                    )
+                ):
+                    raise ValueError
+                previous_ordinal = ordinal
+                run_ids.append(run_id)
+                if audit_run_id is not None:
+                    audit_run_ids.append(audit_run_id)
+            return SessionDeletionManifest(
+                session_id=session_id,
+                run_ids=tuple(run_ids),
+                audit_run_ids=tuple(audit_run_ids),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise SessionStoreError("database_corrupt") from None
+
     def _insert_event(
         self,
         connection: sqlite3.Connection,
@@ -675,10 +827,13 @@ class SQLiteSessionStore:
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> SessionSubmission:
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
         if type(run_mode) is not RunMode:
+            raise SessionStoreError("invalid_session_state")
+        if type(budget_profile) is not BudgetProfile:
             raise SessionStoreError("invalid_session_state")
         selected_skills = self._validate_selected_skills(selected_skills)
         safe_message = scrub_text(message, self._sensitive_values)
@@ -702,6 +857,7 @@ class SQLiteSessionStore:
                 ordinal=1,
                 status=SessionRunStatus.QUEUED,
                 run_mode=run_mode,
+                budget_profile=budget_profile,
                 user_event_sequence=1,
                 started_at_utc=None,
                 finished_at_utc=None,
@@ -748,16 +904,17 @@ class SQLiteSessionStore:
             )
             connection.execute(
                 "INSERT INTO session_runs "
-                "(run_id, session_id, ordinal, status, run_mode, "
+                "(run_id, session_id, ordinal, status, run_mode, budget_profile, "
                 "user_event_sequence, started_at_utc, finished_at_utc, "
                 "agent_status, termination_reason, audit_run_id, final_report_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.run_id,
                     run.session_id,
                     run.ordinal,
                     run.status.value,
                     run.run_mode.value,
+                    run.budget_profile.value,
                     run.user_event_sequence,
                     run.started_at_utc,
                     run.finished_at_utc,
@@ -797,6 +954,175 @@ class SQLiteSessionStore:
         try:
             return self._decode_session(self._select_session(connection, session_id))
         except sqlite3.Error as exc:
+            raise _sqlite_store_error(exc) from None
+        finally:
+            connection.close()
+
+    def get_session_deletion_manifest(
+        self,
+        session_id: str,
+    ) -> SessionDeletionManifest:
+        try:
+            _require_session_entity_id(session_id, "session_id")
+        except ValueError:
+            raise SessionStoreError("session_not_found") from None
+        connection = self._connect()
+        try:
+            return self._read_deletion_manifest(connection, session_id)
+        except sqlite3.Error as exc:
+            raise _sqlite_store_error(exc) from None
+        finally:
+            connection.close()
+
+    def session_exists(self, session_id: str) -> bool:
+        try:
+            _require_session_entity_id(session_id, "session_id")
+        except ValueError:
+            raise SessionStoreError("session_not_found") from None
+        connection = self._connect()
+        try:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                is not None
+            )
+        except sqlite3.Error as exc:
+            raise _sqlite_store_error(exc) from None
+        finally:
+            connection.close()
+
+    def delete_session(self, manifest: SessionDeletionManifest) -> None:
+        if type(manifest) is not SessionDeletionManifest:
+            raise SessionStoreError("invalid_session_state")
+        connection = self._connect()
+        try:
+            self._begin(connection)
+            try:
+                current = self._read_deletion_manifest(
+                    connection,
+                    manifest.session_id,
+                )
+            except SessionStoreError as exc:
+                if exc.code == "session_not_found":
+                    raise SessionStoreError("invalid_session_state") from None
+                raise
+            if current != manifest:
+                raise SessionStoreError("invalid_session_state")
+            session = self._decode_session(
+                self._select_session(connection, manifest.session_id)
+            )
+            if session.status is not SessionStatus.IDLE or self._active_run_exists(
+                connection
+            ):
+                raise SessionStoreError("invalid_session_state")
+
+            expected_events = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM session_events WHERE session_id = ?",
+                    (manifest.session_id,),
+                ).fetchone()[0]
+            )
+            expected_runs = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM session_runs WHERE session_id = ?",
+                    (manifest.session_id,),
+                ).fetchone()[0]
+            )
+            expected_selections = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM session_skill_selections "
+                    "WHERE session_id = ?",
+                    (manifest.session_id,),
+                ).fetchone()[0]
+            )
+            expected_snapshots = 0
+            snapshot_placeholders = ""
+            if manifest.run_ids:
+                snapshot_placeholders = ",".join("?" for _ in manifest.run_ids)
+                expected_snapshots = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM run_skill_snapshots WHERE run_id IN ("
+                        + snapshot_placeholders
+                        + ")",
+                        manifest.run_ids,
+                    ).fetchone()[0]
+                )
+
+            deleted_events = connection.execute(
+                "DELETE FROM session_events WHERE session_id = ?",
+                (manifest.session_id,),
+            ).rowcount
+            if deleted_events != expected_events:
+                raise SessionStoreError("invalid_session_state")
+            if manifest.run_ids:
+                deleted_snapshots = connection.execute(
+                    "DELETE FROM run_skill_snapshots WHERE run_id IN ("
+                    + snapshot_placeholders
+                    + ")",
+                    manifest.run_ids,
+                ).rowcount
+                if deleted_snapshots != expected_snapshots:
+                    raise SessionStoreError("invalid_session_state")
+            deleted_runs = connection.execute(
+                "DELETE FROM session_runs WHERE session_id = ?",
+                (manifest.session_id,),
+            ).rowcount
+            if deleted_runs != expected_runs:
+                raise SessionStoreError("invalid_session_state")
+            deleted_selections = connection.execute(
+                "DELETE FROM session_skill_selections WHERE session_id = ?",
+                (manifest.session_id,),
+            ).rowcount
+            if deleted_selections != expected_selections:
+                raise SessionStoreError("invalid_session_state")
+            deleted_session = connection.execute(
+                "DELETE FROM sessions WHERE session_id = ?",
+                (manifest.session_id,),
+            ).rowcount
+            if deleted_session != 1:
+                raise SessionStoreError("invalid_session_state")
+
+            remaining = [
+                connection.execute(
+                    "SELECT COUNT(*) FROM session_events WHERE session_id = ?",
+                    (manifest.session_id,),
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM session_runs WHERE session_id = ?",
+                    (manifest.session_id,),
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM session_skill_selections "
+                    "WHERE session_id = ?",
+                    (manifest.session_id,),
+                ).fetchone()[0],
+                connection.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE session_id = ?",
+                    (manifest.session_id,),
+                ).fetchone()[0],
+            ]
+            if manifest.run_ids:
+                remaining.append(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM run_skill_snapshots WHERE run_id IN ("
+                        + snapshot_placeholders
+                        + ")",
+                        manifest.run_ids,
+                    ).fetchone()[0]
+                )
+            if any(value != 0 for value in remaining):
+                raise SessionStoreError("invalid_session_state")
+            connection.commit()
+        except SessionStoreError:
+            self._rollback(connection)
+            raise
+        except (KeyError, TypeError, ValueError):
+            self._rollback(connection)
+            raise SessionStoreError("database_corrupt") from None
+        except sqlite3.Error as exc:
+            self._rollback(connection)
             raise _sqlite_store_error(exc) from None
         finally:
             connection.close()
@@ -994,10 +1320,13 @@ class SQLiteSessionStore:
         *,
         selected_skills: tuple[SkillDescriptor, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> SessionSubmission:
         if not isinstance(message, str):
             raise SessionStoreError("invalid_message")
         if type(run_mode) is not RunMode:
+            raise SessionStoreError("invalid_session_state")
+        if type(budget_profile) is not BudgetProfile:
             raise SessionStoreError("invalid_session_state")
         selected_skills = self._validate_selected_skills(selected_skills)
         safe_message = scrub_text(message, self._sensitive_values)
@@ -1032,6 +1361,7 @@ class SQLiteSessionStore:
                 ordinal=ordinal,
                 status=SessionRunStatus.QUEUED,
                 run_mode=run_mode,
+                budget_profile=budget_profile,
                 user_event_sequence=user_sequence,
                 started_at_utc=None,
                 finished_at_utc=None,
@@ -1058,16 +1388,17 @@ class SQLiteSessionStore:
             )
             connection.execute(
                 "INSERT INTO session_runs "
-                "(run_id, session_id, ordinal, status, run_mode, "
+                "(run_id, session_id, ordinal, status, run_mode, budget_profile, "
                 "user_event_sequence, started_at_utc, finished_at_utc, "
                 "agent_status, termination_reason, audit_run_id, final_report_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run.run_id,
                     run.session_id,
                     run.ordinal,
                     run.status.value,
                     run.run_mode.value,
+                    run.budget_profile.value,
                     run.user_event_sequence,
                     None,
                     None,
@@ -1332,16 +1663,23 @@ class SQLiteSessionStore:
                 self._select_session(connection, current.session_id)
             )
             timestamp = self._timestamp()
-            expected_status = (
-                "answered"
-                if result.status is SessionRunStatus.SUCCEEDED
-                and current.run_mode is RunMode.READ_ONLY
-                else {
-                    SessionRunStatus.SUCCEEDED: "success",
+            if result.status is SessionRunStatus.SUCCEEDED:
+                default_success_status = (
+                    "answered"
+                    if current.run_mode is RunMode.READ_ONLY
+                    else "success"
+                )
+                expected_status = result.agent_status or default_success_status
+                if expected_status not in {"success", "answered"} or (
+                    expected_status == "success"
+                    and current.run_mode is not RunMode.MODIFY
+                ):
+                    raise SessionStoreError("invalid_session_state")
+            else:
+                expected_status = {
                     SessionRunStatus.FAILED: "failed",
                     SessionRunStatus.INTERRUPTED: "interrupted",
                 }[result.status]
-            )
             if result.agent_status not in {None, expected_status}:
                 raise SessionStoreError("invalid_session_state")
             expected_summary_fields = {
@@ -1382,8 +1720,17 @@ class SQLiteSessionStore:
                     result.audit_run_id is None
                     or projected["run_id"] != result.audit_run_id
                     or projected["run_mode"] != current.run_mode.value
+                    or projected["budget_profile"] != current.budget_profile.value
                     or projected["status"] != expected_status
                     or projected["termination_reason"] != result.termination_reason
+                    or any(
+                        type(projected[field_name]) is not int
+                        for field_name in (
+                            "main_model_calls",
+                            "summary_model_calls",
+                            "summary_provider_attempts",
+                        )
+                    )
                 ):
                     raise SessionStoreError("invalid_session_state")
                 scrubbed_report = self._scrub_json_value(
@@ -1503,6 +1850,7 @@ class SQLiteSessionStore:
                         ordinal=current.ordinal,
                         status=SessionRunStatus.INTERRUPTED,
                         run_mode=current.run_mode,
+                        budget_profile=current.budget_profile,
                         user_event_sequence=current.user_event_sequence,
                         started_at_utc=current.started_at_utc,
                         finished_at_utc=timestamp,

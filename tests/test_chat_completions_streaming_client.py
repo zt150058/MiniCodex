@@ -26,7 +26,12 @@ from coding_agent.messages import (
     ToolResult,
     UserMessage,
 )
-from coding_agent.model import FatalModelError, ModelCallBudget, TransientModelError
+from coding_agent.model import (
+    FatalModelError,
+    ModelCallBudget,
+    ModelOutputLimitError,
+    TransientModelError,
+)
 from coding_agent.streaming import (
     ModelStreamEvent,
     ModelStreamEventKind,
@@ -510,10 +515,6 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
             "object",
         ),
         (
-            (chunk(delta=delta(content="ok"), finish_reason="length"),),
-            "finish reason",
-        ),
-        (
             (
                 chunk(delta=delta(content="ok"), finish_reason="stop"),
                 chunk(delta=delta(), finish_reason="stop"),
@@ -526,7 +527,6 @@ def test_chat_stream_accepts_blank_continuation_identifier_after_valid_id() -> N
         "negative-index",
         "conflicting-id",
         "non-object-arguments",
-        "unsupported-finish",
         "duplicate-finish",
     ],
 )
@@ -581,6 +581,32 @@ def test_chat_stream_rejects_legacy_refusal_and_non_function_tools() -> None:
                 ModelRequest(messages=(UserMessage("task"),)),
                 lambda event: None,
             )
+
+
+def test_chat_stream_length_discards_partial_text_as_output_limit() -> None:
+    events: list[ModelStreamEvent] = []
+    client = ChatCompletionsModelClient(
+        model="test",
+        api_key="not-real",
+        base_url="https://example.test/v1",
+        sdk_client=FakeSDK(
+            FakeStream(
+                (chunk(delta=delta(content="private partial"), finish_reason="length"),)
+            )
+        ),
+    )
+
+    with pytest.raises(ModelOutputLimitError, match="output token limit") as caught:
+        client.stream(
+            ModelRequest(messages=(UserMessage("task"),)),
+            events.append,
+        )
+
+    assert "private partial" not in str(caught.value)
+    assert [event.kind for event in events] == [
+        ModelStreamEventKind.TEXT_DELTA,
+        ModelStreamEventKind.RESPONSE_DISCARDED,
+    ]
 
 
 @pytest.mark.parametrize(

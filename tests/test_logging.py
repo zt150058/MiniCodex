@@ -52,42 +52,255 @@ class FakeMonotonicClock:
         return next(self._values)
 
 
-def test_run_started_schema_v2_requires_run_mode(tmp_path: Path) -> None:
+def _run_started_data(
+    *,
+    task_chars: int = 4,
+    run_mode: str = "modify",
+) -> dict[str, object]:
+    return {
+        "task_chars": task_chars,
+        "mutation_index": 0,
+        "run_mode": run_mode,
+        "budget_profile": "standard",
+        "max_main_model_calls": 24,
+        "max_summary_model_calls": 4,
+        "max_provider_attempts": 48,
+        "max_summary_provider_attempts": 8,
+        "max_tool_calls": 80,
+        "max_runtime_seconds": 1200.0,
+        "verification_tool_reserve": 1,
+    }
+
+
+def _run_completed_data(
+    *,
+    status: str = "answered",
+    termination_reason: str | None = None,
+    phase: str = "finish",
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "termination_reason": termination_reason,
+        "budget_profile": "standard",
+        "phase": phase,
+        "main_model_calls": 1,
+        "summary_model_calls": 0,
+        "logical_model_calls": 1,
+        "summary_provider_attempts": 0,
+        "provider_attempts": 1,
+        "tool_calls": 0,
+        "verification_attempts": 0,
+        "mutation_index": 0,
+        "validation_index": None,
+        "elapsed_ms": 1,
+    }
+
+
+def test_phase_progress_checkpoint_and_latch_events_have_exact_safe_keys(
+    tmp_path: Path,
+) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="c" * 32)
+    cases = (
+        (
+            EventType.PHASE_CHANGED,
+            {"from_phase": "discover", "to_phase": "act", "epoch": 1},
+        ),
+        (
+            EventType.PROGRESS_OBSERVED,
+            {"strength": "weak", "source": "tool", "epoch": 0},
+        ),
+        (
+            EventType.DECISION_CHECKPOINT,
+            {
+                "reason": "exploration_limit",
+                "phase": "discover",
+                "main_calls_remaining": 18,
+            },
+        ),
+        (
+            EventType.NO_PROGRESS_DETECTED,
+            {"phase": "discover", "post_checkpoint_main_turns": 2},
+        ),
+        (
+            EventType.SUMMARY_FALLBACK_LATCHED,
+            {"reason": "invalid_summary", "summary_model_calls": 1},
+        ),
+    )
+
+    for event_type, data in cases:
+        event = logger.emit(event_type, data)
+        assert event.schema_version == 3
+        assert event.data == data
+    logger.close()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["final_read_allowance_exhausted", "verification_failure"],
+)
+def test_decision_checkpoint_accepts_amendment_reasons(
+    tmp_path: Path,
+    reason: str,
+) -> None:
+    logger = RunEventLogger.create(tmp_path)
+    event = logger.emit(
+        EventType.DECISION_CHECKPOINT,
+        {
+            "reason": reason,
+            "phase": "act",
+            "main_calls_remaining": 10,
+        },
+    )
+    logger.close()
+
+    assert event.data["reason"] == reason
+
+
+def test_duplicate_only_checkpoint_reason_is_auditable(tmp_path: Path) -> None:
+    logger = RunEventLogger.create(tmp_path)
+    event = logger.emit(
+        EventType.DECISION_CHECKPOINT,
+        {
+            "reason": "duplicate_only_turn",
+            "phase": "discover",
+            "main_calls_remaining": 30,
+        },
+    )
+    logger.close()
+    assert event.data["reason"] == "duplicate_only_turn"
+
+
+def test_verification_events_accept_local_integrity_source(tmp_path: Path) -> None:
+    logger = RunEventLogger.create(tmp_path)
+    started = logger.emit(
+        EventType.VERIFICATION_STARTED,
+        {
+            "source": "local_integrity",
+            "command_hash": "a" * 64,
+            "mutation_index": 1,
+            "attempt_index": 1,
+        },
+    )
+    completed = logger.emit(
+        EventType.VERIFICATION_COMPLETED,
+        {
+            "source": "local_integrity",
+            "status": "passed",
+            "exit_code": 0,
+            "timed_out": False,
+            "truncated": False,
+            "duration_ms": 0,
+            "validation_index": 1,
+            "mutation_index": 1,
+            "stdout_chars": 48,
+            "stderr_chars": 0,
+            "error_code": None,
+        },
+    )
+    logger.close()
+
+    assert started.data["source"] == "local_integrity"
+    assert completed.data["source"] == "local_integrity"
+
+
+@pytest.mark.parametrize(
+    "safe_error_code",
+    [
+        "agent_rejected:decision_required",
+        "agent_rejected:verification_required",
+    ],
+)
+def test_tool_completed_accepts_exact_agent_rejection_codes(
+    tmp_path: Path,
+    safe_error_code: str,
+) -> None:
+    logger = RunEventLogger.create(tmp_path)
+    event = logger.emit(
+        EventType.TOOL_CALL_COMPLETED,
+        {
+            "ordinal": 1,
+            "tool_name": "read_file",
+            "call_id_hash": "b" * 64,
+            "status": "rejected",
+            "safe_error_code": safe_error_code,
+            "output_chars": 0,
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "duration_ms": 0,
+            "changed_paths": [],
+            "mutation_index_before": 0,
+            "mutation_index_after": 0,
+            "executed": False,
+        },
+    )
+    logger.close()
+
+    assert event.data["safe_error_code"] == safe_error_code
+
+
+def test_new_events_reject_content_paths_continuation_and_extra_fields(
+    tmp_path: Path,
+) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="d" * 32)
+    for extra in (
+        {"summary": "secret"},
+        {"path": str(tmp_path)},
+        {"continuation": "opaque"},
+        {"instructions": "hidden"},
+    ):
+        with pytest.raises(RunLogError):
+            logger.emit(
+                EventType.DECISION_CHECKPOINT,
+                {
+                    "reason": "exploration_limit",
+                    "phase": "discover",
+                    "main_calls_remaining": 4,
+                    **extra,
+                },
+            )
+    logger.close()
+
+
+def test_run_started_schema_v3_requires_profile_and_limits(tmp_path: Path) -> None:
     logger = RunEventLogger.create(tmp_path, run_id="a" * 32)
     event = logger.emit(
         EventType.RUN_STARTED,
-        {
-            "task_chars": 7,
-            "mutation_index": 0,
-            "run_mode": RunMode.READ_ONLY.value,
-        },
+        _run_started_data(task_chars=7, run_mode=RunMode.READ_ONLY.value),
     )
     logger.close()
 
-    assert event.schema_version == 2
+    assert event.schema_version == 3
     assert event.data["run_mode"] == "read_only"
 
 
-def test_run_completed_schema_v2_accepts_answered(tmp_path: Path) -> None:
+def test_run_completed_schema_v3_accepts_answered(tmp_path: Path) -> None:
     logger = RunEventLogger.create(tmp_path, run_id="b" * 32)
     event = logger.emit(
         EventType.RUN_COMPLETED,
-        {
-            "status": "answered",
-            "termination_reason": None,
-            "logical_model_calls": 1,
-            "provider_attempts": 1,
-            "tool_calls": 0,
-            "verification_attempts": 0,
-            "mutation_index": 0,
-            "validation_index": None,
-            "elapsed_ms": 1,
-        },
+        _run_completed_data(),
     )
     logger.close()
 
-    assert event.schema_version == 2
+    assert event.schema_version == 3
     assert event.data["status"] == "answered"
+
+
+def test_run_completed_schema_accepts_changes_unverified(tmp_path: Path) -> None:
+    logger = RunEventLogger.create(tmp_path, run_id="c" * 32)
+
+    event = logger.emit(
+        EventType.RUN_COMPLETED,
+        _run_completed_data(
+            status="failed",
+            termination_reason="changes_unverified",
+            phase="finish",
+        ),
+    )
+    logger.close()
+
+    assert event.data["status"] == "failed"
+    assert event.data["termination_reason"] == "changes_unverified"
 
 
 def test_event_observer_runs_only_after_line_is_flushed(tmp_path: Path) -> None:
@@ -101,7 +314,7 @@ def test_event_observer_runs_only_after_line_is_flushed(tmp_path: Path) -> None:
     logger.set_event_observer(observer)
     event = logger.emit(
         EventType.RUN_STARTED,
-        {"task_chars": 4, "mutation_index": 0, "run_mode": "modify"},
+        _run_started_data(),
     )
     assert observed[0][0] == event
     assert json.loads(observed[0][1].splitlines()[-1])["sequence"] == event.sequence
@@ -122,21 +335,15 @@ def test_ordinary_event_observer_failure_does_not_poison_audit_log(
     logger.set_event_observer(observer)
     first = logger.emit(
         EventType.RUN_STARTED,
-        {"task_chars": 4, "mutation_index": 0, "run_mode": "modify"},
+        _run_started_data(),
     )
     second = logger.emit(
         EventType.RUN_COMPLETED,
-        {
-            "status": "failed",
-            "termination_reason": "empty_model_response",
-            "logical_model_calls": 1,
-            "provider_attempts": 1,
-            "tool_calls": 0,
-            "verification_attempts": 0,
-            "mutation_index": 0,
-            "validation_index": None,
-            "elapsed_ms": 1,
-        },
+        _run_completed_data(
+            status="failed",
+            termination_reason="empty_model_response",
+            phase="discover",
+        ),
     )
     logger.close()
     assert (first.sequence, second.sequence, calls) == (1, 2, 2)
@@ -153,7 +360,7 @@ def test_event_observer_system_exit_is_not_swallowed(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as captured:
         logger.emit(
             EventType.RUN_STARTED,
-            {"task_chars": 4, "mutation_index": 0, "run_mode": "modify"},
+            _run_started_data(),
         )
     assert captured.value.code == 7
     logger.close()
@@ -175,7 +382,7 @@ def test_jsonl_has_deterministic_envelope_sequence_utf8_and_newline(
 
     first = logger.emit(
         EventType.RUN_STARTED,
-        {"task_chars": 2, "mutation_index": 0, "run_mode": "modify"},
+        _run_started_data(task_chars=2),
     )
     second = logger.emit(
         EventType.TOOL_CALL_STARTED,
@@ -459,12 +666,12 @@ def test_serialization_failure_poisons_logger_without_consuming_sequence(
     with pytest.raises(RunLogError) as first:
         logger.emit(
             EventType.RUN_STARTED,
-            {"task_chars": 1, "mutation_index": 0, "run_mode": "modify"},
+            _run_started_data(task_chars=1),
         )
     with pytest.raises(RunLogError) as second:
         logger.emit(
             EventType.RUN_STARTED,
-            {"task_chars": 1, "mutation_index": 0, "run_mode": "modify"},
+            _run_started_data(task_chars=1),
         )
 
     assert first.value.code == "event_serialization_failed"

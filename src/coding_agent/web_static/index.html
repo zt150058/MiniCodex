@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta id="coding-agent-bootstrap" name="coding-agent-token" content="__CODING_AGENT_ACCESS_TOKEN__">
-    <title>Local Coding Agent</title>
+    <title>Local MiniCodex</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
@@ -43,6 +43,12 @@
           </button>
           <div id="skill-panel" class="skill-panel" hidden>
             <p class="section-copy">选择用于下一次运行的本地声明式指令。</p>
+            <div class="skill-import">
+              <button id="skill-import-button" class="secondary-button skill-import__button" type="button" aria-label="导入 Skill ZIP">导入 Skill ZIP</button>
+              <input id="skill-file-input" class="visually-hidden" type="file" accept=".zip,application/zip" aria-label="选择 Skill ZIP 文件">
+              <p id="skill-import-status" class="skill-import__status" role="status" aria-live="polite"></p>
+            </div>
+            <p id="skill-empty-state" class="skill-empty-state">尚未安装可用 Skill。</p>
             <div id="skill-list" class="skill-list" role="group" aria-labelledby="skill-heading"></div>
           </div>
         </section>
@@ -62,7 +68,7 @@
             <p class="eyebrow">CURRENT SESSION</p>
             <h1 id="conversation-title">准备开始</h1>
           </div>
-          <div class="run-facts" aria-label="Agent 运行状态">
+          <div class="run-facts" aria-label="MiniCodex 运行状态">
             <div class="run-fact">
               <span class="fact-label">状态</span>
               <span id="run-status" class="status-pill status-pill--idle">空闲</span>
@@ -90,7 +96,7 @@
               </svg>
             </div>
             <p class="eyebrow">READY WHEN YOU ARE</p>
-            <h2>把一个清晰的代码任务交给 Agent</h2>
+            <h2>把一个清晰的代码任务交给 MiniCodex</h2>
             <p>MiniCodex 可以在授权范围内读取和修改工作区文件、运行受控命令，并展示真实验证结果。</p>
           </div>
         </section>
@@ -101,8 +107,12 @@
             <textarea id="message-input" rows="3" maxlength="12000" placeholder="描述你想检查、修复或实现的内容…"></textarea>
             <div class="composer-actions">
               <div id="run-mode-control" class="run-mode-control" role="group" aria-label="运行权限模式">
-                <button id="run-mode-modify" class="run-mode-option" type="button" data-run-mode="modify" aria-label="允许 Agent 修改工作区" aria-pressed="true">允许修改</button>
+                <button id="run-mode-modify" class="run-mode-option" type="button" data-run-mode="modify" aria-label="允许 MiniCodex 修改工作区" aria-pressed="true">允许修改</button>
                 <button id="run-mode-read-only" class="run-mode-option" type="button" data-run-mode="read_only" aria-label="只读问答，不修改工作区" aria-pressed="false">只读问答</button>
+              </div>
+              <div id="budget-profile-control" class="budget-profile-control" role="group" aria-label="运行预算">
+                <button id="budget-profile-standard" class="budget-profile-option" type="button" data-budget-profile="standard" aria-label="使用标准运行预算" aria-pressed="true">标准</button>
+                <button id="budget-profile-deep" class="budget-profile-option" type="button" data-budget-profile="deep" aria-label="使用深入运行预算" aria-pressed="false">深入</button>
               </div>
               <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
               <button id="send-message-button" class="send-button" type="submit" aria-label="发送消息">

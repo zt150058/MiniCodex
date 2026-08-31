@@ -19,6 +19,18 @@ class ModelError(RuntimeError):
     """Base class for failures crossing the model-client boundary."""
 
 
+class InvalidModelResponseError(ModelError):
+    """A completed provider response cannot be parsed safely."""
+
+    observation_error_code = "invalid_model_response"
+
+
+class ModelOutputLimitError(ModelError):
+    """The provider stopped generation at the configured output limit."""
+
+    observation_error_code = "model_output_limit"
+
+
 class TransientModelError(ModelError):
     """A retryable model failure such as timeout, 429, or 5xx."""
 
@@ -29,7 +41,10 @@ class FatalModelError(ModelError):
 
 class ModelBudgetReason(StrEnum):
     LOGICAL_CALL_LIMIT = "logical_model_call_limit"
+    MAIN_LOGICAL_CALL_LIMIT = "main_model_call_limit"
+    SUMMARY_LOGICAL_CALL_LIMIT = "summary_model_call_limit"
     PROVIDER_ATTEMPT_LIMIT = "provider_attempt_limit"
+    SUMMARY_PROVIDER_ATTEMPT_LIMIT = "summary_provider_attempt_limit"
 
 
 class ModelCallPurpose(StrEnum):
@@ -174,8 +189,17 @@ class ModelBudgetExceeded(ModelError):
             ModelBudgetReason.LOGICAL_CALL_LIMIT: (
                 "logical model call limit reached"
             ),
+            ModelBudgetReason.MAIN_LOGICAL_CALL_LIMIT: (
+                "main model call limit reached"
+            ),
+            ModelBudgetReason.SUMMARY_LOGICAL_CALL_LIMIT: (
+                "summary model call limit reached"
+            ),
             ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT: (
                 "provider attempt limit reached"
+            ),
+            ModelBudgetReason.SUMMARY_PROVIDER_ATTEMPT_LIMIT: (
+                "summary provider attempt limit reached"
             ),
         }[reason]
         super().__init__(message)
@@ -202,8 +226,14 @@ def _bounded_count(value: object, maximum: int, name: str) -> int:
 class ModelCallBudget:
     max_logical_calls: int = 12
     max_provider_attempts: int = 12
+    max_main_logical_calls: int | None = None
+    max_summary_logical_calls: int | None = None
+    max_summary_provider_attempts: int | None = None
     logical_calls: int = 0
     provider_attempts: int = 0
+    main_logical_calls: int = 0
+    summary_logical_calls: int = 0
+    summary_provider_attempts: int = 0
     observer: ModelObservationSink | None = field(
         default=None,
         repr=False,
@@ -231,6 +261,18 @@ class ModelCallBudget:
             self.max_provider_attempts,
             "max_provider_attempts",
         )
+        for name, total_limit in (
+            ("max_main_logical_calls", self.max_logical_calls),
+            ("max_summary_logical_calls", self.max_logical_calls),
+            ("max_summary_provider_attempts", self.max_provider_attempts),
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            validated = _positive_integer(value, name)
+            if validated > total_limit:
+                raise ValueError(f"{name} must not exceed its total limit")
+            setattr(self, name, validated)
         self.logical_calls = _bounded_count(
             self.logical_calls,
             self.max_logical_calls,
@@ -241,6 +283,27 @@ class ModelCallBudget:
             self.max_provider_attempts,
             "provider_attempts",
         )
+        self.main_logical_calls = _bounded_count(
+            self.main_logical_calls,
+            self.max_main_logical_calls or self.max_logical_calls,
+            "main_logical_calls",
+        )
+        self.summary_logical_calls = _bounded_count(
+            self.summary_logical_calls,
+            self.max_summary_logical_calls or self.max_logical_calls,
+            "summary_logical_calls",
+        )
+        self.summary_provider_attempts = _bounded_count(
+            self.summary_provider_attempts,
+            self.max_summary_provider_attempts or self.max_provider_attempts,
+            "summary_provider_attempts",
+        )
+        if self.main_logical_calls + self.summary_logical_calls > self.logical_calls:
+            raise ValueError("purpose logical counts must not exceed logical_calls")
+        if self.summary_provider_attempts > self.provider_attempts:
+            raise ValueError(
+                "summary_provider_attempts must not exceed provider_attempts"
+            )
 
     def start_logical_call(self) -> None:
         if self.logical_calls >= self.max_logical_calls:
@@ -265,17 +328,34 @@ class ModelCallBudget:
         purpose: ModelCallPurpose,
         request: ModelRequest,
     ) -> int:
+        if not isinstance(purpose, ModelCallPurpose):
+            raise TypeError("purpose must be ModelCallPurpose")
         logical_call_index = self.logical_calls + 1
-        if self.logical_calls >= self.max_logical_calls:
+        blocked_reason: ModelBudgetReason | None = None
+        if (
+            purpose is ModelCallPurpose.MAIN
+            and self.max_main_logical_calls is not None
+            and self.main_logical_calls >= self.max_main_logical_calls
+        ):
+            blocked_reason = ModelBudgetReason.MAIN_LOGICAL_CALL_LIMIT
+        elif (
+            purpose is ModelCallPurpose.SUMMARY
+            and self.max_summary_logical_calls is not None
+            and self.summary_logical_calls >= self.max_summary_logical_calls
+        ):
+            blocked_reason = ModelBudgetReason.SUMMARY_LOGICAL_CALL_LIMIT
+        elif self.logical_calls >= self.max_logical_calls:
+            blocked_reason = ModelBudgetReason.LOGICAL_CALL_LIMIT
+        if blocked_reason is not None:
             self._observe(
                 ModelObservation(
                     ModelObservationKind.LOGICAL_BLOCKED,
                     purpose,
                     logical_call_index,
-                    error_code=ModelBudgetReason.LOGICAL_CALL_LIMIT.value,
+                    error_code=blocked_reason.value,
                 )
             )
-            raise ModelBudgetExceeded(ModelBudgetReason.LOGICAL_CALL_LIMIT)
+            raise ModelBudgetExceeded(blocked_reason)
         self._observe(
             ModelObservation(
                 ModelObservationKind.LOGICAL_STARTED,
@@ -287,6 +367,10 @@ class ModelCallBudget:
             )
         )
         self.start_logical_call()
+        if purpose is ModelCallPurpose.MAIN:
+            self.main_logical_calls += 1
+        else:
+            self.summary_logical_calls += 1
         self._active_purpose = purpose
         return logical_call_index
 
@@ -337,18 +421,30 @@ class ModelCallBudget:
         self.provider_attempts += 1
 
     def begin_provider_attempt(self, purpose: ModelCallPurpose) -> int:
+        if not isinstance(purpose, ModelCallPurpose):
+            raise TypeError("purpose must be ModelCallPurpose")
         provider_attempt_index = self.provider_attempts + 1
         logical_call_index = max(1, self.logical_calls)
+        blocked_reason: ModelBudgetReason | None = None
         if self.provider_attempts >= self.max_provider_attempts:
+            blocked_reason = ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT
+        elif (
+            purpose is ModelCallPurpose.SUMMARY
+            and self.max_summary_provider_attempts is not None
+            and self.summary_provider_attempts
+            >= self.max_summary_provider_attempts
+        ):
+            blocked_reason = ModelBudgetReason.SUMMARY_PROVIDER_ATTEMPT_LIMIT
+        if blocked_reason is not None:
             self._observe(
                 ModelObservation(
                     ModelObservationKind.PROVIDER_BLOCKED,
                     purpose,
                     logical_call_index,
-                    error_code=ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT.value,
+                    error_code=blocked_reason.value,
                 )
             )
-            raise ModelBudgetExceeded(ModelBudgetReason.PROVIDER_ATTEMPT_LIMIT)
+            raise ModelBudgetExceeded(blocked_reason)
         self._observe(
             ModelObservation(
                 ModelObservationKind.PROVIDER_STARTED,
@@ -358,6 +454,8 @@ class ModelCallBudget:
             )
         )
         self.claim_provider_attempt()
+        if purpose is ModelCallPurpose.SUMMARY:
+            self.summary_provider_attempts += 1
         return provider_attempt_index
 
     def finish_provider_attempt(
@@ -464,8 +562,9 @@ class FakeModelClient:
 
 
 def _model_error_code(error: Exception) -> str:
-    if getattr(error, "observation_error_code", None) == "invalid_model_response":
-        return "invalid_model_response"
+    observation_code = getattr(error, "observation_error_code", None)
+    if observation_code in {"invalid_model_response", "model_output_limit"}:
+        return observation_code
     if isinstance(error, ModelBudgetExceeded):
         return "model_budget_exceeded"
     if isinstance(error, TransientModelError):

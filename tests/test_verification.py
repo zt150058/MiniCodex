@@ -1004,6 +1004,178 @@ def test_missing_model_evidence_returns_feedback_without_execution(
     assert executor.calls == []
 
 
+def test_optional_gate_validates_changed_markdown_locally(tmp_path: Path) -> None:
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    executor = FakeVerificationExecutor()
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=executor,
+    )
+    state = _candidate_state(tmp_path)
+    state.mutation_index = 1
+    state.modified_paths = ("README.md",)
+    state.verification_status = VerificationStatus.STALE
+
+    decision = gate.evaluate(state)
+
+    assert decision.outcome is VerificationOutcome.SUCCESS
+    assert decision.command_executed is True
+    assert decision.feedback is None
+    assert decision.result is state.last_verification
+    assert decision.result is not None
+    assert decision.result.source is CommandSource.LOCAL_INTEGRITY
+    assert decision.result.command == "builtin:validate_changed_files"
+    assert decision.result.status is VerificationStatus.PASSED
+    assert decision.result.validation_index == state.mutation_index == 1
+    assert json.loads(decision.result.stdout) == {
+        "checked_paths": ["README.md"],
+        "syntax_checked": [],
+    }
+    assert executor.calls == []
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "syntax_checked"),
+    [
+        ("module.py", "VALUE = 1\n", ["module.py"]),
+        ("data.json", '{"value":1}\n', ["data.json"]),
+        ("config.toml", 'name = "demo"\n', ["config.toml"]),
+        ("main.cpp", "int main() { return 0; }\n", []),
+    ],
+)
+def test_local_integrity_uses_deterministic_format_checks(
+    tmp_path: Path,
+    name: str,
+    content: str,
+    syntax_checked: list[str],
+) -> None:
+    (tmp_path / name).write_text(content, encoding="utf-8")
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    state = _candidate_state(tmp_path)
+    state.mutation_index = 1
+    state.modified_paths = (name,)
+    state.verification_status = VerificationStatus.STALE
+
+    decision = gate.evaluate(state)
+
+    assert decision.outcome is VerificationOutcome.SUCCESS
+    assert decision.result is not None
+    assert json.loads(decision.result.stdout)["syntax_checked"] == syntax_checked
+
+
+@pytest.mark.parametrize(
+    ("name", "raw", "reason"),
+    [
+        ("broken.py", b"def broken(:\n", "invalid_syntax"),
+        ("broken.json", b"{", "invalid_syntax"),
+        ("broken.toml", b"name = [", "invalid_syntax"),
+        ("binary.txt", b"text\x00data", "binary_content"),
+        ("encoded.txt", b"\xff", "invalid_utf8"),
+        ("large.txt", b"x" * 524_289, "file_too_large"),
+    ],
+    ids=(
+        "python-syntax",
+        "json-syntax",
+        "toml-syntax",
+        "binary",
+        "invalid-utf8",
+        "too-large",
+    ),
+)
+def test_local_integrity_failure_is_stable_and_keeps_changes_unverified(
+    tmp_path: Path,
+    name: str,
+    raw: bytes,
+    reason: str,
+) -> None:
+    (tmp_path / name).write_bytes(raw)
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    state = _candidate_state(tmp_path)
+    state.mutation_index = 1
+    state.modified_paths = (name,)
+    state.verification_status = VerificationStatus.STALE
+
+    decision = gate.evaluate(state)
+
+    assert decision.outcome is VerificationOutcome.CONTINUE
+    assert decision.command_executed is True
+    assert decision.result is not None
+    assert decision.result.status is VerificationStatus.FAILED
+    assert decision.result.exit_code == 1
+    assert json.loads(decision.result.stdout)["failure"] == {
+        "path": name,
+        "reason": reason,
+    }
+    assert state.has_unverified_changes is True
+
+
+def test_local_integrity_allows_exact_byte_limit_and_rejects_missing_path(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "exact.txt").write_bytes(b"x" * 524_288)
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    exact = _candidate_state(tmp_path)
+    exact.mutation_index = 1
+    exact.modified_paths = ("exact.txt",)
+    exact.verification_status = VerificationStatus.STALE
+
+    assert gate.evaluate(exact).outcome is VerificationOutcome.SUCCESS
+
+    missing = _candidate_state(tmp_path)
+    missing.mutation_index = 1
+    missing.modified_paths = ("missing.txt",)
+    missing.verification_status = VerificationStatus.STALE
+    decision = gate.evaluate(missing)
+
+    assert decision.outcome is VerificationOutcome.CONTINUE
+    assert decision.result is not None
+    assert json.loads(decision.result.stdout)["failure"] == {
+        "path": "",
+        "reason": "invalid_changed_path",
+    }
+
+
+def test_current_failed_model_evidence_is_not_replaced_by_local_integrity(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    gate = VerificationGate(
+        required_command=None,
+        execution_context=ExecutionContext(tmp_path),
+        executor=FakeVerificationExecutor(),
+    )
+    state = _candidate_state(tmp_path)
+    state.mutation_index = 1
+    state.modified_paths = ("README.md",)
+    failed = _result(
+        status=VerificationStatus.FAILED,
+        validation_index=1,
+        source=CommandSource.MODEL,
+        exit_code=1,
+    )
+    state.last_verification = failed
+    state.verification_status = VerificationStatus.FAILED
+
+    decision = gate.evaluate(state)
+
+    assert decision.outcome is VerificationOutcome.CONTINUE
+    assert decision.command_executed is False
+    assert state.last_verification is failed
+
+
 def test_fresh_model_pass_succeeds_and_is_reusable_without_execution(
     tmp_path: Path,
 ) -> None:
@@ -1045,6 +1217,7 @@ def test_model_pass_at_mutation_zero_succeeds(tmp_path: Path) -> None:
 def test_new_mutation_makes_model_evidence_stale_but_preserves_audit(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "changed.py").write_text("value = 2\n", encoding="utf-8")
     gate = VerificationGate(
         required_command=None,
         execution_context=ExecutionContext(tmp_path),
@@ -1056,6 +1229,7 @@ def test_new_mutation_makes_model_evidence_stale_but_preserves_audit(
     audit_result = state.last_verification
 
     state.mutation_index += 1
+    state.modified_paths = ("changed.py",)
     state.verification_status = VerificationStatus.STALE
     decision = gate.evaluate(state)
 

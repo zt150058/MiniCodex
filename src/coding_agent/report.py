@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.logging import RunMetadata, TokenUsageTotals, scrub_text
 from coding_agent.messages import JSONObject
+from coding_agent.progress import AgentPhase
 from coding_agent.run_mode import RunMode
 from coding_agent.safety import CommandSource
 from coding_agent.state import (
@@ -15,7 +17,7 @@ from coding_agent.state import (
 )
 
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 MAX_REPORT_COMPLETION_CHARS = 4096
 MAX_REPORT_COMMAND_CHARS = 4096
 MAX_REPORT_STREAM_CHARS = 8192
@@ -89,6 +91,8 @@ class FinalReport:
     schema_version: int
     run_id: str
     run_mode: RunMode
+    budget_profile: BudgetProfile
+    phase: AgentPhase
     status: AgentStatus
     exit_code: int
     completion: EvidenceExcerpt | None
@@ -98,7 +102,10 @@ class FinalReport:
     mutation_index: int
     validation_index: int | None
     verification: VerificationReport
+    main_model_calls: int
+    summary_model_calls: int
     logical_model_calls: int
+    summary_provider_attempts: int
     provider_attempts: int
     tool_calls: int
     verification_attempts: int
@@ -107,6 +114,32 @@ class FinalReport:
     elapsed_ms: int
     log_failure_code: str | None
     log_path: str
+
+    def __post_init__(self) -> None:
+        if type(self.budget_profile) is not BudgetProfile:
+            raise TypeError("budget_profile must be BudgetProfile")
+        if not isinstance(self.phase, AgentPhase):
+            raise TypeError("phase must be AgentPhase")
+        for name in (
+            "main_model_calls",
+            "summary_model_calls",
+            "logical_model_calls",
+            "summary_provider_attempts",
+            "provider_attempts",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise TypeError(f"{name} must be a non-negative integer")
+        if self.logical_model_calls != (
+            self.main_model_calls + self.summary_model_calls
+        ):
+            raise ReportInvariantError("logical model counts are inconsistent")
+        if self.summary_provider_attempts > self.provider_attempts:
+            raise ReportInvariantError("provider attempt counts are inconsistent")
+        if self.status in {AgentStatus.SUCCESS, AgentStatus.ANSWERED} and (
+            self.phase is not AgentPhase.FINISH
+        ):
+            raise ReportInvariantError("successful terminal state must be finish phase")
 
     @classmethod
     def from_state(
@@ -126,6 +159,16 @@ class FinalReport:
             raise ReportInvariantError("agent state is not terminal")
         if metadata.finished_elapsed_ms is None or metadata.finished_elapsed_ms < 0:
             raise ReportInvariantError("run metadata has no terminal elapsed time")
+        if (
+            state.logical_model_call_count
+            != state.main_model_call_count + state.summary_model_call_count
+            or state.summary_provider_attempt_count > state.model_call_count
+        ):
+            raise ReportInvariantError("model budget counts are inconsistent")
+        if state.status in {AgentStatus.SUCCESS, AgentStatus.ANSWERED} and (
+            state.progress.phase is not AgentPhase.FINISH
+        ):
+            raise ReportInvariantError("successful terminal state must be finish phase")
 
         if state.status is AgentStatus.SUCCESS:
             evidence = state.last_verification
@@ -143,8 +186,7 @@ class FinalReport:
             exit_code = 0
         elif state.status is AgentStatus.ANSWERED:
             if (
-                state.run_mode is not RunMode.READ_ONLY
-                or not isinstance(state.completion_text, str)
+                not isinstance(state.completion_text, str)
                 or not state.completion_text.strip()
                 or state.termination_reason is not None
                 or state.failure_reason is not None
@@ -215,6 +257,8 @@ class FinalReport:
             schema_version=REPORT_SCHEMA_VERSION,
             run_id=metadata.run_id,
             run_mode=state.run_mode,
+            budget_profile=state.budget_profile,
+            phase=state.progress.phase,
             status=state.status,
             exit_code=exit_code,
             completion=_excerpt(
@@ -234,7 +278,10 @@ class FinalReport:
             mutation_index=state.mutation_index,
             validation_index=state.validation_index,
             verification=verification,
+            main_model_calls=state.main_model_call_count,
+            summary_model_calls=state.summary_model_call_count,
             logical_model_calls=state.logical_model_call_count,
+            summary_provider_attempts=state.summary_provider_attempt_count,
             provider_attempts=state.model_call_count,
             tool_calls=state.tool_call_count,
             verification_attempts=state.verification_attempt_count,
@@ -256,6 +303,8 @@ class FinalReport:
             "schema_version": self.schema_version,
             "run_id": self.run_id,
             "run_mode": self.run_mode.value,
+            "budget_profile": self.budget_profile.value,
+            "phase": self.phase.value,
             "status": self.status.value,
             "exit_code": self.exit_code,
             "completion": None if self.completion is None else self.completion.to_dict(),
@@ -267,7 +316,10 @@ class FinalReport:
             "mutation_index": self.mutation_index,
             "validation_index": self.validation_index,
             "verification": self.verification.to_dict(),
+            "main_model_calls": self.main_model_calls,
+            "summary_model_calls": self.summary_model_calls,
             "logical_model_calls": self.logical_model_calls,
+            "summary_provider_attempts": self.summary_provider_attempts,
             "provider_attempts": self.provider_attempts,
             "tool_calls": self.tool_calls,
             "verification_attempts": self.verification_attempts,

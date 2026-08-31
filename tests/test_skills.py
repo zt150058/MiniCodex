@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from coding_agent import skills as skills_module
 from coding_agent.skills import (
     RunSkillSnapshotMetadata,
     SkillCatalog,
@@ -15,6 +16,70 @@ from coding_agent.skills import (
     SkillDescriptor,
     SkillSource,
 )
+
+
+def test_parse_skill_document_matches_catalog_discovery(tmp_path: Path) -> None:
+    raw = (
+        b"---\r\n"
+        b"id: review\r\n"
+        b"name: Review\r\n"
+        b"description: Review safely.\r\n"
+        b"---\r\n"
+        b"first\r\nsecond\r\n"
+    )
+    parsed = skills_module._parse_skill_document(
+        raw,
+        SkillSource.WORKSPACE,
+        "review",
+    )
+    root = tmp_path / "workspace"
+    directory = root / "review"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_bytes(raw)
+    discovered = SkillCatalog(
+        user_root=tmp_path / "missing-user",
+        workspace_root=root,
+    ).discover().skills[0]
+
+    assert parsed.instructions == "first\nsecond"
+    assert parsed.descriptor == discovered
+    assert parsed.descriptor.sha256 == hashlib.sha256(b"first\nsecond").hexdigest()
+    assert parsed.descriptor.char_count == len("first\nsecond")
+
+
+@pytest.mark.parametrize(
+    ("raw", "entry_name", "code"),
+    [
+        (b"\xff", "review", "skill_file_not_utf8"),
+        (b"x" * 65_537, "review", "skill_file_too_large"),
+        (
+            b"---\nid: review\nname: Review\ndescription: Safe\n---\nbody\x00",
+            "review",
+            "invalid_skill_instructions",
+        ),
+        (b"id: review\nbody", "review", "invalid_skill_front_matter"),
+        (
+            b"---\nid: other\nname: Review\ndescription: Safe\n---\nbody",
+            "review",
+            "skill_id_mismatch",
+        ),
+        (
+            b"---\nid: review\nname: Review\ndescription: Safe\n---\n \n",
+            "review",
+            "empty_skill_instructions",
+        ),
+    ],
+    ids=("utf8", "too-large", "control", "front-matter", "id", "body"),
+)
+def test_parse_skill_document_preserves_exact_entry_error_codes(
+    raw: bytes,
+    entry_name: str,
+    code: str,
+) -> None:
+    with pytest.raises(skills_module._EntryError) as captured:
+        skills_module._parse_skill_document(raw, SkillSource.WORKSPACE, entry_name)
+
+    assert captured.value.code == code
 
 
 def write_skill(

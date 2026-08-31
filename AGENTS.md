@@ -130,9 +130,27 @@ Before completing a task, verify:
   either a safe, credible `run_command` with `purpose="verification"` or an
   internally consistent `run_java_tests` call with `purpose="verification"`;
   inspection-only commands and Java calls with `purpose="test"` are not proof.
-- Keep default limits aligned with `DESIGN.md`: 12 model calls, 40 tool calls,
-  10 minutes total runtime, and a threshold of 3 for no-progress repetition,
-  consecutive failures, or consecutive safety rejections.
+- After an ordinary decision checkpoint, count model responses that attempt
+  reads and allow exactly one final batch for `standard` and two for `deep`.
+  A duplicate-only read response closes reads immediately. Reject later reads
+  with paired `agent_rejected:decision_required` results while still allowing
+  legal mutation calls from the same model response, and give the model exactly
+  one corrective response after the first decision attempt makes no progress.
+- Model-facing verification guidance must name only the approved forms:
+  `python <workspace-relative-file.py>`, `python -m pytest ...`,
+  `python -m unittest ...` with `purpose="verification"`, and
+  `run_java_tests` for Java. A rejected command may receive bounded safe
+  correction, but local code must never rewrite or auto-execute it.
+- Unverified mutations never succeed. If recovery ends without fresh passing
+  evidence for the latest mutation, preserve the files and terminate as
+  `changes_unverified`; do not claim rollback or `SUCCESS`.
+- Every run has an immutable `BudgetProfile`. Keep `standard` aligned with
+  `DESIGN.md`: 24 main model calls, 4 summary calls, 48 provider attempts,
+  8 summary provider attempts, 80 tool calls, and 20 minutes. Keep `deep` at
+  40 main calls, 6 summary calls, 80 provider attempts, 12 summary provider
+  attempts, 140 tool calls, and 30 minutes. These are hard caps, not promised
+  consumption. Summary failure must latch the deterministic local fallback;
+  exploration limits must issue a decision checkpoint before `no_progress`.
 - Write only redacted execution facts to JSONL. Never log hidden reasoning,
   authentication headers, environment dumps, or provider continuation payloads.
 - Treat code executed from the workspace as trusted for the first version and

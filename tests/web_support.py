@@ -11,6 +11,7 @@ from threading import Event, Thread
 import httpx
 import uvicorn
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.session import (
     PersistedSessionEventKind,
     SessionControllerError,
@@ -31,6 +32,7 @@ from coding_agent.session_events import (
     SessionUpdateBatch,
     SessionUpdateKind,
 )
+from coding_agent.session_deletion import SessionDeletionResult
 from coding_agent.run_mode import RunMode
 from coding_agent.skills import (
     SkillCatalogDiagnostic,
@@ -71,6 +73,7 @@ def make_run_record(
     session_id: str = SESSION_ID,
     status: SessionRunStatus = SessionRunStatus.QUEUED,
     run_mode: RunMode = RunMode.MODIFY,
+    budget_profile: BudgetProfile = BudgetProfile.STANDARD,
 ) -> SessionRunRecord:
     terminal = status in {
         SessionRunStatus.SUCCEEDED,
@@ -84,6 +87,7 @@ def make_run_record(
         ordinal=1 if run_id == RUN_ID else 2,
         status=status,
         run_mode=run_mode,
+        budget_profile=budget_profile,
         user_event_sequence=1,
         started_at_utc=TIMESTAMP if active or terminal else None,
         finished_at_utc=TIMESTAMP if terminal else None,
@@ -174,13 +178,40 @@ class RecordingController:
         default_factory=lambda: SkillCatalogView((), (), True)
     )
     selected_skill_ids: tuple[str, ...] = ()
+    imported_skill: SkillDescriptor = field(
+        default_factory=lambda: SkillDescriptor(
+            skill_id="review",
+            name="Review",
+            description="Review safely.",
+            source=SkillSource.WORKSPACE,
+            sha256="c" * 64,
+            char_count=12,
+        )
+    )
     create_handle: RunHandle = field(
-        default_factory=lambda: RunHandle(SESSION_ID, RUN_ID, RunMode.MODIFY)
+        default_factory=lambda: RunHandle(
+            SESSION_ID,
+            RUN_ID,
+            RunMode.MODIFY,
+            BudgetProfile.STANDARD,
+        )
     )
     follow_up_handle: RunHandle = field(
-        default_factory=lambda: RunHandle(SESSION_ID, SECOND_RUN_ID, RunMode.MODIFY)
+        default_factory=lambda: RunHandle(
+            SESSION_ID,
+            SECOND_RUN_ID,
+            RunMode.MODIFY,
+            BudgetProfile.STANDARD,
+        )
     )
     cancellation_result: CancellationResult = CancellationResult.REQUESTED
+    delete_result: SessionDeletionResult = field(
+        default_factory=lambda: SessionDeletionResult(
+            SESSION_ID,
+            (RUN_ID,),
+            False,
+        )
+    )
     update_batches: deque[SessionUpdateBatch] = field(default_factory=deque)
     errors: dict[str, RuntimeError] = field(default_factory=dict)
     calls: list[tuple[object, ...]] = field(default_factory=list)
@@ -199,14 +230,25 @@ class RecordingController:
         self._record("list_sessions", limit)
         return self.sessions
 
+    def delete_session(self, session_id: str) -> SessionDeletionResult:
+        self._record("delete_session", session_id)
+        return self.delete_result
+
     def create_session(
         self,
         message: str,
         *,
         skill_ids: tuple[str, ...] = (),
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
-        self._record("create_session", message, skill_ids, run_mode)
+        self._record(
+            "create_session",
+            message,
+            skill_ids,
+            run_mode,
+            budget_profile,
+        )
         return self.create_handle
 
     def get_session(self, session_id: str) -> SessionView:
@@ -221,13 +263,24 @@ class RecordingController:
         message: str,
         *,
         run_mode: RunMode = RunMode.MODIFY,
+        budget_profile: BudgetProfile = BudgetProfile.STANDARD,
     ) -> RunHandle:
-        self._record("submit_message", session_id, message, run_mode)
+        self._record(
+            "submit_message",
+            session_id,
+            message,
+            run_mode,
+            budget_profile,
+        )
         return self.follow_up_handle
 
     def list_skills(self) -> SkillCatalogView:
         self._record("list_skills")
         return self.skill_view
+
+    def import_skill_archive(self, archive: bytes) -> SkillDescriptor:
+        self._record("import_skill_archive", archive)
+        return self.imported_skill
 
     def get_session_skills(self, session_id: str) -> tuple[str, ...]:
         self._record("get_session_skills", session_id)

@@ -40,6 +40,7 @@ from coding_agent.model import (
     ModelCallBudget,
     ModelObservation,
     ModelObservationKind,
+    ModelOutputLimitError,
     ModelClient,
     TransientModelError,
     invoke_model,
@@ -85,12 +86,14 @@ class FakeResponse:
         usage: object | None = None,
         status: str = "completed",
         error: object | None = None,
+        incomplete_details: object | None = None,
     ) -> None:
         self.id = response_id
         self.output = list(output)
         self.usage = usage
         self.status = status
         self.error = error
+        self.incomplete_details = incomplete_details
 
 
 class FakeResponsesResource:
@@ -573,6 +576,19 @@ def complete_once(response: FakeResponse) -> ModelResponse:
     return client.complete(ModelRequest(messages=(UserMessage("task"),)))
 
 
+def test_incomplete_max_output_tokens_is_a_distinct_output_limit_error() -> None:
+    response = FakeResponse(
+        output=(text_item("private partial"),),
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+    )
+
+    with pytest.raises(ModelOutputLimitError, match="output token limit") as caught:
+        complete_once(response)
+
+    assert "private partial" not in str(caught.value)
+
+
 def test_text_output_blocks_and_messages_are_joined_in_order() -> None:
     first = FakeOutputItem(
         {
@@ -665,7 +681,11 @@ def test_usage_and_provider_response_id_map_to_internal_types() -> None:
             "missing response id",
         ),
         (
-            FakeResponse(output=(text_item("x"),), status="incomplete"),
+            FakeResponse(
+                output=(text_item("x"),),
+                status="incomplete",
+                incomplete_details=SimpleNamespace(reason="other"),
+            ),
             "response status is not completed",
         ),
         (

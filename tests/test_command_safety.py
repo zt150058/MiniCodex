@@ -167,6 +167,7 @@ def test_command_policy_rejects_invalid_purpose_as_argument_error(
 def test_command_source_values_are_stable() -> None:
     assert CommandSource.MODEL.value == "model"
     assert CommandSource.USER_VERIFY.value == "user_verify"
+    assert CommandSource.LOCAL_INTEGRITY.value == "local_integrity"
 
 
 def _authorize(

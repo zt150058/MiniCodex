@@ -4,6 +4,7 @@ import argparse
 import sys
 from typing import TYPE_CHECKING, Mapping, NoReturn, Sequence, TextIO
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.config import ConfigError, load_run_config
 from coding_agent.run_mode import RunMode
 
@@ -37,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--read-only",
         action="store_true",
         help="Inspect and answer without file mutation or verification tools",
+    )
+    parser.add_argument(
+        "--budget-profile",
+        choices=tuple(profile.value for profile in BudgetProfile),
+        default=BudgetProfile.STANDARD.value,
+        help="Run resource profile: standard or deep (default: standard).",
     )
     parser.add_argument(
         "--model",
@@ -86,6 +93,7 @@ def main(
             run_mode=(
                 RunMode.READ_ONLY if args.read_only else RunMode.MODIFY
             ),
+            budget_profile=args.budget_profile,
         )
     except ConfigError as exc:
         print(f"error: {exc}", file=errors)

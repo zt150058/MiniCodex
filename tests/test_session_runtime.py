@@ -7,6 +7,7 @@ import sys
 
 import pytest
 
+from coding_agent.budget import BudgetProfile
 from coding_agent.context import ContextManager, ContextLimits
 from coding_agent.app import ApplicationFactories
 from coding_agent.config import load_run_config
@@ -88,6 +89,28 @@ def test_session_run_request_accepts_frozen_skill_bundle_and_hides_body(
             current_message="inspect",
             initial_user_message="inspect",
             skill_bundle="invalid",  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("profile", tuple(BudgetProfile))
+def test_session_run_request_preserves_budget_profile(
+    profile: BudgetProfile,
+) -> None:
+    request = SessionRunRequest(
+        session_id="1" * 32,
+        run_id="2" * 32,
+        current_message="inspect",
+        initial_user_message="inspect",
+        budget_profile=profile,
+    )
+    assert request.budget_profile is profile
+    with pytest.raises(TypeError, match="budget_profile"):
+        SessionRunRequest(
+            session_id="1" * 32,
+            run_id="2" * 32,
+            current_message="inspect",
+            initial_user_message="inspect",
+            budget_profile=profile.value,  # type: ignore[arg-type]
         )
 
 

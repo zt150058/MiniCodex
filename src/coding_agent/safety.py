@@ -321,6 +321,7 @@ class PathGuard:
 class CommandSource(StrEnum):
     MODEL = "model"
     USER_VERIFY = "user_verify"
+    LOCAL_INTEGRITY = "local_integrity"
 
 
 @dataclass(frozen=True, slots=True)
