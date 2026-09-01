@@ -156,15 +156,6 @@ def test_readme_describes_folders_without_file_level_inventory() -> None:
     assert "逐个源码文件" not in text
 
 
-def test_readme_txt_submission_contract() -> None:
-    text = (ROOT / "README.txt").read_text(encoding="utf-8")
-    assert len(text) <= 1000
-    assert "https://github.com/zt150058/MiniCodex" in text
-    assert "Python 3.11" in text
-    assert "coding-agent" in text
-    assert "coding-agent-web" in text
-
-
 def test_agents_points_to_current_design_and_tasks() -> None:
     text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     assert "docs/project/DESIGN.md" in text

@@ -3,7 +3,6 @@ from __future__ import annotations
 from io import StringIO
 import json
 from pathlib import Path
-import shutil
 import time
 
 from coding_agent.engine.agent import AgentRunner
@@ -28,15 +27,38 @@ from coding_agent.operations.tools.shell import AuthorizedCommandExecutor
 
 
 FAKE_KEY = "task13-failure-matrix-fake-key"
-FIXTURE = Path(__file__).parents[2] / "examples" / "broken_pytest_project"
+BROKEN_CALCULATOR = """\
+def add(left: int, right: int) -> int:
+    return left - right
+
+
+def is_even(value: int) -> bool:
+    return value % 2 == 1
+"""
+CALCULATOR_TESTS = """\
+from calculator import add, is_even
+
+
+def test_adds_positive_numbers() -> None:
+    assert add(2, 3) == 5
+
+
+def test_detects_even_and_odd_numbers() -> None:
+    assert is_even(4) is True
+    assert is_even(3) is False
+"""
 
 
 def _copy_demo(tmp_path: Path, name: str = "demo") -> Path:
     workspace = tmp_path / name
-    shutil.copytree(
-        FIXTURE,
-        workspace,
-        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc"),
+    workspace.mkdir()
+    (workspace / "calculator.py").write_text(
+        BROKEN_CALCULATOR,
+        encoding="utf-8",
+    )
+    (workspace / "test_calculator.py").write_text(
+        CALCULATOR_TESTS,
+        encoding="utf-8",
     )
     return workspace
 
@@ -546,10 +568,9 @@ def test_two_runs_use_independent_logs_and_fresh_fixture_copies(
         "PYTHONDONTWRITEBYTECODE",
         "1",
     )
-    tracked_source = (FIXTURE / "calculator.py").read_bytes()
-    tracked_test = (FIXTURE / "test_calculator.py").read_bytes()
     first_workspace = _copy_demo(tmp_path, "first-demo")
     second_workspace = _copy_demo(tmp_path, "second-demo")
+    original_test = CALCULATOR_TESTS.encode("utf-8")
 
     first_code, first_report, _, first_stderr = _run_with_fake(
         first_workspace,
@@ -570,6 +591,10 @@ def test_two_runs_use_independent_logs_and_fresh_fixture_copies(
     assert first_report["log_path"] != second_report["log_path"]
     assert (first_workspace / first_report["log_path"]).is_file()  # type: ignore[operator]
     assert (second_workspace / second_report["log_path"]).is_file()  # type: ignore[operator]
-    assert (FIXTURE / "calculator.py").read_bytes() == tracked_source
-    assert (FIXTURE / "test_calculator.py").read_bytes() == tracked_test
+    assert (first_workspace / "test_calculator.py").read_bytes() == original_test
+    assert (second_workspace / "test_calculator.py").read_bytes() == original_test
+    for workspace in (first_workspace, second_workspace):
+        source = (workspace / "calculator.py").read_text(encoding="utf-8")
+        assert "return left + right" in source
+        assert "return value % 2 == 0" in source
     assert first_stderr.getvalue() == second_stderr.getvalue() == ""

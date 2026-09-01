@@ -200,7 +200,7 @@ GUI 的命令活动卡会在存在整数进程退出码时显示 `exit N`；例�
 
 ## 离线演示与完整测试
 
-确定性 demo 位于 `tests/integration/test_agent_repair.py`，使用 FakeModelClient，复制 `examples/broken_pytest_project/` 后完成“读取—修改—验证失败—再次修改—验证通过”：
+确定性 demo 位于 `tests/integration/test_agent_repair.py`，使用 FakeModelClient，并在临时工作区创建隔离 fixture，完成“读取—修改—验证失败—再次修改—验证通过”：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests\integration\test_agent_repair.py -q -p no:cacheprovider

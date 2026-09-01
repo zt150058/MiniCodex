@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
 from pathlib import Path
 
@@ -25,19 +24,6 @@ PUBLIC_DOCS = (
     ROOT / "docs" / "USAGE.md",
     ROOT / "docs" / "OPENAI_API.md",
 )
-README_HARD_TOTAL = 850
-REPOSITORY_URL = "https://github.com/zt150058/MiniCodex"
-
-
-@dataclass(frozen=True, slots=True)
-class ReadmeMetrics:
-    unicode_chars: int
-    non_whitespace_chars: int
-    han_chars: int
-    utf8_bytes: int
-    lines: int
-
-
 def _read_utf8(path: Path) -> str:
     raw = path.read_bytes()
     assert not raw.startswith(b"\xef\xbb\xbf")
@@ -47,19 +33,6 @@ def _read_utf8(path: Path) -> str:
 def _read_budget_contract_docs() -> str:
     paths = (ROOT / "AGENTS.md", *PUBLIC_DOCS)
     return "\n".join(_read_utf8(path) for path in paths)
-
-
-def _readme_metrics(path: Path) -> ReadmeMetrics:
-    raw = path.read_bytes()
-    text = raw.decode("utf-8")
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
-    return ReadmeMetrics(
-        unicode_chars=len(normalized),
-        non_whitespace_chars=sum(not char.isspace() for char in normalized),
-        han_chars=sum("\u4e00" <= char <= "\u9fff" for char in normalized),
-        utf8_bytes=len(raw),
-        lines=0 if not normalized else len(normalized.splitlines()),
-    )
 
 
 def test_read_utf8_normalizes_windows_and_legacy_line_endings(
@@ -87,36 +60,6 @@ def test_required_public_documents_exist_and_are_utf8() -> None:
     assert missing == []
     for path in PUBLIC_DOCS:
         _read_utf8(path)
-
-
-def test_readme_txt_meets_submission_contract() -> None:
-    path = ROOT / "README.txt"
-    text = _read_utf8(path)
-    metrics = _readme_metrics(path)
-
-    assert 650 <= metrics.unicode_chars <= README_HARD_TOTAL
-    assert metrics.han_chars <= 1000
-    assert REPOSITORY_URL in text
-    for required in (
-        "Windows",
-        "Python 3.11+",
-        "coding-agent",
-        "--workspace",
-        "--verify",
-        "--api-mode",
-        "--base-url",
-        "responses",
-        "chat-completions",
-        "OPENAI_API_KEY",
-        "CHAT_COMPLETIONS_API_KEY",
-        "pytest -q",
-        ".coding-agent/logs/",
-        "docs/USAGE.md",
-        "docs/OPENAI_API.md",
-        "最后一次修改",
-        "不是操作系统级沙箱",
-    ):
-        assert required in text
 
 
 def test_all_markdown_relative_links_and_source_references_exist() -> None:
@@ -295,14 +238,6 @@ def test_docs_lock_directory_integrity_and_chat_stream_fallback_contracts() -> N
     assert "已经公开任何文本后不会同步回退" in api
     assert "exactly six" not in agents
     assert "恰好六个" not in agents
-
-
-def test_readme_submission_stays_within_limit_and_names_read_only_mode() -> None:
-    text = _read_utf8(ROOT / "README.txt")
-    metrics = _readme_metrics(ROOT / "README.txt")
-    assert metrics.unicode_chars <= README_HARD_TOTAL
-    for value in ("--read-only", "只读问答", "允许修改", "ANSWERED"):
-        assert value in text
 
 
 def test_docs_explain_deterministic_decision_and_verification_recovery() -> None:

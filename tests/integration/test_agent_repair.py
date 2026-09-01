@@ -3,7 +3,6 @@ from __future__ import annotations
 from io import StringIO
 import json
 from pathlib import Path
-import shutil
 import socket
 import subprocess
 import sys
@@ -18,7 +17,38 @@ from coding_agent.operations.tools.shell import AuthorizedCommandExecutor
 
 
 FAKE_KEY = "task13-repair-fake-key"
-FIXTURE = Path(__file__).parents[2] / "examples" / "broken_pytest_project"
+BROKEN_CALCULATOR = """\
+def add(left: int, right: int) -> int:
+    return left - right
+
+
+def is_even(value: int) -> bool:
+    return value % 2 == 1
+"""
+CALCULATOR_TESTS = """\
+from calculator import add, is_even
+
+
+def test_adds_positive_numbers() -> None:
+    assert add(2, 3) == 5
+
+
+def test_detects_even_and_odd_numbers() -> None:
+    assert is_even(4) is True
+    assert is_even(3) is False
+"""
+
+
+def _create_demo(workspace: Path) -> None:
+    workspace.mkdir()
+    (workspace / "calculator.py").write_text(
+        BROKEN_CALCULATOR,
+        encoding="utf-8",
+    )
+    (workspace / "test_calculator.py").write_text(
+        CALCULATOR_TESTS,
+        encoding="utf-8",
+    )
 
 
 def _run_pytest(workspace: Path) -> subprocess.CompletedProcess[str]:
@@ -116,11 +146,7 @@ def test_cli_repairs_demo_after_failed_forced_verification(
         "1",
     )
     workspace = tmp_path / "demo"
-    shutil.copytree(
-        FIXTURE,
-        workspace,
-        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc"),
-    )
+    _create_demo(workspace)
     copied_source = workspace / "calculator.py"
     copied_test = workspace / "test_calculator.py"
     original_test_bytes = copied_test.read_bytes()
