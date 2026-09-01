@@ -37,6 +37,3 @@ coding-agent-web --workspace "D:\你的项目" `
 - 修改后验证门：每次文件变更递增 mutation_index，并立即使旧证据过期。VerificationGate 只接受 validation_index 对齐最后一次修改的新鲜证据；用户提供的 --verify 是强制门槛。失败、超时或未验证时保留文件并以 changes_unverified 结束，模型文字不能决定 SUCCESS。
 - 本地 GUI 与审计：SQLite 持久化会话、追问、模式、预算和模型，认证 SSE 实时投影文本、工具 exit code、修改与验证状态，并支持协作式取消。JSONL 只记录脱敏执行事实、哈希和相对路径，不保存 API Key、文件正文、完整历史或隐藏推理。
 
-五、安全边界
-
-GUI 仅供本机使用，不要通过代理、端口转发或网络共享对外暴露。项目限制 Agent 的工具能力，但不是操作系统级沙箱；被允许执行的项目脚本和测试仍属于可信代码，请只在已备份的项目副本中运行。
