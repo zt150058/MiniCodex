@@ -41,13 +41,9 @@ def test_detects_even_and_odd_numbers() -> None:
 
 def _create_demo(workspace: Path) -> None:
     workspace.mkdir()
-    (workspace / "calculator.py").write_text(
-        BROKEN_CALCULATOR,
-        encoding="utf-8",
-    )
-    (workspace / "test_calculator.py").write_text(
-        CALCULATOR_TESTS,
-        encoding="utf-8",
+    (workspace / "calculator.py").write_bytes(BROKEN_CALCULATOR.encode("utf-8"))
+    (workspace / "test_calculator.py").write_bytes(
+        CALCULATOR_TESTS.encode("utf-8")
     )
 
 
